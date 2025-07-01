@@ -123,9 +123,10 @@ async fn help(ctx: &Context, msg: &Message) -> CommandResult {
         • **Features:** High-quality embeds, clickable links, animated GIF support\n\n\
         **🤖 AI Chat (LM Studio/Ollama):**\n\
         • `{0}lm <prompt>` - Interactive AI chat with real-time streaming\n\
+        • `{0}lm -s <search query>` - Search DuckDuckGo and display top 5 results\n\
         • **Aliases:** `{0}llm`, `{0}ai`, `{0}chat`\n\
-        • **Features:** Live response streaming, multi-part messages, 8K token support\n\
-        • **Requirements:** LM Studio or Ollama with configured models\n\n\
+        • **Features:** Live response streaming, multi-part messages, 8K token support, web search\n\
+        • **Requirements:** LM Studio or Ollama with configured models (for AI chat)\n\n\
         **🧠 AI Reasoning (Advanced):**\n\
         • `{0}reason <question>` - Specialized AI reasoning with step-by-step analysis\n\
         • **Aliases:** `{0}reasoning`\n\
@@ -141,7 +142,14 @@ async fn help(ctx: &Context, msg: &Message) -> CommandResult {
         • Discord bot token in `botconfig.txt`\n\
         • LM Studio/Ollama configuration in `lmapiconf.txt` (for AI features)\n\
         • System prompts in `system_prompt.txt` and `reasoning_prompt.txt`\n\n\
-        **📚 Need help?** Check the README.md for detailed setup instructions!", 
+        **📚 Need help?** Check the README.md for detailed setup instructions!\n\n\
+        **🚀 Quick Start:**\n\
+        1. `{0}ping` - Test basic bot functionality\n\
+        2. `{0}help` - View all available commands with categories and aliases  \n\
+        3. `{0}ppfp @user` - Try the profile picture feature\n\
+        4. `{0}lm Hello!` - Test AI chat (requires configuration)\n\
+        5. `{0}lm -s rust programming` - Test web search (no configuration needed)\n\
+        6. `{0}reason Why did the sky turn red at sunset?` - Test AI reasoning (requires configuration)", 
         prefix
     );
     

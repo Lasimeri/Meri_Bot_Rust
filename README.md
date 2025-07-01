@@ -31,9 +31,18 @@ A powerful Discord bot written in Rust using the Serenity framework, featuring r
 - `^lm <prompt>` - Chat with AI via LM Studio/Ollama
   - **Aliases**: `^llm`, `^ai`, `^chat` 
   - **Features**: **Real-time streaming responses**, smart message chunking, extended output length (8K tokens), live progress indicators, multi-part message support
+- `^lm -s <search query>` - Search the web using DuckDuckGo
+  - **Aliases**: `^lm --search <query>`
+  - **Features**: **Real-time web search**, top 5 results, rich formatting with titles and links, no configuration required
 - `^reason <question>` - Deep reasoning with specialized AI model
   - **Aliases**: `^reasoning`
   - **Features**: **Real-time streaming with thinking tag filtering**, step-by-step reasoning, dedicated reasoning model, automatic `<think>` content removal, logical explanations
+
+### 🔍 Web Search Commands
+- `^lm -s <search query>` - Search DuckDuckGo and display top 5 results
+  - **Features**: Real-time search with typing indicators, rich result formatting, clickable links
+  - **No configuration required** - Works independently of AI model setup
+  - **Examples**: `^lm -s rust programming`, `^lm -s "discord bot tutorial"`
 
 ### 💡 User Experience
 - **Typing indicators** on all commands for immediate feedback
@@ -54,7 +63,8 @@ A powerful Discord bot written in Rust using the Serenity framework, featuring r
 
 - Rust (latest stable version)
 - A Discord bot token
-- LM Studio (for AI chat functionality) - optional
+- LM Studio or Ollama (for AI chat and reasoning functionality) - optional
+- Internet connection (for web search functionality)
 
 ## Setup
 
@@ -160,8 +170,9 @@ meri_bot_rust/
 │   ├── main.rs                # Entry point
 │   ├── meri_bot.rs           # Main bot logic
 │   ├── profilepfp.rs         # Profile picture command
-│   ├── lm.rs                 # LM Studio AI chat command
-│   └── reason.rs             # AI reasoning command
+│   ├── lm.rs                 # LM Studio AI chat and search commands
+│   ├── reason.rs             # AI reasoning command  
+│   └── search.rs             # DuckDuckGo web search functionality
 ├── target/                   # Rust build artifacts
 ├── Cargo.toml                # Dependencies
 ├── botconfig.txt            # Bot configuration (create this)
@@ -193,8 +204,9 @@ The bot responds to commands with the configured prefix (default: `^`):
 1. `^ping` - Test basic bot functionality
 2. `^help` - View all available commands with categories and aliases  
 3. `^ppfp @user` - Try the profile picture feature
-4. `^lm Hello!` - Test AI chat (requires configuration)
-5. `^reason Why did the sky turn red at sunset?` - Test AI reasoning (requires configuration)
+4. `^lm -s rust programming` - Test web search (no configuration needed)
+5. `^lm Hello!` - Test AI chat (requires configuration)
+6. `^reason Why did the sky turn red at sunset?` - Test AI reasoning (requires configuration)
 
 ### Profile Picture Command
 
@@ -263,6 +275,29 @@ The `^reason` command provides advanced AI reasoning capabilities with real-time
   - Falls back to `system_prompt.txt` if reasoning prompt not found
   - Models that support thinking tags (e.g., qwen, deepseek-r1, specialized reasoning models)
 
+### Web Search Command (DuckDuckGo)
+
+The `^lm -s` command provides instant web search functionality:
+
+- **Usage**: `^lm -s <search query>` or `^lm --search <search query>`
+- **Features**:
+  - **🔍 Real-time search** - Immediate results with typing indicators
+  - **📊 Top 5 results** - Shows the most relevant DuckDuckGo search results
+  - **🔗 Rich formatting** - Results include titles, descriptions, and clickable links
+  - **⚡ No configuration required** - Works independently of AI model setup
+  - **🛡️ Error handling** - Graceful fallback with helpful error messages
+- **Examples**:
+  ```
+  ^lm -s rust programming tutorial
+  ^lm -s "how to create discord bot"
+  ^lm --search async programming patterns
+  ```
+- **Technical Features**:
+  - **🌐 HTTP requests** with 15-second timeout protection
+  - **📝 HTML parsing** with comprehensive result extraction
+  - **🧹 Content cleaning** - Removes HTML tags and decodes entities
+  - **📋 Structured results** - Title, link, and description for each result
+
 ## Development
 
 To add new commands:
@@ -299,9 +334,13 @@ The bot uses these key dependencies:
 - `tokio` (1.x) - Async runtime with full features
 
 #### HTTP & Networking  
-- `reqwest` (0.11) - HTTP client with JSON and streaming support
+- `reqwest` (0.11) - HTTP client with JSON, streaming, and blocking support
 - `futures-util` (0.3) - Stream processing utilities
 - `tokio-stream` (0.1) - Async stream utilities with io-util features
+
+#### Web Scraping & Search
+- `scraper` (0.13) - HTML parsing and CSS selector support for web search
+- `urlencoding` (2.1) - URL encoding for search queries
 
 #### Data Handling
 - `serde` (1.0) - JSON serialization/deserialization with derive macros

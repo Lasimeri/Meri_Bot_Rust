@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::collections::HashMap;
 use futures_util::StreamExt;
+use crate::search::{ddg_search, format_search_results};
 
 // Structure to track streaming statistics
 #[derive(Debug)]
@@ -180,15 +181,75 @@ pub async fn load_lm_config() -> Result<LMConfig, Box<dyn std::error::Error + Se
 #[command]
 #[aliases("llm", "ai", "chat")]
 pub async fn lm(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
-    let prompt = args.message().trim();
+    let input = args.message().trim();
     
     // Start typing indicator
     let _typing = ctx.http.start_typing(msg.channel_id.0)?;
     
-    if prompt.is_empty() {
-        msg.reply(ctx, "❌ Please provide a prompt! Usage: `^lm <your prompt>`").await?;
+    if input.is_empty() {
+        msg.reply(ctx, "❌ Please provide a prompt! Usage: `^lm <your prompt>` or `^lm -s <search query>`").await?;
         return Ok(());
     }
+
+    // Check if this is a search request
+    if input.starts_with("-s ") || input.starts_with("--search ") {
+        // Extract search query
+        let search_query = if input.starts_with("-s ") {
+            &input[3..]
+        } else {
+            &input[9..] // "--search "
+        };
+
+        if search_query.trim().is_empty() {
+            msg.reply(ctx, "❌ Please provide a search query! Usage: `^lm -s <search query>`").await?;
+            return Ok(());
+        }
+
+        // Send initial search message
+        let mut search_msg = match msg.channel_id.send_message(&ctx.http, |m| {
+            m.content("🔍 Searching DuckDuckGo...")
+        }).await {
+            Ok(message) => message,
+            Err(e) => {
+                eprintln!("❌ Failed to send initial search message: {}", e);
+                msg.reply(ctx, "❌ Failed to send message!").await?;
+                return Ok(());
+            }
+        };
+
+        // Perform search
+        match ddg_search(search_query).await {
+            Ok(results) => {
+                let formatted_results = format_search_results(&results, search_query);
+                
+                // Update message with search results
+                if let Err(e) = search_msg.edit(&ctx.http, |m| {
+                    m.content(&formatted_results)
+                }).await {
+                    eprintln!("❌ Failed to update search message: {}", e);
+                    msg.reply(ctx, "❌ Failed to display search results!").await?;
+                }
+                
+                println!("🔍 Search completed successfully for query: '{}'", search_query);
+            }
+            Err(e) => {
+                eprintln!("❌ Search failed: {}", e);
+                let error_msg = format!("❌ **Search Failed**\n\nQuery: `{}`\nError: {}\n\n💡 Try rephrasing your search query or check your internet connection.", search_query, e);
+                
+                if let Err(edit_error) = search_msg.edit(&ctx.http, |m| {
+                    m.content(&error_msg)
+                }).await {
+                    eprintln!("❌ Failed to update search message with error: {}", edit_error);
+                    msg.reply(ctx, &error_msg).await?;
+                }
+            }
+        }
+
+        return Ok(());
+    }
+
+    // Regular AI chat functionality (existing code)
+    let prompt = input;
 
     // Load LM Studio configuration
     let config = match load_lm_config().await {
@@ -251,7 +312,7 @@ pub async fn lm(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
         }
     }
 
-        Ok(())
+    Ok(())
 }
 
 // Main streaming function that handles real-time response with Discord message editing for chat
