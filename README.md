@@ -236,6 +236,7 @@ The `^reason` command provides advanced AI reasoning capabilities:
   - Same as LM chat command plus `DEFAULT_REASON_MODEL` configuration
   - Optional: `reasoning_prompt.txt` file for specialized reasoning instructions
   - Falls back to `system_prompt.txt` if reasoning prompt not found
+  - Independent configuration loading with multi-path search for reliability
 
 ## Development
 
@@ -255,6 +256,14 @@ async fn mycommand(ctx: &Context, msg: &Message) -> CommandResult {
     Ok(())
 }
 ```
+
+### Configuration Loading
+
+Both the `^lm` and `^reason` commands use robust multi-path configuration loading:
+- Searches for `lmapiconf.txt` in multiple locations: current directory, parent directories, and src/
+- Each command loads configuration independently for maximum reliability
+- Comprehensive error messages help diagnose configuration issues
+- Console logging shows which configuration files and models are being used
 
 ### Dependencies
 
