@@ -1,5 +1,5 @@
 # Discord Bot Configuration
-# Copy this file to bot_config.txt and replace with your actual bot token
+# Copy this file to botconfig.txt and replace with your actual bot token
 DISCORD_TOKEN=YOUR_BOT_TOKEN_HERE
 PREFIX=^
 RUST_LOG=info 

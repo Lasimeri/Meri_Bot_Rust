@@ -15,10 +15,11 @@ use std::fs;
 use std::collections::HashMap;
 use tokio::signal;
 use crate::profilepfp::*;
+use crate::lm::*;
 
 // Command group declaration
 #[group]
-#[commands(ping, echo, help, ppfp)]
+#[commands(ping, echo, help, ppfp, lm)]
 struct General;
 
 // Event handler implementation
@@ -31,13 +32,13 @@ impl EventHandler for Handler {
     }
 }
 
-// Function to read configuration from bot_config.txt
+// Function to read configuration from botconfig.txt
 fn load_bot_config() -> Result<HashMap<String, String>, String> {
     let config_paths = [
-        "bot_config.txt",
-        "../bot_config.txt", 
-        "../../bot_config.txt",
-        "src/bot_config.txt"
+        "botconfig.txt",
+        "../botconfig.txt", 
+        "../../botconfig.txt",
+        "src/botconfig.txt"
     ];
     
     // Clear any existing relevant environment variables
@@ -81,18 +82,20 @@ fn load_bot_config() -> Result<HashMap<String, String>, String> {
         }
     }
     
-    Err("No bot_config.txt file found in any expected location".to_string())
+    Err("No botconfig.txt file found in any expected location".to_string())
 }
 
 // Command implementations
 #[command]
 async fn ping(ctx: &Context, msg: &Message) -> CommandResult {
+    let _typing = ctx.http.start_typing(msg.channel_id.0)?;
     msg.reply(ctx, "Pong! 🏓").await?;
     Ok(())
 }
 
 #[command]
 async fn echo(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
+    let _typing = ctx.http.start_typing(msg.channel_id.0)?;
     let text = args.message();
     if text.is_empty() {
         msg.reply(ctx, "Please provide text to echo!").await?;
@@ -104,20 +107,21 @@ async fn echo(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
 
 #[command]
 async fn help(ctx: &Context, msg: &Message) -> CommandResult {
+    let _typing = ctx.http.start_typing(msg.channel_id.0)?;
     let prefix = env::var("PREFIX").unwrap_or_else(|_| "!".to_string());
-    let response = format!("**Meri Bot Commands:**\n`{0}ping` - Test bot response\n`{0}echo <text>` - Repeat your message\n`{0}ppfp @user` - Show user's profile picture\n`{0}help` - Show this message", prefix);
+    let response = format!("**🤖 Meri Bot Commands:**\n\n**📋 Basic Commands:**\n`{0}ping` - Test bot response\n`{0}echo <text>` - Repeat your message\n`{0}help` - Show this command list\n\n**🖼️ Profile Pictures:**\n`{0}ppfp @user` - Show user's profile picture\n*Aliases: {0}avatar, {0}pfp, {0}profilepic*\n\n**🤖 AI Chat:**\n`{0}lm <prompt>` - Chat with AI via LM Studio/Ollama\n*Aliases: {0}llm, {0}ai, {0}chat*\n\n**💡 Tip:** All commands show typing indicators while processing!", prefix);
     msg.reply(ctx, &response).await?;
     Ok(())
 }
 
 // Main bot function
 pub async fn run() {
-    // Load configuration from bot_config.txt file
+    // Load configuration from botconfig.txt file
     match load_bot_config() {
-        Ok(_) => println!("✅ Configuration loaded from bot_config.txt"),
+        Ok(_) => println!("✅ Configuration loaded from botconfig.txt"),
         Err(error) => {
-            eprintln!("❌ Failed to load bot_config.txt: {}", error);
-            eprintln!("Create a bot_config.txt file in the project root with: DISCORD_TOKEN=your_token_here and PREFIX=^");
+            eprintln!("❌ Failed to load botconfig.txt: {}", error);
+            eprintln!("Create a botconfig.txt file in the project root with: DISCORD_TOKEN=your_token_here and PREFIX=^");
             return;
         }
     };
@@ -127,13 +131,13 @@ pub async fn run() {
         Ok(token) => {
             // Validate token is not placeholder
             if token == "YOUR_BOT_TOKEN_HERE" || token.is_empty() {
-                eprintln!("❌ DISCORD_TOKEN in bot_config.txt is set to placeholder! Replace with your actual Discord bot token.");
+                eprintln!("❌ DISCORD_TOKEN in botconfig.txt is set to placeholder! Replace with your actual Discord bot token.");
                 return;
             }
             token
         }
         Err(_) => {
-            eprintln!("❌ DISCORD_TOKEN not found in bot_config.txt file!");
+            eprintln!("❌ DISCORD_TOKEN not found in botconfig.txt file!");
             return;
         }
     };
@@ -160,7 +164,7 @@ pub async fn run() {
         Ok(client) => client,
         Err(e) => {
             eprintln!("❌ Error creating Discord client: {:?}", e);
-            eprintln!("Check your token in bot_config.txt file");
+            eprintln!("Check your token in botconfig.txt file");
             return;
         }
     };

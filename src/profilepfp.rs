@@ -9,6 +9,9 @@ use serenity::{
 pub async fn ppfp(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
     let args_str = args.message().trim();
     
+    // Start typing indicator
+    let _typing = ctx.http.start_typing(msg.channel_id.0)?;
+    
     // Check if a user was mentioned
     if args_str.is_empty() {
         msg.reply(ctx, "❌ Please mention a user! Usage: `^ppfp @user`").await?;
@@ -101,7 +104,9 @@ pub async fn ppfp(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
 
 // Helper function to download image data into memory
 async fn download_image(url: &str) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30)) // 30 second timeout for image downloads
+        .build()?;
     let response = client.get(url).send().await?;
     
     if !response.status().is_success() {

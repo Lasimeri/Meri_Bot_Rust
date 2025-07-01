@@ -4,9 +4,14 @@
 *.pdb
 
 # Bot configuration files containing sensitive information
-bot_config.txt
-*_config.txt
-!example_bot_config.txt
+botconfig.txt
+*config.txt
+!example_botconfig.txt
+
+# LLM system prompts and configuration
+system_prompt.txt
+lmapiconf.txt
+!example_lmapiconf.txt
 
 # Environment files
 .env
@@ -47,6 +52,9 @@ $RECYCLE.BIN/
 .coverage
 .nyc_output
 node_modules/
+test_config.rs
+test_config.exe
+*.test
 
 # Temporary files
 *.tmp

@@ -13,15 +13,31 @@ A simple Discord bot written in Rust using the Serenity framework.
 
 ## Features
 
-- `^ping` - Test bot response
+### 📋 Basic Commands
+- `^ping` - Test bot response with typing indicator
 - `^echo <text>` - Repeat your message
+- `^help` - Show comprehensive command list with categories
+
+### 🖼️ Profile Picture Commands  
 - `^ppfp @user` - Show user's profile picture in a rich embed
-- `^help` - Show available commands
+  - **Aliases**: `^avatar`, `^pfp`, `^profilepic`
+  - **Features**: High-quality embeds, clickable links, memory-efficient processing
+
+### 🤖 AI Chat Commands
+- `^lm <prompt>` - Chat with AI via LM Studio/Ollama
+  - **Aliases**: `^llm`, `^ai`, `^chat` 
+  - **Features**: Real-time streaming, automatic message chunking, configurable models
+
+### 💡 User Experience
+- **Typing indicators** on all commands for immediate feedback
+- **Error handling** with helpful guidance messages
+- **Configuration validation** with clear error messages
 
 ## Prerequisites
 
 - Rust (latest stable version)
 - A Discord bot token
+- LM Studio (for AI chat functionality) - optional
 
 ## Setup
 
@@ -37,17 +53,45 @@ A simple Discord bot written in Rust using the Serenity framework.
    cd meri_bot_rust
    ```
 
-3. **Set up environment variables**
+3. **Set up Discord Bot Configuration**
    
-   Create a `bot_config.txt` file in the project root:
+   Create a `botconfig.txt` file in the project root:
+   ```bash
+   # Copy from the example and customize
+   cp example_botconfig.txt botconfig.txt
    ```
-   DISCORD_TOKEN=your_bot_token_here
+   
+   Edit `botconfig.txt` with your settings:
+   ```
+   DISCORD_TOKEN=your_actual_discord_token_here
    PREFIX=^
+   RUST_LOG=info
    ```
    
-   Note: The PREFIX can be customized to any character(s) you prefer (default is "!")
+   **Note:** The PREFIX can be customized to any character(s) you prefer
 
-4. **Build and run**
+4. **Set up AI Chat (Optional - for LM Studio/Ollama functionality)**
+   
+   Create an `lmapiconf.txt` file in the project root:
+   ```bash
+   # Copy from the example and customize  
+   cp example_lmapiconf.txt lmapiconf.txt
+   ```
+   
+   Edit `lmapiconf.txt` with your AI server settings:
+   ```
+   LM_STUDIO_BASE_URL=http://127.0.0.1:11434  # Ollama default
+   LM_STUDIO_TIMEOUT=30
+   DEFAULT_MODEL=your-model-name
+   DEFAULT_TEMPERATURE=0.8
+   DEFAULT_MAX_TOKENS=2048
+   MAX_DISCORD_MESSAGE_LENGTH=2048
+   RESPONSE_FORMAT_PADDING=25
+   ```
+   
+   **Important:** All settings are mandatory - no defaults provided. See `example_lmapiconf.txt` for guidance.
+
+5. **Build and run**
    ```bash
    cargo build --release
    cargo run
@@ -92,11 +136,15 @@ meri_bot_rust/
 ├── src/
 │   ├── main.rs                # Entry point
 │   ├── meri_bot.rs           # Main bot logic
-│   └── profilepfp.rs         # Profile picture command
+│   ├── profilepfp.rs         # Profile picture command
+│   └── lm.rs                 # LM Studio AI chat command
 ├── target/                   # Rust build artifacts
 ├── Cargo.toml                # Dependencies
-├── bot_config.txt           # Bot configuration (create this)
-├── example_bot_config.txt   # Example configuration file
+├── botconfig.txt            # Bot configuration (create this)
+├── example_botconfig.txt    # Example bot configuration file
+├── lmapiconf.txt            # LM Studio/Ollama API configuration (required for AI commands)
+├── example_lmapiconf.txt    # Example LM API configuration template
+├── system_prompt.txt        # AI system prompt (required for AI commands)
 ├── run_bot.ps1              # Helper script to run the bot
 └── README.md                # This file
 ```
@@ -110,8 +158,15 @@ The bot uses the following configuration:
 ## Usage
 
 The bot responds to commands with the configured prefix (default: `^`):
-- Type `^help` in any channel the bot can see to get a list of commands
-- Commands are case-insensitive
+- Type `^help` in any channel the bot can see to get a comprehensive command list
+- Commands are case-insensitive and show typing indicators
+- All commands provide helpful error messages and usage guidance
+
+### Quick Start
+1. `^ping` - Test basic bot functionality
+2. `^help` - View all available commands with categories and aliases  
+3. `^ppfp @user` - Try the profile picture feature
+4. `^lm Hello!` - Test AI chat (requires configuration)
 
 ### Profile Picture Command
 
@@ -125,6 +180,25 @@ The `^ppfp` command displays user profile pictures in rich embeds:
   - Clickable title links to high-resolution original image
   - Memory-efficient: downloads images to RAM, no disk storage
   - Shows requester information and timestamp
+
+### AI Chat Command (LM Studio/Ollama)
+
+The `^lm` command provides AI chat functionality via LM Studio or Ollama:
+
+- **Usage**: `^lm <your prompt>` 
+- **Aliases**: `^llm <prompt>`, `^ai <prompt>`, `^chat <prompt>`
+- **Features**:
+  - Real-time response streaming with typing indicators
+  - Automatic Discord message chunking (configurable limit)
+  - Multiple response parts with clear numbering
+  - Intelligent model management (no manual loading/unloading)
+  - Comprehensive error handling and user feedback
+  - Configurable temperature, tokens, and formatting
+- **Requirements**:
+  - LM Studio (default: localhost:1234) or Ollama (default: localhost:11434)
+  - Valid model loaded in your AI server
+  - Complete `lmapiconf.txt` configuration (7 required settings)
+  - `system_prompt.txt` file for AI personality/behavior
 
 ## Development
 
@@ -145,15 +219,21 @@ async fn mycommand(ctx: &Context, msg: &Message) -> CommandResult {
 }
 ```
 
-### Adding Dependencies
+### Dependencies
 
-The bot uses several key dependencies:
-- `serenity` - Discord API wrapper
-- `tokio` - Async runtime
-- `reqwest` - HTTP client for downloading images
+The bot uses these key dependencies:
 
-Add new dependencies to `Cargo.toml` as needed.
+#### Core Framework
+- `serenity` (0.11) - Discord API wrapper with command framework
+- `tokio` (1.x) - Async runtime with full features
 
-## License
+#### HTTP & Networking  
+- `reqwest` (0.11) - HTTP client with JSON and streaming support
+- `futures-util` (0.3) - Stream processing utilities
+- `tokio-stream` (0.1) - Async stream utilities with io-util features
 
-This project is open source and available under the [MIT License](LICENSE). 
+#### Data Handling
+- `serde` (1.0) - JSON serialization/deserialization with derive macros
+- `serde_json` (1.0) - JSON processing for API requests/responses
+
+All dependencies are specified in `Cargo.toml` with appropriate feature flags for optimal performance and functionality.
