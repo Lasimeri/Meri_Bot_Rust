@@ -271,10 +271,7 @@ pub async fn buffer_chat_response(
         stream: true,
     };
 
-    // Debug logging to see exactly what model is being used
-    println!("🔍 API Request Debug - Model: '{}', URL: {}", model, config.base_url);
-    println!("🔍 Full request: model='{}', temperature={}, max_tokens={}", 
-        model, config.default_temperature, config.default_max_tokens);
+
 
     let response = client
         .post(&format!("{}/v1/chat/completions", config.base_url))
