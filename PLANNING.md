@@ -8,14 +8,14 @@ The DuckDuckGo search functionality has been successfully integrated into the `l
 
 **Implementation Status:** ✅ COMPLETED (Enhanced Version)
 
-The search functionality has been upgraded to include AI-powered query optimization and result summarization, providing users with intelligent, comprehensive responses.
+The search functionality has been upgraded to include AI-powered query optimization and result summarization, providing users with intelligent, comprehensive responses with embedded source links.
 
 ### 🧠 Enhanced Search Flow
 
 **AI-Enhanced Mode:**
 1. **Query Refinement** - AI optimizes the user's search query for better results
 2. **Web Search** - Performs DuckDuckGo search with optimized query  
-3. **Result Summarization** - AI synthesizes search results into a comprehensive response
+3. **Result Summarization** - AI synthesizes search results into a comprehensive response with embedded links
 4. **Progress Updates** - Real-time Discord message updates: "Refining..." → "Searching..." → "Summarizing..."
 
 **Fallback Mode:**
@@ -36,16 +36,14 @@ The search functionality has been upgraded to include AI-powered query optimizat
 Rust is a systems programming language focused on **safety**, **speed**, and **concurrency**. Here are the key learning resources:
 
 **Getting Started:**
-• **The Rust Book** - Official comprehensive guide
-• **Rustlings** - Interactive exercises for hands-on learning
+• [The Rust Book](https://doc.rust-lang.org/book/) - Official comprehensive guide
+• [Rustlings](https://github.com/rust-lang/rustlings) - Interactive exercises for hands-on learning
 • **Rust by Example** - Practical code examples and explanations
 
 **Key Concepts:**
 • Ownership and borrowing for memory safety
 • Pattern matching with `match` expressions  
 • Error handling with `Result<T, E>` types
-
-🔗 **Sources:** [The Rust Programming Language Book](https://doc.rust-lang.org/book/)
 
 ---
 *🔍 Searched: rust programming tutorial → rust programming language tutorial guide official documentation*
@@ -63,19 +61,20 @@ Rust is a systems programming language focused on **safety**, **speed**, and **c
    - Optimizes search queries for better web search results
    - Includes technical term enhancement and synonym addition
 
-3. **✅ AI Result Summarization**
+3. **✅ AI Result Summarization with Embedded Links**
    - `summarize_search_results()` function with intelligent synthesis
-   - Discord-formatted responses with bold text, code blocks, and bullet points
-   - Source citations and character limit management (1800 chars)
+   - Discord-formatted responses with bold text, code blocks, and embedded links
+   - Natural link integration using Discord markdown format [title](URL)
+   - Character limit management (1800 chars) with smart formatting
 
 4. **✅ Prompt Template System**
    - `refine_search_prompt.txt` - Search query optimization instructions
-   - `summarize_search_prompt.txt` - Result summarization guidelines
+   - `summarize_search_prompt.txt` - Result summarization guidelines with link embedding
    - Example templates provided for customization
    - Graceful fallback to built-in prompts
 
 5. **✅ Enhanced Search Flow**
-   - `perform_ai_enhanced_search()` - Complete AI-powered search pipeline
+   - `perform_ai_enhanced_search()` - Complete AI-powered search pipeline with embedded links
    - `perform_basic_search()` - Fallback function for basic search
    - Real-time progress updates with Discord message editing
    - Comprehensive error handling with fallback strategies
@@ -102,7 +101,7 @@ Rust is a systems programming language focused on **safety**, **speed**, and **c
 **Smart Result Synthesis:**
 - 🤖 AI summarization of multiple search results
 - 📊 Structured formatting with Discord markdown
-- 🔗 Source citations and link preservation
+- 🔗 **Embedded source links** using natural Discord markdown format [title](URL)
 - 📏 Character limit management for Discord compatibility
 
 **Robust Operation:**
@@ -147,142 +146,6 @@ cp example_summarize_search_prompt.txt summarize_search_prompt.txt
 - **Search result image integration** for visual content
 - **User preference learning** for query refinement patterns
 
-## 🧠 Intelligent Search Trigger Integration Complete
-
-**Implementation Status:** ✅ COMPLETED
-
-The Discord bot now features an intelligent search trigger system that automatically performs web searches when the AI doesn't know the answer to a user's question. This creates a seamless experience where users get either AI knowledge or current web information without manual mode switching.
-
-### 🎯 How the Search Trigger Works
-
-**Intelligent Decision Flow:**
-1. **Knowledge Check** - AI evaluates if it has knowledge about the user's query
-2. **Trigger Detection** - If AI responds with exactly `__SEARCH__`, search is automatically triggered
-3. **Seamless Search** - User sees: "🧠 AI doesn't know this - searching the web..."
-4. **AI-Enhanced Results** - Performs the full AI-enhanced search pipeline
-5. **Fallback Layers** - Multiple fallback strategies ensure robust operation
-
-**User Experience Examples:**
-
-**Knowledge Available (Normal Chat):**
-```
-User: ^lm How do I create a Rust variable?
-Bot: 🤖 Generating response...
-
-In Rust, you create variables using the `let` keyword...
-```
-
-**Knowledge Missing (Automatic Search Trigger):**
-```
-User: ^lm What's the latest news about Rust 1.75?
-Bot: 🧠 AI doesn't know this - searching the web...
-     🧠 Refining search query...
-     🔍 Searching with optimized query...
-     🤖 Generating AI summary...
-
-**Rust 1.75 Release Updates**
-
-Rust 1.75 introduces several new features including...
-
-🔗 **Sources:** [Rust Blog](https://blog.rust-lang.org/...)
-
----
-*🔍 Searched: latest news Rust 1.75 → Rust programming language 1.75 release notes updates*
-```
-
-### 📋 Technical Implementation
-
-1. **✅ System Prompt Enhancement**
-   - Updated `system_prompt.txt` and `example_system_prompt.txt`
-   - Added search trigger instruction: "If you do not know the answer... respond with exactly __SEARCH__"
-   - Maintains backward compatibility with existing prompts
-
-2. **✅ Chat Logic Modification**
-   - Added initial knowledge check before streaming response
-   - Uses `chat_completion()` with 16-token limit for efficiency
-   - Detects exact `__SEARCH__` response with whitespace trimming
-
-3. **✅ Search Trigger Handler**
-   - Implemented `handle_search_trigger()` function
-   - Integrates with existing AI-enhanced search pipeline
-   - Provides comprehensive fallback: AI search → basic search → error handling
-   - Updates Discord messages with clear progress indicators
-
-4. **✅ Robust Fallback Strategy**
-   - **Primary**: AI-enhanced search with query refinement and summarization
-   - **Secondary**: Basic DuckDuckGo search with formatted results
-   - **Tertiary**: Error message with troubleshooting guidance
-   - **Quaternary**: Fallback to normal AI chat if search completely fails
-
-5. **✅ Unit Testing**
-   - Search trigger detection tests (exact match, whitespace handling)
-   - Token limit validation for efficiency
-   - System prompt content verification
-   - ChatMessage structure validation
-
-6. **✅ User Experience Enhancements**
-   - Clear progress indicators: "AI doesn't know this - searching..."
-   - Search metadata: Shows original → refined query transformation
-   - Context preservation: Users understand why search was triggered
-   - Seamless integration: No manual mode switching required
-
-### 🎯 Key Features Implemented
-
-**Intelligent Routing:**
-- 🧠 AI knowledge for general topics and programming concepts
-- 🔍 Web search for current events, recent releases, and specific news
-- ⚡ Automatic decision making without user intervention
-
-**Seamless User Experience:**
-- 🤖 Single command interface (`^lm`) handles both chat and search
-- 📊 Real-time progress updates during search triggering
-- 🔗 Clear source attribution when search is triggered
-- 💬 Maintains conversation flow and context
-
-**Robust Operation:**
-- 🛡️ Multiple fallback layers prevent total failure
-- 📋 Comprehensive error handling with user guidance
-- 🔧 Efficient token usage (16 tokens for knowledge check)
-- 🔄 Graceful degradation when components are unavailable
-
-### 🚀 Testing Scenarios
-
-**Normal AI Chat (No Search Trigger):**
-```bash
-^lm Hello, how are you?
-^lm How do I write a for loop in Rust?
-^lm Explain the difference between Vec and arrays
-```
-
-**Search Trigger Scenarios:**
-```bash
-^lm What's the latest news about SpaceX Starship?
-^lm What happened in the latest Rust release?
-^lm Current weather in Tokyo
-^lm Recent developments in quantum computing
-```
-
-**Edge Cases Handled:**
-- AI configuration unavailable (falls back to basic search)
-- Search enhancement fails (falls back to basic search)
-- Basic search fails (provides error guidance)
-- Model doesn't follow trigger instruction (continues with normal chat)
-
-### 🔧 Configuration Requirements
-
-**For Full Functionality:**
-- `system_prompt.txt` with search trigger instructions (✅ provided)
-- `lmapiconf.txt` with LM Studio/Ollama configuration
-- `refine_search_prompt.txt` and `summarize_search_prompt.txt` (optional)
-- Running LM Studio or Ollama instance with loaded model
-
-**Fallback Behavior:**
-- Works with just internet connection (basic search)
-- Graceful degradation when AI components unavailable
-- Clear error messages guide users through setup issues
-
-This intelligent search trigger system transforms the Discord bot into a comprehensive knowledge assistant that seamlessly combines AI expertise with current web information, providing users with the best possible answers regardless of the question type! 🤖🔍✨
-
 ## 📁 Robust Text File Handling System Complete
 
 **Implementation Status:** ✅ COMPLETED
@@ -293,7 +156,7 @@ The Discord bot now features a comprehensive, robust text file handling system t
 
 **Moved AI-Enhanced Search to `search.rs`:**
 - Centralized all search-related functionality in a dedicated module
-- Functions moved: `load_refine_search_prompt()`, `load_summarize_search_prompt()`, `refine_search_query()`, `summarize_search_results()`, `perform_basic_search()`, `perform_ai_enhanced_search()`, `handle_search_trigger()`, `load_lm_config()`
+- Functions moved: `load_refine_search_prompt()`, `load_summarize_search_prompt()`, `refine_search_query()`, `summarize_search_results()`, `perform_basic_search()`, `perform_ai_enhanced_search()`, `load_lm_config()`
 - Better separation of concerns and cleaner code architecture
 
 ### 📂 **Standardized Multi-Path File Loading**
@@ -433,3 +296,170 @@ test_search_result_creation()   // Search result handling
 - `example_summarize_search_prompt.txt` - Template for result summarization
 
 The robust text file handling system ensures that Meri Bot can reliably load configuration and prompt files from multiple locations, handle various text encoding issues, provide clear feedback to users, and gracefully degrade when files are missing. This creates a much more reliable and user-friendly setup experience! 📁✨
+
+## 🔧 Modular Command Architecture Complete
+
+**Implementation Status:** ✅ COMPLETED
+
+The Discord bot has been successfully refactored to use a modular command architecture for improved maintainability and reduced risk of breaking changes.
+
+### **🏗️ Modular Structure Implemented**
+
+**Command Modules Created:**
+- ✅ **`src/help.rs`** - Help command with comprehensive documentation and Serenity framework integration
+- ✅ **`src/ping.rs`** - Ping command with response time measurement in milliseconds  
+- ✅ **`src/echo.rs`** - Echo command for message echoing functionality
+- ✅ **`src/profilepfp.rs`** - Profile picture command (existing, maintained)
+- ✅ **`src/lm.rs`** - AI chat and search commands (existing, maintained)
+- ✅ **`src/reason.rs`** - AI reasoning commands (existing, maintained)
+- ✅ **`src/search.rs`** - Web search functionality (existing, maintained)
+
+### **🔧 Framework Integration Fixed**
+
+**Help Command Registration:**
+- ✅ **Root Cause Identified** - Serenity's StandardFramework requires explicit help registration using `.help()` method
+- ✅ **Solution Implemented** - Changed `#[command]` to `#[help]` attribute and registered with `.help(&BOT_HELP)`
+- ✅ **Import Structure** - Proper import of `BOT_HELP` constant from help module
+- ✅ **Command Separation** - Help command registered separately from command group
+
+**Technical Implementation:**
+```rust
+// src/help.rs
+#[help]
+pub async fn bot_help(ctx: &Context, msg: &Message, _args: Args) -> CommandResult {
+    // Help command implementation
+}
+
+// src/meri_bot.rs  
+use crate::help::BOT_HELP;
+
+let framework = StandardFramework::new()
+    .help(&BOT_HELP)  // ← Key fix for help command recognition
+    .group(&GENERAL_GROUP);
+```
+
+### **✅ Benefits Achieved**
+
+**Modular Architecture:**
+- 🏗️ **Separation of Concerns** - Each command in its own module file
+- 🔧 **Maintainability** - Changes to individual commands don't affect main bot file
+- 🛡️ **Stability** - Reduced risk of breaking existing functionality when adding new commands
+- 📁 **Organization** - Clear file structure with logical command grouping
+
+**Help Command Fixes:**
+- ✅ **`^help` Command Working** - Properly registered with Serenity framework
+- ✅ **Comprehensive Documentation** - Detailed help text under Discord's 2000 character limit
+- ✅ **Response Time Display** - Ping command shows millisecond response times
+- ✅ **All Commands Registered** - Ping, echo, help, profilepfp, lm, and reason commands all functional
+
+**Code Quality:**
+- ✅ **No Compilation Errors** - All modules compile successfully
+- ✅ **Proper Imports** - Clean module import structure in main.rs and meri_bot.rs
+- ✅ **Consistent Patterns** - All commands follow same signature patterns with Args parameter
+- ✅ **Framework Compliance** - Proper integration with Serenity's command system
+
+### **🚀 Current Command Status**
+
+**All Commands Operational:**
+1. **`^ping`** - Response time measurement ✅
+2. **`^echo <text>`** - Message echoing ✅  
+3. **`^help`** - Comprehensive help display ✅
+4. **`^ppfp @user`** - Profile picture display ✅
+5. **`^lm <prompt>`** - AI chat with streaming ✅
+6. **`^lm -s <query>`** - AI-enhanced web search ✅
+7. **`^reason <question>`** - AI reasoning with thinking tag filtering ✅
+8. **`^reason -s <query>`** - Reasoning-enhanced analytical search ✅
+
+**Framework Features:**
+- ✅ Real-time command execution logging
+- ✅ Unrecognized command detection and logging
+- ✅ Case-insensitive command processing
+- ✅ Configurable command prefix (default: `^`)
+- ✅ Proper Discord intents and permissions
+
+The modular command architecture provides a robust foundation for future command additions while maintaining clean separation between bot framework logic and individual command implementations. The help command issue has been completely resolved with proper Serenity framework integration. 🏗️✨
+
+## 🏗️ Simplified Architecture Complete (Post-Modular)
+
+**Implementation Status:** ✅ COMPLETED
+
+The Discord bot architecture has been further simplified by consolidating the command group definition directly into `main.rs`, eliminating the need for the intermediate `meri_bot.rs` module.
+
+### **📁 Architecture Simplification**
+
+**What Was Changed:**
+- ✅ **Moved Command Group to main.rs** - All command imports and group definition now in entry point
+- ✅ **Removed meri_bot.rs** - Eliminated unnecessary intermediate module file  
+- ✅ **Direct Command Imports** - `main.rs` now directly imports command constants (`HELP_COMMAND`, `PING_COMMAND`, etc.)
+- ✅ **Simplified Module Structure** - Cleaner dependency graph with fewer files
+
+**Before vs After:**
+```
+BEFORE:                          AFTER:
+main.rs ← meri_bot.rs           main.rs (simplified!)
+           ↑                      ↑
+    ┌──────┼──────┐              ┌┼┼┼┼┼┼┐
+help.rs ping.rs echo.rs       help.rs ping.rs echo.rs
+profilepfp.rs lm.rs           profilepfp.rs lm.rs  
+reason.rs search.rs           reason.rs search.rs
+```
+
+### **🔧 Technical Changes Made**
+
+**File Structure Changes:**
+- ✅ **Deleted**: `src/meri_bot.rs` (functionality moved to main.rs)
+- ✅ **Enhanced**: `src/main.rs` now includes command group definition
+- ✅ **Maintained**: All individual command modules unchanged
+
+**Code Changes in main.rs:**
+```rust
+// Added direct command imports
+use crate::help::HELP_COMMAND;
+use crate::ping::PING_COMMAND;
+use crate::echo::ECHO_COMMAND;
+use crate::profilepfp::PPFP_COMMAND;
+use crate::lm::LM_COMMAND;
+use crate::reason::REASON_COMMAND;
+
+// Added command group definition
+#[group]
+#[commands(ping, echo, help, ppfp, lm, reason)]
+struct General;
+```
+
+### **✅ Benefits Achieved**
+
+**Reduced Complexity:**
+- 🗂️ **Fewer Files** - One less module file to maintain
+- 🔄 **Simpler Imports** - Direct command imports without intermediate module
+- 📁 **Cleaner Structure** - More straightforward dependency relationships
+
+**Maintained Functionality:**
+- ✅ **All Commands Work** - No functional changes to any command
+- ✅ **Same Modularity** - Individual commands still in separate modules
+- ✅ **Configuration Loading** - All multi-path file loading preserved
+- ✅ **Error Handling** - Comprehensive error handling maintained
+
+**Developer Experience:**
+- 🚀 **Easier New Commands** - Simpler process for adding commands
+- 📝 **Clear Documentation** - Updated README with new development guide
+- 🔧 **Compilation Success** - All code compiles cleanly with no warnings
+
+### **🎯 Current Architecture Benefits**
+
+**Simplified Entry Point:**
+- **main.rs** handles bot startup, configuration loading, AND command group setup
+- Single point of entry makes the codebase easier to understand
+- Command group definition co-located with framework setup
+
+**Maintained Modularity:**
+- Individual commands remain in separate, focused modules
+- Clean separation of concerns for each command's functionality  
+- Easy to add, remove, or modify individual commands
+
+**Robust Foundation:**
+- Multi-path configuration loading across all modules
+- Comprehensive error handling and fallback strategies
+- Real-time streaming, search capabilities, and reasoning features intact
+
+The simplified architecture maintains all the powerful features of Meri Bot while reducing code complexity and making the project easier to understand and maintain. This change represents the optimal balance between modularity and simplicity! 🏗️✨

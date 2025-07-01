@@ -55,15 +55,91 @@ struct MessageState {
 #[command]
 #[aliases("reasoning")]
 pub async fn reason(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
-    let prompt = args.message().trim();
+    let input = args.message().trim();
     
     // Start typing indicator
     let _typing = ctx.http.start_typing(msg.channel_id.0)?;
     
-    if prompt.is_empty() {
-        msg.reply(ctx, "❌ Please provide a reasoning prompt! Usage: `^reason <your reasoning question>`").await?;
+    if input.is_empty() {
+        msg.reply(ctx, "❌ Please provide a reasoning prompt! Usage: `^reason <your reasoning question>` or `^reason -s <search query>`").await?;
         return Ok(());
     }
+
+    // Check if this is a search request
+    if input.starts_with("-s ") || input.starts_with("--search ") {
+        // Extract search query
+        let search_query = if input.starts_with("-s ") {
+            &input[3..]
+        } else {
+            &input[9..] // "--search "
+        };
+
+        if search_query.trim().is_empty() {
+            msg.reply(ctx, "❌ Please provide a search query! Usage: `^reason -s <search query>`").await?;
+            return Ok(());
+        }
+
+        // Load LM Studio configuration for AI-enhanced reasoning search
+        let config = match load_reasoning_config().await {
+            Ok(config) => config,
+            Err(e) => {
+                eprintln!("❌ Failed to load LM Studio configuration for reasoning search: {}", e);
+                // Fallback to basic search without AI enhancement
+                return crate::search::perform_basic_search(ctx, msg, search_query).await.map_err(|e| e.into());
+            }
+        };
+
+        // Send initial search message
+        let mut search_msg = match msg.channel_id.send_message(&ctx.http, |m| {
+            m.content("🧠 Refining search query for reasoning analysis...")
+        }).await {
+            Ok(message) => message,
+            Err(e) => {
+                eprintln!("❌ Failed to send initial search message: {}", e);
+                msg.reply(ctx, "❌ Failed to send message!").await?;
+                return Ok(());
+            }
+        };
+
+        // Reasoning-Enhanced Search Flow
+        match perform_reasoning_enhanced_search(search_query, &config, &mut search_msg, ctx).await {
+            Ok(()) => {
+                println!("🧠 Reasoning-enhanced search completed successfully for query: '{}'", search_query);
+            }
+            Err(e) => {
+                eprintln!("❌ Reasoning-enhanced search failed: {}", e);
+                // Fallback to basic search
+                if let Err(fallback_error) = search_msg.edit(&ctx.http, |m| {
+                    m.content("🔍 AI enhancement failed, performing basic search...")
+                }).await {
+                    eprintln!("❌ Failed to update message for fallback: {}", fallback_error);
+                }
+                
+                // Perform basic search as fallback
+                match crate::search::ddg_search(search_query).await {
+                    Ok(results) => {
+                        let formatted_results = crate::search::format_search_results(&results, search_query);
+                        if let Err(e) = search_msg.edit(&ctx.http, |m| {
+                            m.content(&formatted_results)
+                        }).await {
+                            eprintln!("❌ Failed to update search message: {}", e);
+                        }
+                    }
+                    Err(basic_error) => {
+                        let error_msg = format!("❌ **Reasoning Search Failed**\n\nQuery: `{}`\nError: {}\n\n💡 Try rephrasing your search query or check your internet connection.", search_query, basic_error);
+                        let _ = search_msg.edit(&ctx.http, |m| {
+                            m.content(&error_msg)
+                        }).await;
+                    }
+                }
+            }
+        }
+
+        return Ok(());
+    }
+
+    // Regular reasoning functionality
+    let prompt = input;
 
     // Load LM Studio configuration
     let config = match load_reasoning_config().await {
@@ -592,4 +668,179 @@ async fn finalize_message_content(
     }).await?;
 
     Ok(())
+}
+
+/// Perform reasoning-enhanced search with direct user query and analytical summarization
+async fn perform_reasoning_enhanced_search(
+    user_query: &str,
+    config: &LMConfig,
+    search_msg: &mut Message,
+    ctx: &Context,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Step 1: Use the user's exact query for searching (no refinement)
+    println!("🧠 Using exact user query for reasoning search: '{}'", user_query);
+    
+    // Update message to show search progress
+    search_msg.edit(&ctx.http, |m| {
+        m.content("🔍 Searching with your exact query...")
+    }).await.map_err(|e| format!("Failed to update message: {}", e))?;
+
+    // Step 2: Perform the web search with user's exact query
+    let results = crate::search::ddg_search(user_query).await
+        .map_err(|e| format!("Search failed: {}", e))?;
+    
+    // Update message to show reasoning analysis progress
+    search_msg.edit(&ctx.http, |m| {
+        m.content("🧠 Analyzing search results with reasoning model...")
+    }).await.map_err(|e| format!("Failed to update message: {}", e))?;
+
+    // Step 3: Analyze the search results using reasoning model with embedded links
+    let analysis = analyze_search_results_with_reasoning(&results, user_query, user_query, config).await?;
+    
+    // Add search metadata to the analysis
+    let final_response = format!(
+        "{}\n\n---\n*🧠 Reasoning Search: {}*",
+        analysis,
+        user_query
+    );
+
+    // Step 4: Post the final reasoning-enhanced analysis
+    search_msg.edit(&ctx.http, |m| {
+        m.content(&final_response)
+    }).await.map_err(|e| format!("Failed to update message: {}", e))?;
+
+    Ok(())
+}
+
+/// Analyze search results using reasoning model with embedded links
+async fn analyze_search_results_with_reasoning(
+    results: &[crate::search::SearchResult],
+    _search_query: &str,
+    user_query: &str,
+    config: &LMConfig,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    println!("🧠 Reasoning analysis: Generating analytical summary for {} results", results.len());
+    
+    let analysis_prompt = load_reasoning_search_analysis_prompt().await.unwrap_or_else(|_| {
+        "You are an expert analytical reasoner. Analyze these web search results to provide a comprehensive, logical analysis that addresses the user's query. Focus on reasoning through the information, identifying patterns, drawing connections, and providing insights. Use Discord formatting and embed relevant links naturally in your analysis using [title](URL) format. Keep under 1800 characters.".to_string()
+    });
+
+    // Format the results for the reasoning model with both text and links
+    let mut formatted_results = String::new();
+    for (index, result) in results.iter().enumerate() {
+        formatted_results.push_str(&format!(
+            "Source {}: {}\nURL: {}\nContent: {}\n\n",
+            index + 1,
+            result.title,
+            result.link,
+            if result.snippet.is_empty() { "No content preview available" } else { &result.snippet }
+        ));
+    }
+
+    let user_prompt = format!(
+        "User's search query: {}\n\nSources to analyze:\n{}\n\nPlease provide a comprehensive analytical reasoning response that:\n1. Addresses the user's question through logical analysis\n2. Synthesizes information from multiple sources\n3. Draws meaningful connections and insights\n4. Embeds 2-3 most relevant source links naturally using [title](URL) format\n5. Uses clear reasoning and step-by-step thinking where appropriate",
+        user_query, formatted_results
+    );
+
+    let messages = vec![
+        ChatMessage {
+            role: "system".to_string(),
+            content: analysis_prompt,
+        },
+        ChatMessage {
+            role: "user".to_string(),
+            content: user_prompt,
+        },
+    ];
+
+    let analysis = chat_completion_reasoning(
+        messages,
+        &config.default_reason_model,
+        config,
+        Some(512), // Limit tokens for analysis to ensure it fits Discord
+    ).await?;
+
+    println!("🧠 Reasoning analysis: Generated analysis of {} characters", analysis.len());
+    Ok(analysis)
+}
+
+/// Load reasoning-specific search analysis prompt
+async fn load_reasoning_search_analysis_prompt() -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    // Try to load reasoning-specific search analysis prompt first, fall back to general prompts
+    let prompt_paths = [
+        "reasoning_search_analysis_prompt.txt",
+        "../reasoning_search_analysis_prompt.txt",
+        "../../reasoning_search_analysis_prompt.txt",
+        "src/reasoning_search_analysis_prompt.txt",
+        "summarize_search_prompt.txt",
+        "../summarize_search_prompt.txt", 
+        "../../summarize_search_prompt.txt",
+        "src/summarize_search_prompt.txt",
+        "example_summarize_search_prompt.txt",
+        "../example_summarize_search_prompt.txt",
+        "../../example_summarize_search_prompt.txt", 
+        "src/example_summarize_search_prompt.txt",
+    ];
+    
+    for path in &prompt_paths {
+        match fs::read_to_string(path) {
+            Ok(content) => {
+                // Remove BOM if present  
+                let content = content.strip_prefix('\u{feff}').unwrap_or(&content);
+                println!("🧠 Reasoning analysis: Loaded prompt from {}", path);
+                return Ok(content.trim().to_string());
+            }
+            Err(_) => continue,
+        }
+    }
+    
+    // Final fallback prompt
+    Ok("You are an expert analytical reasoner. Analyze these web search results to provide a comprehensive, logical analysis. Focus on reasoning through the information, identifying patterns, and providing insights. Use Discord formatting and embed relevant links naturally using [title](URL) format.".to_string())
+}
+
+/// Non-streaming chat completion specifically for reasoning tasks
+async fn chat_completion_reasoning(
+    messages: Vec<ChatMessage>,
+    model: &str,
+    config: &LMConfig,
+    max_tokens: Option<i32>,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(config.timeout))
+        .build()?;
+        
+    let chat_request = ChatRequest {
+        model: model.to_string(),
+        messages,
+        temperature: 0.5, // Slightly higher temperature for reasoning tasks
+        max_tokens: max_tokens.unwrap_or(config.default_max_tokens),
+        stream: false,
+    };
+
+    let response = client
+        .post(&format!("{}/v1/chat/completions", config.base_url))
+        .json(&chat_request)
+        .send()
+        .await?;
+
+    if !response.status().is_success() {
+        return Err(format!("API request failed: HTTP {}", response.status()).into());
+    }
+
+    // Parse non-streaming response
+    let response_text = response.text().await?;
+    let response_json: serde_json::Value = serde_json::from_str(&response_text)?;
+    
+    // Extract content from response
+    if let Some(choices) = response_json["choices"].as_array() {
+        if let Some(first_choice) = choices.get(0) {
+            if let Some(message) = first_choice["message"].as_object() {
+                if let Some(content) = message["content"].as_str() {
+                    return Ok(content.trim().to_string());
+                }
+            }
+        }
+    }
+    
+    Err("Failed to extract content from reasoning API response".into())
 } 

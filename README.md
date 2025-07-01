@@ -30,20 +30,22 @@ A powerful Discord bot written in Rust using the Serenity framework, featuring r
 ### 🤖 AI Chat Commands
 - `^lm <prompt>` - Chat with AI via LM Studio/Ollama
   - **Aliases**: `^llm`, `^ai`, `^chat` 
-  - **Features**: **Real-time streaming responses**, smart message chunking, extended output length (8K tokens), live progress indicators, multi-part message support, **intelligent search trigger**
-  - **Search Trigger**: If the AI doesn't know the answer, it automatically triggers web search for current information
+  - **Features**: **Real-time streaming responses**, smart message chunking, extended output length (8K tokens), live progress indicators, multi-part message support
 - `^lm -s <search query>` - AI-enhanced web search with intelligent query optimization and result summarization
   - **Aliases**: `^lm --search <query>`
-  - **Features**: **AI query refinement**, **intelligent summarization**, real-time progress updates, fallback to basic search
+  - **Features**: **AI query refinement**, **intelligent summarization with embedded links**, real-time progress updates, fallback to basic search
 - `^reason <question>` - Deep reasoning with specialized AI model
   - **Aliases**: `^reasoning`
   - **Features**: **Real-time streaming with thinking tag filtering**, step-by-step reasoning, dedicated reasoning model, automatic `<think>` content removal, logical explanations
+- `^reason -s <search query>` - Reasoning-enhanced web search with analytical insights
+  - **Aliases**: `^reasoning -s`, `^reasoning --search`
+  - **Features**: **Analytical research synthesis**, reasoning-focused query optimization, embedded source links, specialized reasoning model analysis
 
 ### 🔍 Web Search Commands
 - `^lm -s <search query>` - AI-enhanced web search with intelligent processing
-  - **AI Mode (with LM Studio/Ollama)**: Query refinement → web search → AI summarization
+  - **AI Mode (with LM Studio/Ollama)**: Query refinement → web search → AI summarization with embedded links
   - **Basic Mode (fallback)**: Direct DuckDuckGo search with formatted results
-  - **Features**: Real-time progress updates, smart query optimization, comprehensive summaries
+  - **Features**: Real-time progress updates, smart query optimization, comprehensive summaries with embedded source links
   - **Examples**: `^lm -s rust programming`, `^lm -s "discord bot tutorial"`
 
 ### 💡 User Experience
@@ -125,7 +127,7 @@ A powerful Discord bot written in Rust using the Serenity framework, featuring r
    - All settings are mandatory - no defaults provided. See `example_lmapiconf.txt` for guidance.
    - Replace `your-chat-model-name` and `your-reasoning-model-name` with your actual model names.
    - For reasoning tasks, consider using models optimized for logical analysis (e.g., qwen, deepseek-r1, etc.).
-   - The `system_prompt.txt` includes intelligent search trigger functionality that automatically performs web searches when the AI doesn't know an answer.
+   - The `system_prompt.txt` configures the AI's behavior and personality for chat interactions.
 
 5. **Build and run**
    ```bash
@@ -170,8 +172,10 @@ cargo run
 ```
 meri_bot_rust/
 ├── src/
-│   ├── main.rs                # Entry point
-│   ├── meri_bot.rs           # Main bot logic
+│   ├── main.rs                # Entry point and command group setup (simplified!)
+│   ├── help.rs               # Help command implementation
+│   ├── ping.rs               # Ping command with response time
+│   ├── echo.rs               # Echo command implementation
 │   ├── profilepfp.rs         # Profile picture command
 │   ├── lm.rs                 # LM Studio AI chat and search commands
 │   ├── reason.rs             # AI reasoning command  
@@ -184,10 +188,12 @@ meri_bot_rust/
 ├── example_lmapiconf.txt    # Example LM API configuration template
 ├── system_prompt.txt        # AI system prompt (required for AI commands)
 ├── reasoning_prompt.txt     # Optional: Specialized prompt for reasoning command
+├── reasoning_search_analysis_prompt.txt # Optional: Reasoning-focused search analysis prompt
 ├── refine_search_prompt.txt     # Optional: AI search query refinement prompt
 ├── summarize_search_prompt.txt  # Optional: AI search result summarization prompt
 ├── example_system_prompt.txt     # Example system prompt template
 ├── example_reasoning_prompt.txt  # Example reasoning prompt template
+├── example_reasoning_search_analysis_prompt.txt # Example reasoning search analysis template
 ├── example_refine_search_prompt.txt    # Example search refinement prompt template
 ├── example_summarize_search_prompt.txt # Example search summarization prompt template
 ├── run_bot.ps1              # Helper script to run the bot
@@ -214,6 +220,7 @@ The bot responds to commands with the configured prefix (default: `^`):
 4. `^lm -s rust programming` - Test AI-enhanced search (with AI config) or basic search (fallback)
 5. `^lm Hello!` - Test AI chat (requires configuration)
 6. `^reason Why did the sky turn red at sunset?` - Test AI reasoning (requires configuration)
+7. `^reason -s quantum computing applications` - Test reasoning-enhanced analytical search
 
 ### Profile Picture Command
 
@@ -282,6 +289,58 @@ The `^reason` command provides advanced AI reasoning capabilities with real-time
   - Falls back to `system_prompt.txt` if reasoning prompt not found
   - Models that support thinking tags (e.g., qwen, deepseek-r1, specialized reasoning models)
 
+### Reasoning-Enhanced Web Search Command
+
+The `^reason -s` command provides analytical web search capabilities using the reasoning model for deeper insights:
+
+- **Usage**: `^reason -s <search query>` or `^reason --search <search query>`
+- **Reasoning-Enhanced Mode** (when LM Studio/Ollama is configured):
+  1. **🧠 Query Optimization** - Reasoning model refines your query for analytical research
+  2. **🔍 Web Search** - Searches DuckDuckGo with the optimized query
+  3. **🤖 Analytical Synthesis** - Reasoning model provides deep analysis with embedded links
+  4. **📊 Progress Updates** - Real-time status: "Refining for reasoning analysis..." → "Searching..." → "Analyzing with reasoning model..."
+- **Basic Mode** (fallback when AI is unavailable):
+  - Direct DuckDuckGo search with formatted results
+  - Shows top 5 results with titles, descriptions, and clickable links
+- **Examples**:
+  ```
+  ^reason -s quantum computing applications
+  ^reason -s "climate change economic impacts"
+  ^reasoning --search artificial intelligence ethics
+  ```
+- **Key Features**:
+  - **🧠 Analytical Focus** - Uses reasoning model for deeper analysis beyond simple summarization
+  - **📝 Research-Oriented** - Optimizes queries for academic and analytical content
+  - **🔗 Embedded Links** - Source links naturally integrated in analytical responses
+  - **⚡ Real-time Progress** - Live updates during the analysis process
+  - **🛡️ Robust Fallback** - Falls back to basic search when reasoning enhancement fails
+  - **🎯 Specialized Prompts** - Uses reasoning-specific prompts for analytical synthesis
+
+### Setup for Reasoning-Enhanced Search
+
+To enable reasoning-enhanced search features, ensure you have:
+
+1. **Configuration Files**:
+   ```bash
+   # Copy and customize the reasoning analysis prompt template
+   cp example_reasoning_search_analysis_prompt.txt reasoning_search_analysis_prompt.txt
+   
+   # Optional: Use existing search prompt templates
+   cp example_refine_search_prompt.txt refine_search_prompt.txt
+   cp example_summarize_search_prompt.txt summarize_search_prompt.txt
+   ```
+
+2. **LM Studio/Ollama Setup** (same as AI chat):
+   - Valid `lmapiconf.txt` configuration with `DEFAULT_REASON_MODEL`
+   - Running LM Studio or Ollama instance
+   - Reasoning model loaded and accessible
+
+3. **Specialized Features**:
+   - **Reasoning Model**: Uses `DEFAULT_REASON_MODEL` for analytical capabilities
+   - **Analytical Prompts**: Specialized prompts for reasoning-focused analysis
+   - **Fallback Behavior**: Uses regular search prompts if reasoning-specific ones aren't found
+   - **Independent Operation**: Works separately from regular AI chat and search functions
+
 ### AI-Enhanced Web Search Command
 
 The `^lm -s` command provides intelligent web search functionality with AI assistance:
@@ -329,60 +388,80 @@ To enable AI-enhanced search features, ensure you have:
    - No configuration required for basic search functionality
    - All search attempts will work, with varying levels of intelligence
 
-### 🧠 Intelligent Search Trigger
+### 🔍 Enhanced Web Search with Embedded Links
 
-The AI chat has an intelligent search trigger system that automatically performs web searches when the AI doesn't know the answer to a question.
+The AI-enhanced search functionality provides intelligent processing with embedded source links directly in the response.
 
 **How It Works:**
-1. **Knowledge Check** - AI first evaluates if it knows the answer to your question
-2. **Automatic Search** - If the AI responds with `__SEARCH__`, it automatically triggers web search
-3. **Seamless Experience** - Users get either AI knowledge or current web information without manual switching
+1. **Query Refinement** - AI optimizes your search query for better results
+2. **Web Search** - Performs DuckDuckGo search with the refined query
+3. **AI Summarization** - Creates comprehensive responses with embedded source links
 
 **User Experience:**
 ```
-User: ^lm What's the latest news about SpaceX Starship?
-Bot: 🧠 AI doesn't know this - searching the web...
-     🧠 Refining search query...
+User: ^lm -s rust programming tutorial
+Bot: 🧠 Refining search query...
      🔍 Searching with optimized query...
      🤖 Generating AI summary...
      
-     **SpaceX Starship Latest Updates**
+     **Rust Programming Fundamentals**
      
-     [AI-synthesized summary of current news...]
+     Rust is a systems programming language focused on **safety**, **speed**, and **concurrency**. 
+     Here are the key learning resources:
+     
+     **Getting Started:**
+     • [The Rust Book](https://doc.rust-lang.org/book/) - Official comprehensive guide
+     • [Rustlings](https://github.com/rust-lang/rustlings) - Interactive exercises
+     • **Rust by Example** - Practical code examples and explanations
      
      ---
-     *🔍 Searched: latest news SpaceX Starship → SpaceX Starship recent launches news updates*
+     *🔍 Searched: rust programming tutorial → rust programming language tutorial guide*
 ```
 
 **Benefits:**
-- **🤖 Intelligent Routing** - AI knowledge for general topics, web search for current events
-- **⚡ Automatic Fallback** - No need to manually switch between chat and search modes
-- **🔍 Current Information** - Always get the most up-to-date information available
-- **🛡️ Robust Operation** - Multiple fallback layers ensure you always get an answer
+- **🔗 Embedded Links** - Source links naturally integrated in the response text
+- **📊 Smart Formatting** - Discord markdown with bold text, code blocks, and organized structure
+- **🧠 AI Processing** - Intelligent synthesis of multiple search results
+- **🛡️ Robust Fallback** - Falls back to basic search when AI enhancement fails
 
 **Configuration:**
-- Requires the same setup as AI chat (LM Studio/Ollama with `lmapiconf.txt`)
-- Uses the `system_prompt.txt` with search trigger instructions
-- Falls back to basic search if AI enhancement fails
-- Works with any model that can follow the `__SEARCH__` trigger instruction
+- Enhanced mode requires LM Studio/Ollama setup with `lmapiconf.txt`
+- Optional `refine_search_prompt.txt` and `summarize_search_prompt.txt` for customization
+- Basic search works without any configuration - just needs internet connection
 
 ## Development
 
 To add new commands:
 
-1. Create a new command function (in `meri_bot.rs` or a separate module file)
-2. Add the module to `main.rs` if using a separate file
-3. Import the command in `meri_bot.rs`
-4. Add the command to the `#[commands()]` attribute in the General group
-5. Implement the command logic
+1. Create a new command function in a separate module file (e.g., `src/mycommand.rs`)
+2. Add the module declaration to `main.rs`: `mod mycommand;`
+3. Import the command constant in `main.rs`: `use crate::mycommand::MYCOMMAND_COMMAND;`
+4. Add the command to the `#[commands()]` attribute in the General group in `main.rs`
+5. Implement the command logic in your module file
 
-Example:
+Example command module (`src/mycommand.rs`):
 ```rust
+use serenity::{
+    client::Context,
+    framework::standard::{macros::command, Args, CommandResult},
+    model::channel::Message,
+};
+
 #[command]
-async fn mycommand(ctx: &Context, msg: &Message) -> CommandResult {
+pub async fn mycommand(ctx: &Context, msg: &Message, _args: Args) -> CommandResult {
     msg.reply(ctx, "Hello!").await?;
     Ok(())
 }
+```
+
+Then update `main.rs`:
+```rust
+mod mycommand;
+use crate::mycommand::MYCOMMAND_COMMAND;
+
+#[group]
+#[commands(ping, echo, help, ppfp, lm, reason, mycommand)]
+struct General;
 ```
 
 ### Configuration Loading

@@ -263,7 +263,7 @@ pub async fn load_summarize_search_prompt() -> Result<String, Box<dyn std::error
     
     // Fallback prompt if no file found
     println!("🔍 Result summary: Using built-in fallback prompt");
-    Ok("You are an expert information synthesizer. Summarize these web search results into a comprehensive, well-organized response under 1800 characters. Use Discord formatting (bold, code blocks) for better readability.".to_string())
+    Ok("You are an expert information synthesizer. Summarize these web search results into a comprehensive, well-organized response under 1800 characters. Use Discord formatting (bold, code blocks) for better readability. Include relevant links directly embedded in your response.".to_string())
 }
 
 /// Non-streaming chat completion for AI query refinement and summarization
@@ -314,7 +314,9 @@ async fn chat_completion(
 }
 
 /// Refine search query using AI
-pub async fn refine_search_query(
+// Note: This function is currently unused since we now use exact user queries
+#[allow(dead_code)]
+async fn refine_search_query(
     user_query: &str,
     config: &LMConfig,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
@@ -346,22 +348,34 @@ pub async fn refine_search_query(
     Ok(refined_query)
 }
 
-/// Summarize search results using AI
+/// Summarize search results using AI with embedded links
 pub async fn summarize_search_results(
-    formatted_results: &str,
-    refined_query: &str,
-    original_query: &str,
+    results: &[SearchResult],
+    _search_query: &str,
+    user_query: &str,
     config: &LMConfig,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    println!("🔍 Result summary: Generating AI summary for {} results", formatted_results.matches("**").count() / 2);
+    println!("🔍 Result summary: Generating AI summary for {} results", results.len());
     
     let summarize_prompt = load_summarize_search_prompt().await.unwrap_or_else(|_| {
-        "You are an expert information synthesizer. Summarize these web search results into a comprehensive, well-organized response under 1800 characters. Use Discord formatting (bold, code blocks) for better readability.".to_string()
+        "You are an expert information synthesizer. Summarize these web search results into a comprehensive, well-organized response under 1800 characters. Use Discord formatting (bold, code blocks) for better readability. Include relevant links directly embedded in your response.".to_string()
     });
 
+    // Format the results for the AI with both text and links
+    let mut formatted_results = String::new();
+    for (index, result) in results.iter().enumerate() {
+        formatted_results.push_str(&format!(
+            "Result {}: {}\nURL: {}\nDescription: {}\n\n",
+            index + 1,
+            result.title,
+            result.link,
+            if result.snippet.is_empty() { "No description available" } else { &result.snippet }
+        ));
+    }
+
     let user_prompt = format!(
-        "Original query: {}\nRefined query: {}\n\nSearch results to summarize:\n{}",
-        original_query, refined_query, formatted_results
+        "User's search query: {}\n\nSearch results to summarize:\n{}\n\nPlease provide a comprehensive summary that directly answers the user's question. Include relevant links by embedding them naturally in your response using Discord markdown format [title](URL). Focus on the most important information and cite 2-3 of the most relevant sources.",
+        user_query, formatted_results
     );
 
     let messages = vec![
@@ -386,90 +400,37 @@ pub async fn summarize_search_results(
     Ok(summary)
 }
 
-/// Perform basic search without AI enhancement
-pub async fn perform_basic_search(
-    ctx: &Context,
-    msg: &Message,
-    search_query: &str,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Send initial search message
-    let mut search_msg = match msg.channel_id.send_message(&ctx.http, |m| {
-        m.content("🔍 Searching DuckDuckGo...")
-    }).await {
-        Ok(message) => message,
-        Err(e) => {
-            eprintln!("❌ Failed to send initial search message: {}", e);
-            msg.reply(ctx, "❌ Failed to send message!").await?;
-            return Err(e.into());
-        }
-    };
-
-    // Perform basic search
-    match ddg_search(search_query).await {
-        Ok(results) => {
-            let formatted_results = format_search_results(&results, search_query);
-            
-            // Update message with search results
-            if let Err(e) = search_msg.edit(&ctx.http, |m| {
-                m.content(&formatted_results)
-            }).await {
-                eprintln!("❌ Failed to update search message: {}", e);
-                msg.reply(ctx, "❌ Failed to display search results!").await?;
-                return Err(e.into());
-            }
-            
-            println!("🔍 Basic search completed successfully for query: '{}'", search_query);
-        }
-        Err(e) => {
-            eprintln!("❌ Basic search failed: {}", e);
-            let error_msg = format!("❌ **Search Failed**\n\nQuery: `{}`\nError: {}\n\n💡 Try rephrasing your search query or check your internet connection.", search_query, e);
-            
-            if let Err(edit_error) = search_msg.edit(&ctx.http, |m| {
-                m.content(&error_msg)
-            }).await {
-                eprintln!("❌ Failed to update search message with error: {}", edit_error);
-                msg.reply(ctx, &error_msg).await?;
-            }
-            return Err(e.into());
-        }
-    }
-
-    Ok(())
-}
-
-/// Perform AI-enhanced search with query refinement and result summarization
+/// Perform AI-enhanced search with direct user query and result summarization with embedded links
 pub async fn perform_ai_enhanced_search(
-    original_query: &str,
+    user_query: &str,
     config: &LMConfig,
     search_msg: &mut Message,
     ctx: &Context,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Step 1: Refine the search query using AI
-    let refined_query = refine_search_query(original_query, config).await?;
+    // Step 1: Use the user's exact query for searching (no refinement)
+    println!("🔍 Using exact user query for search: '{}'", user_query);
     
     // Update message to show search progress
     search_msg.edit(&ctx.http, |m| {
-        m.content("🔍 Searching with optimized query...")
+        m.content("🔍 Searching with your exact query...")
     }).await.map_err(|e| format!("Failed to update message: {}", e))?;
 
-    // Step 2: Perform the web search with refined query
-    let results = ddg_search(&refined_query).await?;
-    let formatted_results = format_search_results(&results, &refined_query);
+    // Step 2: Perform the web search with user's exact query
+    let results = ddg_search(user_query).await?;
     
     // Update message to show summarization progress
     search_msg.edit(&ctx.http, |m| {
         m.content("🤖 Generating AI summary...")
     }).await.map_err(|e| format!("Failed to update message: {}", e))?;
 
-    // Step 3: Summarize the search results using AI
-    let summary = summarize_search_results(&formatted_results, &refined_query, original_query, config).await?;
+    // Step 3: Summarize the search results using AI with embedded links
+    let summary = summarize_search_results(&results, user_query, user_query, config).await?;
     
     // Add search metadata to the summary
     let final_response = format!(
-        "{}\n\n---\n*🔍 Searched: {} → {}*",
+        "{}\n\n---\n*🔍 Searched: {}*",
         summary,
-        original_query,
-        refined_query
+        user_query
     );
 
     // Step 4: Post the final AI-enhanced summary
@@ -478,77 +439,6 @@ pub async fn perform_ai_enhanced_search(
     }).await.map_err(|e| format!("Failed to update message: {}", e))?;
 
     Ok(())
-}
-
-/// Handle search trigger from AI chat
-pub async fn handle_search_trigger(
-    original_query: &str,
-    config: &LMConfig,
-    current_msg: &mut Message,
-    ctx: &Context,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    println!("🔍 Search trigger: Handling AI-triggered search for '{}'", original_query);
-    
-    // Update message to show search refinement
-    if let Err(e) = current_msg.edit(&ctx.http, |m| {
-        m.content("🧠 Refining search query...")
-    }).await {
-        eprintln!("❌ Failed to update message for search trigger refinement: {}", e);
-    }
-
-    // Try AI-enhanced search first
-    match perform_ai_enhanced_search(original_query, config, current_msg, ctx).await {
-        Ok(()) => {
-            println!("🔍 Search trigger: AI-enhanced search completed successfully");
-            Ok(())
-        }
-        Err(e) => {
-            eprintln!("❌ Search trigger: AI-enhanced search failed: {}", e);
-            
-            // Update message to show fallback
-            if let Err(fallback_error) = current_msg.edit(&ctx.http, |m| {
-                m.content("🔍 AI enhancement failed, performing basic search...")
-            }).await {
-                eprintln!("❌ Failed to update message for search trigger fallback: {}", fallback_error);
-            }
-            
-            // Fallback to basic search
-            match ddg_search(original_query).await {
-                Ok(results) => {
-                    let formatted_results = format_search_results(&results, original_query);
-                    let final_response = format!(
-                        "{}\n\n---\n*🤖 AI triggered this search because it didn't know the answer*",
-                        formatted_results
-                    );
-                    
-                    if let Err(e) = current_msg.edit(&ctx.http, |m| {
-                        m.content(&final_response)
-                    }).await {
-                        eprintln!("❌ Failed to update message with basic search results: {}", e);
-                        return Err(format!("Failed to display search results: {}", e).into());
-                    }
-                    
-                    println!("🔍 Search trigger: Basic search completed successfully");
-                    Ok(())
-                }
-                Err(basic_error) => {
-                    eprintln!("❌ Search trigger: Basic search also failed: {}", basic_error);
-                    let error_msg = format!(
-                        "❌ **Search Failed**\n\nQuery: `{}`\nError: {}\n\n💡 The AI didn't know this answer and web search also failed. Try rephrasing your question or check your internet connection.", 
-                        original_query, basic_error
-                    );
-                    
-                    if let Err(e) = current_msg.edit(&ctx.http, |m| {
-                        m.content(&error_msg)
-                    }).await {
-                        eprintln!("❌ Failed to update message with search error: {}", e);
-                    }
-                    
-                    Err(format!("Search trigger failed: {}", basic_error).into())
-                }
-            }
-        }
-    }
 }
 
 /// Perform a DuckDuckGo search and return top results
@@ -681,6 +571,57 @@ pub fn format_search_results(results: &[SearchResult], query: &str) -> String {
     }
     
     formatted
+}
+
+/// Perform basic search without AI enhancement (fallback)
+pub async fn perform_basic_search(
+    ctx: &Context,
+    msg: &Message,
+    search_query: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Send initial search message
+    let mut search_msg = match msg.channel_id.send_message(&ctx.http, |m| {
+        m.content("🔍 Searching DuckDuckGo...")
+    }).await {
+        Ok(message) => message,
+        Err(e) => {
+            eprintln!("❌ Failed to send initial search message: {}", e);
+            msg.reply(ctx, "❌ Failed to send message!").await?;
+            return Err(e.into());
+        }
+    };
+
+    // Perform basic search
+    match ddg_search(search_query).await {
+        Ok(results) => {
+            let formatted_results = format_search_results(&results, search_query);
+            
+            // Update message with search results
+            if let Err(e) = search_msg.edit(&ctx.http, |m| {
+                m.content(&formatted_results)
+            }).await {
+                eprintln!("❌ Failed to update search message: {}", e);
+                msg.reply(ctx, "❌ Failed to display search results!").await?;
+                return Err(e.into());
+            }
+            
+            println!("🔍 Basic search completed successfully for query: '{}'", search_query);
+        }
+        Err(e) => {
+            eprintln!("❌ Basic search failed: {}", e);
+            let error_msg = format!("❌ **Search Failed**\n\nQuery: `{}`\nError: {}\n\n💡 Try rephrasing your search query or check your internet connection.", search_query, e);
+            
+            if let Err(edit_error) = search_msg.edit(&ctx.http, |m| {
+                m.content(&error_msg)
+            }).await {
+                eprintln!("❌ Failed to update search message with error: {}", edit_error);
+                msg.reply(ctx, &error_msg).await?;
+            }
+            return Err(e.into());
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]

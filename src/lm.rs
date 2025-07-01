@@ -8,7 +8,7 @@ use std::fs;
 use futures_util::StreamExt;
 use crate::search::{
     ddg_search, format_search_results, load_lm_config, perform_basic_search, 
-    perform_ai_enhanced_search, handle_search_trigger, LMConfig, ChatMessage
+    perform_ai_enhanced_search, LMConfig, ChatMessage
 };
 
 // Structure to track streaming statistics
@@ -50,53 +50,6 @@ struct Choice {
 #[derive(Deserialize)]
 struct Delta {
     content: Option<String>,
-}
-
-// Non-streaming chat completion for search trigger check
-async fn chat_completion(
-    messages: Vec<ChatMessage>,
-    model: &str,
-    config: &LMConfig,
-    max_tokens: Option<i32>,
-) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(config.timeout))
-        .build()?;
-        
-    let chat_request = ChatRequest {
-        model: model.to_string(),
-        messages,
-        temperature: 0.3, // Lower temperature for more focused responses
-        max_tokens: max_tokens.unwrap_or(config.default_max_tokens),
-        stream: false,
-    };
-
-    let response = client
-        .post(&format!("{}/v1/chat/completions", config.base_url))
-        .json(&chat_request)
-        .send()
-        .await?;
-
-    if !response.status().is_success() {
-        return Err(format!("API request failed: HTTP {}", response.status()).into());
-    }
-
-    // Parse non-streaming response
-    let response_text = response.text().await?;
-    let response_json: serde_json::Value = serde_json::from_str(&response_text)?;
-    
-    // Extract content from response
-    if let Some(choices) = response_json["choices"].as_array() {
-        if let Some(first_choice) = choices.get(0) {
-            if let Some(message) = first_choice["message"].as_object() {
-                if let Some(content) = message["content"].as_str() {
-                    return Ok(content.trim().to_string());
-                }
-            }
-        }
-    }
-    
-    Err("Failed to extract content from API response".into())
 }
 
 #[command]
@@ -234,56 +187,6 @@ pub async fn lm(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
 
     // Log which model is being used for LM command
     println!("💬 LM command: Using model '{}' for chat", config.default_model);
-
-    // First, check if AI knows the answer or wants to trigger search
-    println!("🤔 Checking AI knowledge for query: '{}'", prompt);
-    match chat_completion(
-        messages.clone(),
-        &config.default_model,
-        &config,
-        Some(16), // Limit tokens for search trigger check
-    ).await {
-        Ok(initial_response) => {
-            let trimmed_response = initial_response.trim();
-            if trimmed_response == "__SEARCH__" {
-                println!("🔍 AI triggered search for query: '{}'", prompt);
-                // Update message to show search trigger
-                if let Err(e) = current_msg.edit(&ctx.http, |m| {
-                    m.content("🧠 AI doesn't know this - searching the web...")
-                }).await {
-                    eprintln!("❌ Failed to update message for search trigger: {}", e);
-                }
-                
-                // Trigger AI-enhanced search
-                if let Err(e) = handle_search_trigger(prompt, &config, &mut current_msg, ctx).await {
-                    eprintln!("❌ Search trigger failed: {}", e);
-                    let _ = current_msg.edit(&ctx.http, |m| {
-                        m.content("❌ Search trigger failed! Let me try to answer anyway...")
-                    }).await;
-                    
-                    // Fallback to normal chat if search fails
-                    match stream_chat_response(messages, &config.default_model, &config, ctx, &mut current_msg).await {
-                        Ok(final_stats) => {
-                            println!("💬 LM command (fallback): Streaming complete - {} characters", final_stats.total_characters);
-                        }
-                        Err(stream_error) => {
-                            eprintln!("❌ Fallback streaming also failed: {}", stream_error);
-                            let _ = current_msg.edit(&ctx.http, |m| {
-                                m.content("❌ Both search and AI chat failed! Please try again.")
-                            }).await;
-                        }
-                    }
-                }
-                return Ok(());
-            } else {
-                println!("💬 AI has knowledge, proceeding with normal chat response");
-            }
-        }
-        Err(e) => {
-            eprintln!("❌ Failed to check AI knowledge: {}", e);
-            println!("💬 Proceeding with normal chat response due to check failure");
-        }
-    }
 
     // Stream the response with real-time Discord post editing
     match stream_chat_response(messages, &config.default_model, &config, ctx, &mut current_msg).await {
@@ -541,56 +444,20 @@ mod tests {
     use super::*;
     
     #[test]
-    fn test_search_trigger_detection() {
-        // Test exact match for search trigger
-        assert_eq!("__SEARCH__".trim(), "__SEARCH__");
-        
-        // Test with whitespace
-        assert_eq!("  __SEARCH__  ".trim(), "__SEARCH__");
-        
-        // Test non-trigger responses
-        assert_ne!("Hello there!".trim(), "__SEARCH__");
-        assert_ne!("I don't know __SEARCH__".trim(), "__SEARCH__");
-        assert_ne!("__SEARCH__ something".trim(), "__SEARCH__");
-    }
-    
-    #[test]
-    fn test_search_trigger_token_limit() {
-        // Verify that the token limit for search trigger check is appropriate
-        // The check uses 16 tokens which should be enough for "__SEARCH__"
-        let trigger_response = "__SEARCH__";
-        assert!(trigger_response.len() < 50); // Well under typical token limits
-    }
-    
-    #[tokio::test]
-    async fn test_load_system_prompt_contains_search_trigger() {
-        // Test that system prompt contains search trigger instruction
-        // This test will only pass if system_prompt.txt exists and contains the trigger
-        if let Ok(prompt) = load_system_prompt().await {
-            assert!(prompt.contains("__SEARCH__"), 
-                "System prompt should contain __SEARCH__ trigger instruction");
-            assert!(prompt.contains("Search Trigger:") || prompt.contains("search trigger"), 
-                "System prompt should contain search trigger documentation");
-        }
-        // If file doesn't exist, test passes (file is optional)
-    }
-    
-    #[test]
     fn test_chat_message_structure() {
-        // Test that ChatMessage can be created properly for search trigger
+        // Test that ChatMessage can be created properly
         let system_message = ChatMessage {
             role: "system".to_string(),
-            content: "You are a helpful AI. If you don't know something, respond with exactly __SEARCH__.".to_string(),
+            content: "You are a helpful AI assistant.".to_string(),
         };
         
         let user_message = ChatMessage {
             role: "user".to_string(),
-            content: "What is the latest news about quantum computing?".to_string(),
+            content: "What is machine learning?".to_string(),
         };
         
         assert_eq!(system_message.role, "system");
         assert_eq!(user_message.role, "user");
-        assert!(system_message.content.contains("__SEARCH__"));
     }
     
     #[tokio::test]
@@ -603,7 +470,6 @@ mod tests {
                 println!("✅ System prompt loaded successfully:");
                 println!("Length: {} characters", prompt.len());
                 println!("Content preview: {}", &prompt[..prompt.len().min(200)]);
-                println!("Contains __SEARCH__: {}", prompt.contains("__SEARCH__"));
             }
             Err(e) => {
                 println!("❌ Failed to load system prompt: {}", e);
