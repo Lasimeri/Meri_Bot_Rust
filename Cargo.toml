@@ -3,6 +3,8 @@ name = "meri_bot_rust"
 version = "0.1.0"
 edition = "2021"
 
+
+
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 serenity = { version = "0.11", features = ["client", "gateway", "rustls_backend", "model", "framework", "standard_framework"] }

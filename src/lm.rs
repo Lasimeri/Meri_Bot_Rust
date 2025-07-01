@@ -219,6 +219,9 @@ pub async fn lm(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
         },
     ];
 
+    // Log which model is being used for LM command
+    println!("💬 LM command: Using model '{}' for chat", config.default_model);
+
     // Buffer the complete response from streaming
     match buffer_chat_response(messages, &config.default_model, &config, ctx, &mut current_msg).await {
         Ok(response_content) => {
@@ -267,6 +270,11 @@ pub async fn buffer_chat_response(
         max_tokens: config.default_max_tokens,
         stream: true,
     };
+
+    // Debug logging to see exactly what model is being used
+    println!("🔍 API Request Debug - Model: '{}', URL: {}", model, config.base_url);
+    println!("🔍 Full request: model='{}', temperature={}, max_tokens={}", 
+        model, config.default_temperature, config.default_max_tokens);
 
     let response = client
         .post(&format!("{}/v1/chat/completions", config.base_url))

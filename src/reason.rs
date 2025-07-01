@@ -66,7 +66,8 @@ pub async fn reason(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
     ];
 
     // Log which reasoning model is being used
-    println!("🧠 Reasoning command: Using model '{}' for reasoning task", config.default_reason_model);
+    println!("🧠 Reasoning command: About to call buffer_chat_response with model: '{}'", config.default_reason_model);
+    println!("🧠 Reasoning command: Model parameter being passed: '{}'", &config.default_reason_model);
 
     // Buffer the complete response from streaming using the reasoning model
     match buffer_chat_response(messages, &config.default_reason_model, &config, ctx, &mut current_msg).await {
@@ -138,6 +139,15 @@ async fn load_reasoning_config() -> Result<LMConfig, Box<dyn std::error::Error +
         if let Some(equals_pos) = line.find('=') {
             let key = line[..equals_pos].trim().to_string();
             let value = line[equals_pos + 1..].trim().to_string();
+            
+            // Debug logging for reasoning model specifically
+            if key == "DEFAULT_REASON_MODEL" {
+                println!("🔍 Config Debug - Found DEFAULT_REASON_MODEL: '{}' (length: {})", value, value.len());
+                for (i, c) in value.chars().enumerate() {
+                    println!("🔍 Config Debug - Char {}: '{}' (code: {})", i, c, c as u32);
+                }
+            }
+            
             config_map.insert(key, value);
         } else {
             // Skip invalid lines silently
@@ -192,7 +202,8 @@ async fn load_reasoning_config() -> Result<LMConfig, Box<dyn std::error::Error +
             .map_err(|_| "Invalid RESPONSE_FORMAT_PADDING value in lmapiconf.txt")?,
     };
 
-    println!("🧠 Reasoning command: Successfully loaded config with reasoning model: {}", config.default_reason_model);
+    println!("🧠 Reasoning command: Successfully loaded config with reasoning model: '{}'", config.default_reason_model);
+    println!("🧠 Reasoning command: Chat model: '{}', Reasoning model: '{}'", config.default_model, config.default_reason_model);
     Ok(config)
 }
 
