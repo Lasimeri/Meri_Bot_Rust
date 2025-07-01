@@ -71,8 +71,27 @@ pub async fn reason(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
     // Buffer the complete response from streaming using the reasoning model
     match buffer_chat_response(messages, &config.default_reason_model, &config, ctx, &mut current_msg).await {
         Ok(response_content) => {
-            // Send the complete buffered response in Discord-sized chunks
-            if let Err(e) = send_buffered_response(ctx, &mut current_msg, &response_content, &config).await {
+            // Filter out thinking tags and content before sending to Discord
+            let filtered_content = filter_thinking_tags(&response_content);
+            
+            // Log the filtering results for debugging
+            println!("🧠 Reasoning command: Raw response length: {} characters", response_content.len());
+            println!("🧠 Reasoning command: Filtered response length: {} characters", filtered_content.len());
+            
+            if filtered_content.len() != response_content.len() {
+                println!("🧠 Reasoning command: Successfully filtered thinking content");
+            }
+            
+            // Check if we have any content left after filtering
+            if filtered_content.trim().is_empty() {
+                let _ = current_msg.edit(&ctx.http, |m| {
+                    m.content("🧠 **Reasoning Complete** ✅\n\nThe AI completed its reasoning process, but the response appears to contain only thinking content. The model may have used `<think>` tags for the entire response.")
+                }).await;
+                return Ok(());
+            }
+            
+            // Send the filtered response in Discord-sized chunks
+            if let Err(e) = send_buffered_response(ctx, &mut current_msg, &filtered_content, &config).await {
                 eprintln!("❌ Failed to send response chunks: {}", e);
                 let _ = current_msg.edit(&ctx.http, |m| {
                     m.content("❌ Failed to send complete response!")
@@ -215,4 +234,73 @@ async fn load_reasoning_system_prompt() -> Result<String, Box<dyn std::error::Er
     }
     
     Err("No reasoning prompt file found".into())
+}
+
+// Helper function to filter out <think>...</think> tags and their content
+fn filter_thinking_tags(content: &str) -> String {
+    let mut result = String::new();
+    let mut remaining = content;
+    
+    loop {
+        // Find the start of a thinking block
+        if let Some(think_start) = remaining.find("<think>") {
+            // Add everything before the thinking block
+            result.push_str(&remaining[..think_start]);
+            
+            // Look for the end of the thinking block
+            let after_start_tag = &remaining[think_start + 7..]; // Skip "<think>"
+            
+            if let Some(think_end) = after_start_tag.find("</think>") {
+                // Found matching closing tag, skip everything between tags
+                remaining = &after_start_tag[think_end + 8..]; // Skip "</think>"
+            } else {
+                // No closing tag found, discard everything after the opening tag
+                break;
+            }
+        } else {
+            // No more thinking blocks, add the rest of the content
+            result.push_str(remaining);
+            break;
+        }
+    }
+    
+    // Clean up the result - remove extra whitespace and normalize spacing
+    let cleaned = result
+        .lines()
+        .map(|line| line.trim())
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<&str>>()
+        .join("\n");
+    
+    cleaned.trim().to_string()
+}
+
+// Test function for the thinking tag filter (for debugging)
+#[allow(dead_code)]
+fn test_filter_thinking_tags() {
+    // Test basic filtering
+    let test1 = "Before <think>This is thinking</think> After";
+    let result1 = filter_thinking_tags(test1);
+    println!("Test 1: '{}' -> '{}'", test1, result1);
+    assert_eq!(result1, "Before After");
+    
+    // Test multiple thinking blocks
+    let test2 = "Start <think>Think 1</think> Middle <think>Think 2</think> End";
+    let result2 = filter_thinking_tags(test2);
+    println!("Test 2: '{}' -> '{}'", test2, result2);
+    assert_eq!(result2, "Start Middle End");
+    
+    // Test unclosed thinking tag
+    let test3 = "Before <think>Unclosed thinking content...";
+    let result3 = filter_thinking_tags(test3);
+    println!("Test 3: '{}' -> '{}'", test3, result3);
+    assert_eq!(result3, "Before");
+    
+    // Test no thinking tags
+    let test4 = "Just normal content here";
+    let result4 = filter_thinking_tags(test4);
+    println!("Test 4: '{}' -> '{}'", test4, result4);
+    assert_eq!(result4, "Just normal content here");
+    
+    println!("✅ All thinking tag filter tests passed!");
 } 

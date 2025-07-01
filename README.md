@@ -33,7 +33,7 @@ A simple Discord bot written in Rust using the Serenity framework.
   - **Features**: Buffered responses, smart message chunking, extended output length, progress indicators
 - `^reason <question>` - Deep reasoning with specialized AI model
   - **Aliases**: `^reasoning`
-  - **Features**: Step-by-step reasoning, dedicated reasoning model, logical explanations
+  - **Features**: Step-by-step reasoning, dedicated reasoning model, thinking tag filtering, logical explanations
 
 ### 💡 User Experience
 - **Typing indicators** on all commands for immediate feedback
@@ -230,8 +230,15 @@ The `^reason` command provides advanced AI reasoning capabilities:
   - **Dedicated reasoning model** for complex logical problems
   - **Step-by-step thinking** with detailed explanations
   - **Specialized system prompt** optimized for reasoning tasks
+  - **Thinking tag filtering** - automatically filters out `<think>...</think>` content from responses
   - **Same buffering system** as the chat command for long responses
   - **Fallback prompts** if custom reasoning prompt files aren't found
+- **Thinking Tag Filtering**:
+  - The command automatically filters out content between `<think>` and `</think>` tags
+  - This allows reasoning models to show their thought process internally without cluttering the user response
+  - Supports multiple thinking blocks within a single response
+  - Handles unclosed thinking tags by discarding everything after the opening tag
+  - If the response contains only thinking content, displays a helpful message to the user
 - **Requirements**:
   - Same as LM chat command plus `DEFAULT_REASON_MODEL` configuration
   - Optional: `reasoning_prompt.txt` file for specialized reasoning instructions
