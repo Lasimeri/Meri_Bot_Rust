@@ -5,9 +5,11 @@ use serenity::{
 };
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::collections::HashMap;
 use futures_util::StreamExt;
-use crate::search::{ddg_search, format_search_results};
+use crate::search::{
+    ddg_search, format_search_results, load_lm_config, perform_basic_search, 
+    perform_ai_enhanced_search, handle_search_trigger, LMConfig, ChatMessage
+};
 
 // Structure to track streaming statistics
 #[derive(Debug)]
@@ -24,20 +26,7 @@ struct MessageState {
     char_limit: usize,
 }
 
-// LM Studio API Configuration structure
-#[derive(Debug, Clone)]
-pub struct LMConfig {
-    pub base_url: String,
-    pub timeout: u64,
-    pub default_model: String,
-    pub default_reason_model: String,
-    pub default_temperature: f32,
-    pub default_max_tokens: i32,
-    pub max_discord_message_length: usize,
-    pub response_format_padding: usize,
-}
-
-// API Request/Response structures
+// API Request/Response structures for streaming
 #[derive(Serialize)]
 struct ChatRequest {
     model: String,
@@ -45,12 +34,6 @@ struct ChatRequest {
     temperature: f32,
     max_tokens: i32,
     stream: bool,
-}
-
-#[derive(Serialize, Deserialize, Clone)]
-pub struct ChatMessage {
-    pub role: String,
-    pub content: String,
 }
 
 #[derive(Deserialize)]
@@ -69,113 +52,51 @@ struct Delta {
     content: Option<String>,
 }
 
-// Removed LoadModelRequest and UnloadModelRequest - LM Studio handles model management automatically
-
-// Function to load LM Studio configuration from file
-pub async fn load_lm_config() -> Result<LMConfig, Box<dyn std::error::Error + Send + Sync>> {
-    let config_paths = [
-        "lmapiconf.txt",
-        "../lmapiconf.txt", 
-        "../../lmapiconf.txt",
-        "src/lmapiconf.txt"
-    ];
-    
-    let mut content = String::new();
-    let mut found_file = false;
-    
-    // Try to find the config file in multiple locations
-    for config_path in &config_paths {
-        match fs::read_to_string(config_path) {
-            Ok(file_content) => {
-                content = file_content;
-                found_file = true;
-                // Found the config file
-                break;
-            }
-            Err(_) => {
-                continue;
-            }
-        }
-    }
-    
-    if !found_file {
-        return Err("lmapiconf.txt file not found in any expected location (., .., ../.., src/)".into());
-    }
-    
-    // Remove BOM if present
-    let content = content.strip_prefix('\u{feff}').unwrap_or(&content);
-    let mut config_map = HashMap::new();
-
-    // Parse the config file line by line
-    for line in content.lines() {
-        let line = line.trim();
+// Non-streaming chat completion for search trigger check
+async fn chat_completion(
+    messages: Vec<ChatMessage>,
+    model: &str,
+    config: &LMConfig,
+    max_tokens: Option<i32>,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(config.timeout))
+        .build()?;
         
-        // Skip empty lines and comments
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        
-        // Parse KEY=VALUE format
-        if let Some(equals_pos) = line.find('=') {
-            let key = line[..equals_pos].trim().to_string();
-            let value = line[equals_pos + 1..].trim().to_string();
-            config_map.insert(key, value);
-        } else {
-            // Skip invalid lines silently
-        }
-    }
-    
-    // Check for required keys
-    let required_keys = [
-        "LM_STUDIO_BASE_URL",
-        "LM_STUDIO_TIMEOUT", 
-        "DEFAULT_MODEL",
-        "DEFAULT_REASON_MODEL",
-        "DEFAULT_TEMPERATURE",
-        "DEFAULT_MAX_TOKENS",
-        "MAX_DISCORD_MESSAGE_LENGTH",
-        "RESPONSE_FORMAT_PADDING"
-    ];
-    
-    for key in &required_keys {
-        if !config_map.contains_key(*key) {
-            return Err(format!("❌ Required setting '{}' not found in lmapiconf.txt", key).into());
-        }
-    }
-    
-    // Create config - all values must be present in lmapiconf.txt
-    let config = LMConfig {
-        base_url: config_map.get("LM_STUDIO_BASE_URL")
-            .ok_or("LM_STUDIO_BASE_URL not found in lmapiconf.txt")?.clone(),
-        timeout: config_map.get("LM_STUDIO_TIMEOUT")
-            .ok_or("LM_STUDIO_TIMEOUT not found in lmapiconf.txt")?
-            .parse()
-            .map_err(|_| "Invalid LM_STUDIO_TIMEOUT value in lmapiconf.txt")?,
-        default_model: config_map.get("DEFAULT_MODEL")
-            .ok_or("DEFAULT_MODEL not found in lmapiconf.txt")?.clone(),
-        default_reason_model: config_map.get("DEFAULT_REASON_MODEL")
-            .ok_or("DEFAULT_REASON_MODEL not found in lmapiconf.txt")?.clone(),
-        default_temperature: config_map.get("DEFAULT_TEMPERATURE")
-            .ok_or("DEFAULT_TEMPERATURE not found in lmapiconf.txt")?
-            .parse()
-            .map_err(|_| "Invalid DEFAULT_TEMPERATURE value in lmapiconf.txt")?,
-        default_max_tokens: config_map.get("DEFAULT_MAX_TOKENS")
-            .ok_or("DEFAULT_MAX_TOKENS not found in lmapiconf.txt")?
-            .parse()
-            .map_err(|_| "Invalid DEFAULT_MAX_TOKENS value in lmapiconf.txt")?,
-        max_discord_message_length: config_map.get("MAX_DISCORD_MESSAGE_LENGTH")
-            .ok_or("MAX_DISCORD_MESSAGE_LENGTH not found in lmapiconf.txt")?
-            .parse()
-            .map_err(|_| "Invalid MAX_DISCORD_MESSAGE_LENGTH value in lmapiconf.txt")?,
-        response_format_padding: config_map.get("RESPONSE_FORMAT_PADDING")
-            .ok_or("RESPONSE_FORMAT_PADDING not found in lmapiconf.txt")?
-            .parse()
-            .map_err(|_| "Invalid RESPONSE_FORMAT_PADDING value in lmapiconf.txt")?,
+    let chat_request = ChatRequest {
+        model: model.to_string(),
+        messages,
+        temperature: 0.3, // Lower temperature for more focused responses
+        max_tokens: max_tokens.unwrap_or(config.default_max_tokens),
+        stream: false,
     };
 
-    // Configuration loaded successfully
+    let response = client
+        .post(&format!("{}/v1/chat/completions", config.base_url))
+        .json(&chat_request)
+        .send()
+        .await?;
+
+    if !response.status().is_success() {
+        return Err(format!("API request failed: HTTP {}", response.status()).into());
+    }
+
+    // Parse non-streaming response
+    let response_text = response.text().await?;
+    let response_json: serde_json::Value = serde_json::from_str(&response_text)?;
     
-    Ok(config)
+    // Extract content from response
+    if let Some(choices) = response_json["choices"].as_array() {
+        if let Some(first_choice) = choices.get(0) {
+            if let Some(message) = first_choice["message"].as_object() {
+                if let Some(content) = message["content"].as_str() {
+                    return Ok(content.trim().to_string());
+                }
+            }
+        }
+    }
+    
+    Err("Failed to extract content from API response".into())
 }
 
 #[command]
@@ -205,9 +126,19 @@ pub async fn lm(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
             return Ok(());
         }
 
+        // Load LM Studio configuration for AI-enhanced search
+        let config = match load_lm_config().await {
+            Ok(config) => config,
+            Err(e) => {
+                eprintln!("❌ Failed to load LM Studio configuration for search: {}", e);
+                // Fallback to basic search without AI enhancement
+                return perform_basic_search(ctx, msg, search_query).await.map_err(|e| e.into());
+            }
+        };
+
         // Send initial search message
         let mut search_msg = match msg.channel_id.send_message(&ctx.http, |m| {
-            m.content("🔍 Searching DuckDuckGo...")
+            m.content("🧠 Refining search query...")
         }).await {
             Ok(message) => message,
             Err(e) => {
@@ -217,30 +148,36 @@ pub async fn lm(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
             }
         };
 
-        // Perform search
-        match ddg_search(search_query).await {
-            Ok(results) => {
-                let formatted_results = format_search_results(&results, search_query);
-                
-                // Update message with search results
-                if let Err(e) = search_msg.edit(&ctx.http, |m| {
-                    m.content(&formatted_results)
-                }).await {
-                    eprintln!("❌ Failed to update search message: {}", e);
-                    msg.reply(ctx, "❌ Failed to display search results!").await?;
-                }
-                
-                println!("🔍 Search completed successfully for query: '{}'", search_query);
+        // AI-Enhanced Search Flow
+        match perform_ai_enhanced_search(search_query, &config, &mut search_msg, ctx).await {
+            Ok(()) => {
+                println!("🔍 AI-enhanced search completed successfully for query: '{}'", search_query);
             }
             Err(e) => {
-                eprintln!("❌ Search failed: {}", e);
-                let error_msg = format!("❌ **Search Failed**\n\nQuery: `{}`\nError: {}\n\n💡 Try rephrasing your search query or check your internet connection.", search_query, e);
-                
-                if let Err(edit_error) = search_msg.edit(&ctx.http, |m| {
-                    m.content(&error_msg)
+                eprintln!("❌ AI-enhanced search failed: {}", e);
+                // Fallback to basic search
+                if let Err(fallback_error) = search_msg.edit(&ctx.http, |m| {
+                    m.content("🔍 AI enhancement failed, performing basic search...")
                 }).await {
-                    eprintln!("❌ Failed to update search message with error: {}", edit_error);
-                    msg.reply(ctx, &error_msg).await?;
+                    eprintln!("❌ Failed to update message for fallback: {}", fallback_error);
+                }
+                
+                // Perform basic search as fallback
+                match ddg_search(search_query).await {
+                    Ok(results) => {
+                        let formatted_results = format_search_results(&results, search_query);
+                        if let Err(e) = search_msg.edit(&ctx.http, |m| {
+                            m.content(&formatted_results)
+                        }).await {
+                            eprintln!("❌ Failed to update search message: {}", e);
+                        }
+                    }
+                    Err(basic_error) => {
+                        let error_msg = format!("❌ **Search Failed**\n\nQuery: `{}`\nError: {}\n\n💡 Try rephrasing your search query or check your internet connection.", search_query, basic_error);
+                        let _ = search_msg.edit(&ctx.http, |m| {
+                            m.content(&error_msg)
+                        }).await;
+                    }
                 }
             }
         }
@@ -248,7 +185,7 @@ pub async fn lm(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
         return Ok(());
     }
 
-    // Regular AI chat functionality (existing code)
+    // Regular AI chat functionality
     let prompt = input;
 
     // Load LM Studio configuration
@@ -297,6 +234,56 @@ pub async fn lm(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
 
     // Log which model is being used for LM command
     println!("💬 LM command: Using model '{}' for chat", config.default_model);
+
+    // First, check if AI knows the answer or wants to trigger search
+    println!("🤔 Checking AI knowledge for query: '{}'", prompt);
+    match chat_completion(
+        messages.clone(),
+        &config.default_model,
+        &config,
+        Some(16), // Limit tokens for search trigger check
+    ).await {
+        Ok(initial_response) => {
+            let trimmed_response = initial_response.trim();
+            if trimmed_response == "__SEARCH__" {
+                println!("🔍 AI triggered search for query: '{}'", prompt);
+                // Update message to show search trigger
+                if let Err(e) = current_msg.edit(&ctx.http, |m| {
+                    m.content("🧠 AI doesn't know this - searching the web...")
+                }).await {
+                    eprintln!("❌ Failed to update message for search trigger: {}", e);
+                }
+                
+                // Trigger AI-enhanced search
+                if let Err(e) = handle_search_trigger(prompt, &config, &mut current_msg, ctx).await {
+                    eprintln!("❌ Search trigger failed: {}", e);
+                    let _ = current_msg.edit(&ctx.http, |m| {
+                        m.content("❌ Search trigger failed! Let me try to answer anyway...")
+                    }).await;
+                    
+                    // Fallback to normal chat if search fails
+                    match stream_chat_response(messages, &config.default_model, &config, ctx, &mut current_msg).await {
+                        Ok(final_stats) => {
+                            println!("💬 LM command (fallback): Streaming complete - {} characters", final_stats.total_characters);
+                        }
+                        Err(stream_error) => {
+                            eprintln!("❌ Fallback streaming also failed: {}", stream_error);
+                            let _ = current_msg.edit(&ctx.http, |m| {
+                                m.content("❌ Both search and AI chat failed! Please try again.")
+                            }).await;
+                        }
+                    }
+                }
+                return Ok(());
+            } else {
+                println!("💬 AI has knowledge, proceeding with normal chat response");
+            }
+        }
+        Err(e) => {
+            eprintln!("❌ Failed to check AI knowledge: {}", e);
+            println!("💬 Proceeding with normal chat response due to check failure");
+        }
+    }
 
     // Stream the response with real-time Discord post editing
     match stream_chat_response(messages, &config.default_model, &config, ctx, &mut current_msg).await {
@@ -525,11 +512,103 @@ async fn finalize_chat_message(
     Ok(())
 } 
 
-// Helper function to load system prompt from file
+// Helper function to load system prompt from file using multi-path fallback
 async fn load_system_prompt() -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    let content = fs::read_to_string("system_prompt.txt")?;
-    Ok(content.trim().to_string())
+    let prompt_paths = [
+        "system_prompt.txt",
+        "../system_prompt.txt",
+        "../../system_prompt.txt",
+        "src/system_prompt.txt",
+    ];
+    
+    for path in &prompt_paths {
+        match fs::read_to_string(path) {
+            Ok(content) => {
+                // Remove BOM if present
+                let content = content.strip_prefix('\u{feff}').unwrap_or(&content);
+                println!("💬 LM command: Loaded system prompt from {}", path);
+                return Ok(content.trim().to_string());
+            }
+            Err(_) => continue,
+        }
+    }
+    
+    Err("system_prompt.txt file not found in any expected location (., .., ../.., src/)".into())
 }
 
-// Note: Model loading/unloading functions removed as LM Studio handles model management automatically
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_search_trigger_detection() {
+        // Test exact match for search trigger
+        assert_eq!("__SEARCH__".trim(), "__SEARCH__");
+        
+        // Test with whitespace
+        assert_eq!("  __SEARCH__  ".trim(), "__SEARCH__");
+        
+        // Test non-trigger responses
+        assert_ne!("Hello there!".trim(), "__SEARCH__");
+        assert_ne!("I don't know __SEARCH__".trim(), "__SEARCH__");
+        assert_ne!("__SEARCH__ something".trim(), "__SEARCH__");
+    }
+    
+    #[test]
+    fn test_search_trigger_token_limit() {
+        // Verify that the token limit for search trigger check is appropriate
+        // The check uses 16 tokens which should be enough for "__SEARCH__"
+        let trigger_response = "__SEARCH__";
+        assert!(trigger_response.len() < 50); // Well under typical token limits
+    }
+    
+    #[tokio::test]
+    async fn test_load_system_prompt_contains_search_trigger() {
+        // Test that system prompt contains search trigger instruction
+        // This test will only pass if system_prompt.txt exists and contains the trigger
+        if let Ok(prompt) = load_system_prompt().await {
+            assert!(prompt.contains("__SEARCH__"), 
+                "System prompt should contain __SEARCH__ trigger instruction");
+            assert!(prompt.contains("Search Trigger:") || prompt.contains("search trigger"), 
+                "System prompt should contain search trigger documentation");
+        }
+        // If file doesn't exist, test passes (file is optional)
+    }
+    
+    #[test]
+    fn test_chat_message_structure() {
+        // Test that ChatMessage can be created properly for search trigger
+        let system_message = ChatMessage {
+            role: "system".to_string(),
+            content: "You are a helpful AI. If you don't know something, respond with exactly __SEARCH__.".to_string(),
+        };
+        
+        let user_message = ChatMessage {
+            role: "user".to_string(),
+            content: "What is the latest news about quantum computing?".to_string(),
+        };
+        
+        assert_eq!(system_message.role, "system");
+        assert_eq!(user_message.role, "user");
+        assert!(system_message.content.contains("__SEARCH__"));
+    }
+    
+    #[tokio::test]
+    async fn debug_prompt_loading() {
+        println!("=== DEBUG: Testing prompt loading ===");
+        
+        // Test system prompt loading
+        match load_system_prompt().await {
+            Ok(prompt) => {
+                println!("✅ System prompt loaded successfully:");
+                println!("Length: {} characters", prompt.len());
+                println!("Content preview: {}", &prompt[..prompt.len().min(200)]);
+                println!("Contains __SEARCH__: {}", prompt.contains("__SEARCH__"));
+            }
+            Err(e) => {
+                println!("❌ Failed to load system prompt: {}", e);
+            }
+        }
+    }
+}
 

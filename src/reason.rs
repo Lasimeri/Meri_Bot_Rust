@@ -7,7 +7,7 @@ use std::fs;
 use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use futures_util::StreamExt;
-use crate::lm::{LMConfig, ChatMessage};
+use crate::search::{LMConfig, ChatMessage};
 
 // Structures for streaming API responses
 #[derive(Deserialize)]
@@ -141,6 +141,7 @@ async fn load_reasoning_config() -> Result<LMConfig, Box<dyn std::error::Error +
     
     let mut content = String::new();
     let mut found_file = false;
+    let mut config_source = "";
     
     // Try to find the config file in multiple locations
     for config_path in &config_paths {
@@ -148,6 +149,7 @@ async fn load_reasoning_config() -> Result<LMConfig, Box<dyn std::error::Error +
             Ok(file_content) => {
                 content = file_content;
                 found_file = true;
+                config_source = config_path;
                 println!("🧠 Reasoning command: Found config file at {}", config_path);
                 break;
             }
@@ -178,12 +180,7 @@ async fn load_reasoning_config() -> Result<LMConfig, Box<dyn std::error::Error +
         if let Some(equals_pos) = line.find('=') {
             let key = line[..equals_pos].trim().to_string();
             let value = line[equals_pos + 1..].trim().to_string();
-            
-
-            
             config_map.insert(key, value);
-        } else {
-            // Skip invalid lines silently
         }
     }
     
@@ -201,41 +198,41 @@ async fn load_reasoning_config() -> Result<LMConfig, Box<dyn std::error::Error +
     
     for key in &required_keys {
         if !config_map.contains_key(*key) {
-            return Err(format!("❌ Required setting '{}' not found in lmapiconf.txt (reasoning command)", key).into());
+            return Err(format!("❌ Required setting '{}' not found in {} (reasoning command)", key, config_source).into());
         }
     }
     
     // Create config - all values must be present in lmapiconf.txt
     let config = LMConfig {
         base_url: config_map.get("LM_STUDIO_BASE_URL")
-            .ok_or("LM_STUDIO_BASE_URL not found in lmapiconf.txt")?.clone(),
+            .ok_or("LM_STUDIO_BASE_URL not found")?.clone(),
         timeout: config_map.get("LM_STUDIO_TIMEOUT")
-            .ok_or("LM_STUDIO_TIMEOUT not found in lmapiconf.txt")?
+            .ok_or("LM_STUDIO_TIMEOUT not found")?
             .parse()
-            .map_err(|_| "Invalid LM_STUDIO_TIMEOUT value in lmapiconf.txt")?,
+            .map_err(|_| "Invalid LM_STUDIO_TIMEOUT value")?,
         default_model: config_map.get("DEFAULT_MODEL")
-            .ok_or("DEFAULT_MODEL not found in lmapiconf.txt")?.clone(),
+            .ok_or("DEFAULT_MODEL not found")?.clone(),
         default_reason_model: config_map.get("DEFAULT_REASON_MODEL")
-            .ok_or("DEFAULT_REASON_MODEL not found in lmapiconf.txt")?.clone(),
+            .ok_or("DEFAULT_REASON_MODEL not found")?.clone(),
         default_temperature: config_map.get("DEFAULT_TEMPERATURE")
-            .ok_or("DEFAULT_TEMPERATURE not found in lmapiconf.txt")?
+            .ok_or("DEFAULT_TEMPERATURE not found")?
             .parse()
-            .map_err(|_| "Invalid DEFAULT_TEMPERATURE value in lmapiconf.txt")?,
+            .map_err(|_| "Invalid DEFAULT_TEMPERATURE value")?,
         default_max_tokens: config_map.get("DEFAULT_MAX_TOKENS")
-            .ok_or("DEFAULT_MAX_TOKENS not found in lmapiconf.txt")?
+            .ok_or("DEFAULT_MAX_TOKENS not found")?
             .parse()
-            .map_err(|_| "Invalid DEFAULT_MAX_TOKENS value in lmapiconf.txt")?,
+            .map_err(|_| "Invalid DEFAULT_MAX_TOKENS value")?,
         max_discord_message_length: config_map.get("MAX_DISCORD_MESSAGE_LENGTH")
-            .ok_or("MAX_DISCORD_MESSAGE_LENGTH not found in lmapiconf.txt")?
+            .ok_or("MAX_DISCORD_MESSAGE_LENGTH not found")?
             .parse()
-            .map_err(|_| "Invalid MAX_DISCORD_MESSAGE_LENGTH value in lmapiconf.txt")?,
+            .map_err(|_| "Invalid MAX_DISCORD_MESSAGE_LENGTH value")?,
         response_format_padding: config_map.get("RESPONSE_FORMAT_PADDING")
-            .ok_or("RESPONSE_FORMAT_PADDING not found in lmapiconf.txt")?
+            .ok_or("RESPONSE_FORMAT_PADDING not found")?
             .parse()
-            .map_err(|_| "Invalid RESPONSE_FORMAT_PADDING value in lmapiconf.txt")?,
+            .map_err(|_| "Invalid RESPONSE_FORMAT_PADDING value")?,
     };
 
-    println!("🧠 Reasoning command: Successfully loaded config with reasoning model: '{}'", config.default_reason_model);
+    println!("🧠 Reasoning command: Successfully loaded config from {} with reasoning model: '{}'", config_source, config.default_reason_model);
     Ok(config)
 }
 
@@ -244,17 +241,28 @@ async fn load_reasoning_system_prompt() -> Result<String, Box<dyn std::error::Er
     // Try to load reasoning-specific prompt first, fall back to general system prompt
     let reasoning_prompt_paths = [
         "reasoning_prompt.txt",
+        "../reasoning_prompt.txt",
+        "../../reasoning_prompt.txt",
+        "src/reasoning_prompt.txt",
         "system_prompt.txt",
+        "../system_prompt.txt",
+        "../../system_prompt.txt",
+        "src/system_prompt.txt",
     ];
     
     for path in &reasoning_prompt_paths {
-        if let Ok(content) = fs::read_to_string(path) {
-            println!("🧠 Reasoning command: Loaded prompt from {}", path);
-            return Ok(content.trim().to_string());
+        match fs::read_to_string(path) {
+            Ok(content) => {
+                // Remove BOM if present
+                let content = content.strip_prefix('\u{feff}').unwrap_or(&content);
+                println!("🧠 Reasoning command: Loaded prompt from {}", path);
+                return Ok(content.trim().to_string());
+            }
+            Err(_) => continue,
         }
     }
     
-    Err("No reasoning prompt file found".into())
+    Err("No reasoning prompt file found in any expected location".into())
 }
 
 // Helper function to filter out <think>...</think> tags and their content

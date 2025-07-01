@@ -112,7 +112,7 @@ async fn help(ctx: &Context, msg: &Message) -> CommandResult {
     let prefix = env::var("PREFIX").unwrap_or_else(|_| "!".to_string());
     
     let response = format!(
-        "**🤖 Meri Bot - Comprehensive Command Guide**\n\n\
+        "**🤖 Meri Bot - Advanced Discord AI Assistant**\n\n\
         **📋 Basic Commands:**\n\
         • `{0}ping` - Test bot connectivity and response time\n\
         • `{0}echo <text>` - Echo back your message\n\
@@ -121,35 +121,52 @@ async fn help(ctx: &Context, msg: &Message) -> CommandResult {
         • `{0}ppfp @user` - Display user's profile picture in rich embed\n\
         • **Aliases:** `{0}avatar`, `{0}pfp`, `{0}profilepic`\n\
         • **Features:** High-quality embeds, clickable links, animated GIF support\n\n\
-        **🤖 AI Chat (LM Studio/Ollama):**\n\
+        **🤖 AI Chat with Intelligent Search (LM Studio/Ollama):**\n\
         • `{0}lm <prompt>` - Interactive AI chat with real-time streaming\n\
-        • `{0}lm -s <search query>` - Search DuckDuckGo and display top 5 results\n\
         • **Aliases:** `{0}llm`, `{0}ai`, `{0}chat`\n\
-        • **Features:** Live response streaming, multi-part messages, 8K token support, web search\n\
-        • **Requirements:** LM Studio or Ollama with configured models (for AI chat)\n\n\
-        **🧠 AI Reasoning (Advanced):**\n\
+        • **🧠 Intelligent Search Trigger:** AI automatically searches the web when it doesn't know the answer\n\
+        • **Features:** Live response streaming, multi-part messages, 8K token support\n\
+        • **Smart Routing:** AI knowledge for general topics, web search for current events\n\
+        • **Requirements:** LM Studio or Ollama with configured models\n\n\
+        **🔍 Web Search Commands:**\n\
+        • `{0}lm -s <search query>` - AI-enhanced web search with intelligent processing\n\
+        • **Aliases:** `{0}lm --search <query>`\n\
+        • **AI Mode:** Query refinement → web search → AI summarization\n\
+        • **Basic Mode:** Direct DuckDuckGo search (no configuration needed)\n\
+        • **Features:** Real-time progress updates, smart formatting, source citations\n\n\
+        **🧠 AI Reasoning (Advanced Analysis):**\n\
         • `{0}reason <question>` - Specialized AI reasoning with step-by-step analysis\n\
         • **Aliases:** `{0}reasoning`\n\
         • **Features:** Thinking tag filtering, logical breakdown, dedicated reasoning models\n\
         • **Best for:** Complex problems, logical analysis, step-by-step explanations\n\n\
-        **💡 User Experience Features:**\n\
+        **💡 Advanced Features:**\n\
         • ⌨️ **Typing indicators** on all commands for immediate feedback\n\
-        • 🔄 **Real-time streaming** for AI responses with live updates\n\
+        • 🔄 **Real-time streaming** for AI responses with live updates every 0.8 seconds\n\
         • 📝 **Smart message chunking** respects Discord's 2000 character limit\n\
+        • 🧠 **Intelligent search trigger** automatically searches when AI lacks knowledge\n\
+        • 🛡️ **Robust file handling** with multi-path configuration loading\n\
+        • 📊 **Real-time progress** updates during AI-enhanced search operations\n\
         • ❌ **Comprehensive error handling** with helpful guidance messages\n\
         • 🎯 **Case-insensitive commands** work with any capitalization\n\n\
         **🛠️ Setup Requirements:**\n\
-        • Discord bot token in `botconfig.txt`\n\
-        • LM Studio/Ollama configuration in `lmapiconf.txt` (for AI features)\n\
-        • System prompts in `system_prompt.txt` and `reasoning_prompt.txt`\n\n\
-        **📚 Need help?** Check the README.md for detailed setup instructions!\n\n\
-        **🚀 Quick Start:**\n\
+        • **Required:** Discord bot token in `botconfig.txt`\n\
+        • **AI Features:** LM Studio/Ollama configuration in `lmapiconf.txt`\n\
+        • **Prompts:** System prompts in `system_prompt.txt` and `reasoning_prompt.txt`\n\
+        • **Search AI:** Optional `refine_search_prompt.txt` and `summarize_search_prompt.txt`\n\
+        • **📁 Flexible Paths:** Files can be placed in current, parent, or src directories\n\
+        • **🔄 Graceful Fallback:** Basic features work even without full configuration\n\n\
+        **🚀 Quick Start Guide:**\n\
         1. `{0}ping` - Test basic bot functionality\n\
-        2. `{0}help` - View all available commands with categories and aliases  \n\
+        2. `{0}lm -s rust programming` - Test web search (works without AI config)\n\
         3. `{0}ppfp @user` - Try the profile picture feature\n\
-        4. `{0}lm Hello!` - Test AI chat (requires configuration)\n\
-        5. `{0}lm -s rust programming` - Test web search (no configuration needed)\n\
-        6. `{0}reason Why did the sky turn red at sunset?` - Test AI reasoning (requires configuration)", 
+        4. `{0}lm Hello!` - Test AI chat (requires LM Studio/Ollama setup)\n\
+        5. `{0}reason Why is the sky blue?` - Test AI reasoning (requires configuration)\n\n\
+        **🔧 Configuration Tips:**\n\
+        • Copy `example_*.txt` files and customize them for your setup\n\
+        • Bot works with just Discord token - AI features are optional enhancements\n\
+        • Check console output for file loading status and configuration guidance\n\
+        • All text files support UTF-8 with automatic BOM handling\n\n\
+        **📚 Need detailed setup help?** Check the README.md for comprehensive instructions!", 
         prefix
     );
     

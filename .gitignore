@@ -11,10 +11,14 @@ botconfig.txt
 # LLM system prompts and configuration
 system_prompt.txt
 reasoning_prompt.txt
+refine_search_prompt.txt
+summarize_search_prompt.txt
 lmapiconf.txt
 !example_lmapiconf.txt
 !example_system_prompt.txt
 !example_reasoning_prompt.txt
+!example_refine_search_prompt.txt
+!example_summarize_search_prompt.txt
 
 # Environment files
 .env
@@ -125,3 +129,9 @@ run_bot_with_logs.bat
 streaming_test.*
 response_test.*
 filter_test.*
+
+# Additional prompt and configuration variations
+*_prompt.txt
+*_config.txt
+!example_*_prompt.txt
+!example_*_config.txt
