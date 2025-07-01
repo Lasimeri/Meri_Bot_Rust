@@ -10,8 +10,11 @@ botconfig.txt
 
 # LLM system prompts and configuration
 system_prompt.txt
+reasoning_prompt.txt
 lmapiconf.txt
 !example_lmapiconf.txt
+!example_system_prompt.txt
+!example_reasoning_prompt.txt
 
 # Environment files
 .env

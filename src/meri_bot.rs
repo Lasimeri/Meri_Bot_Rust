@@ -16,10 +16,11 @@ use std::collections::HashMap;
 use tokio::signal;
 use crate::profilepfp::*;
 use crate::lm::*;
+use crate::reason::*;
 
 // Command group declaration
 #[group]
-#[commands(ping, echo, help, ppfp, lm)]
+#[commands(ping, echo, help, ppfp, lm, reason)]
 struct General;
 
 // Event handler implementation
@@ -109,7 +110,7 @@ async fn echo(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
 async fn help(ctx: &Context, msg: &Message) -> CommandResult {
     let _typing = ctx.http.start_typing(msg.channel_id.0)?;
     let prefix = env::var("PREFIX").unwrap_or_else(|_| "!".to_string());
-    let response = format!("**🤖 Meri Bot Commands:**\n\n**📋 Basic Commands:**\n`{0}ping` - Test bot response\n`{0}echo <text>` - Repeat your message\n`{0}help` - Show this command list\n\n**🖼️ Profile Pictures:**\n`{0}ppfp @user` - Show user's profile picture\n*Aliases: {0}avatar, {0}pfp, {0}profilepic*\n\n**🤖 AI Chat:**\n`{0}lm <prompt>` - Chat with AI via LM Studio/Ollama\n*Aliases: {0}llm, {0}ai, {0}chat*\n\n**💡 Tip:** All commands show typing indicators while processing!", prefix);
+    let response = format!("**🤖 Meri Bot Commands:**\n\n**📋 Basic Commands:**\n`{0}ping` - Test bot response\n`{0}echo <text>` - Repeat your message\n`{0}help` - Show this command list\n\n**🖼️ Profile Pictures:**\n`{0}ppfp @user` - Show user's profile picture\n*Aliases: {0}avatar, {0}pfp, {0}profilepic*\n\n**🤖 AI Chat:**\n`{0}lm <prompt>` - Chat with AI via LM Studio/Ollama\n*Aliases: {0}llm, {0}ai, {0}chat*\n\n**🧠 AI Reasoning:**\n`{0}reason <question>` - Deep reasoning with specialized AI model\n*Aliases: {0}reasoning*\n\n**💡 Tip:** All commands show typing indicators while processing!", prefix);
     msg.reply(ctx, &response).await?;
     Ok(())
 }

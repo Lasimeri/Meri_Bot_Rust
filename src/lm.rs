@@ -14,6 +14,7 @@ pub struct LMConfig {
     pub base_url: String,
     pub timeout: u64,
     pub default_model: String,
+    pub default_reason_model: String,
     pub default_temperature: f32,
     pub default_max_tokens: i32,
     pub max_discord_message_length: usize,
@@ -31,9 +32,9 @@ struct ChatRequest {
 }
 
 #[derive(Serialize, Deserialize, Clone)]
-struct ChatMessage {
-    role: String,
-    content: String,
+pub struct ChatMessage {
+    pub role: String,
+    pub content: String,
 }
 
 #[derive(Deserialize)]
@@ -113,6 +114,7 @@ pub async fn load_lm_config() -> Result<LMConfig, Box<dyn std::error::Error + Se
         "LM_STUDIO_BASE_URL",
         "LM_STUDIO_TIMEOUT", 
         "DEFAULT_MODEL",
+        "DEFAULT_REASON_MODEL",
         "DEFAULT_TEMPERATURE",
         "DEFAULT_MAX_TOKENS",
         "MAX_DISCORD_MESSAGE_LENGTH",
@@ -135,6 +137,8 @@ pub async fn load_lm_config() -> Result<LMConfig, Box<dyn std::error::Error + Se
             .map_err(|_| "Invalid LM_STUDIO_TIMEOUT value in lmapiconf.txt")?,
         default_model: config_map.get("DEFAULT_MODEL")
             .ok_or("DEFAULT_MODEL not found in lmapiconf.txt")?.clone(),
+        default_reason_model: config_map.get("DEFAULT_REASON_MODEL")
+            .ok_or("DEFAULT_REASON_MODEL not found in lmapiconf.txt")?.clone(),
         default_temperature: config_map.get("DEFAULT_TEMPERATURE")
             .ok_or("DEFAULT_TEMPERATURE not found in lmapiconf.txt")?
             .parse()
@@ -215,11 +219,11 @@ pub async fn lm(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
         },
     ];
 
-    // Stream the response
-    match stream_chat_response(messages, &config).await {
+    // Buffer the complete response from streaming
+    match buffer_chat_response(messages, &config.default_model, &config, ctx, &mut current_msg).await {
         Ok(response_content) => {
-            // Split response into Discord-sized chunks and send
-            if let Err(e) = send_response_chunks(ctx, &mut current_msg, &response_content, &config).await {
+            // Send the complete buffered response in Discord-sized chunks
+            if let Err(e) = send_buffered_response(ctx, &mut current_msg, &response_content, &config).await {
                 eprintln!("❌ Failed to send response chunks: {}", e);
                 let _ = current_msg.edit(&ctx.http, |m| {
                     m.content("❌ Failed to send complete response!")
@@ -227,7 +231,7 @@ pub async fn lm(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
             }
         }
         Err(e) => {
-            eprintln!("❌ Failed to stream response: {}", e);
+            eprintln!("❌ Failed to get response from AI model: {}", e);
             let _ = current_msg.edit(&ctx.http, |m| {
                 m.content("❌ Failed to get response from AI model!")
             }).await;
@@ -245,13 +249,19 @@ async fn load_system_prompt() -> Result<String, Box<dyn std::error::Error + Send
 
 // Note: Model loading/unloading functions removed as LM Studio handles model management automatically
 
-// Helper function to stream chat response from LM Studio
-async fn stream_chat_response(messages: Vec<ChatMessage>, config: &LMConfig) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+// Helper function to buffer chat response from LM Studio with live updates
+pub async fn buffer_chat_response(
+    messages: Vec<ChatMessage>, 
+    model: &str,
+    config: &LMConfig, 
+    ctx: &Context, 
+    current_msg: &mut Message
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(config.timeout * 3)) // Use longer timeout for streaming
         .build()?;
     let chat_request = ChatRequest {
-        model: config.default_model.clone(),
+        model: model.to_string(),
         messages,
         temperature: config.default_temperature,
         max_tokens: config.default_max_tokens,
@@ -268,8 +278,10 @@ async fn stream_chat_response(messages: Vec<ChatMessage>, config: &LMConfig) -> 
         return Err(format!("API request failed: HTTP {}", response.status()).into());
     }
 
-    let mut full_response = String::new();
+    let mut response_buffer = String::new();
     let mut stream = response.bytes_stream();
+    let mut last_update = std::time::Instant::now();
+    let update_interval = std::time::Duration::from_millis(1500); // Update every 1.5 seconds
 
     while let Some(chunk) = stream.next().await {
         match chunk {
@@ -281,20 +293,37 @@ async fn stream_chat_response(messages: Vec<ChatMessage>, config: &LMConfig) -> 
                     // Handle SSE format: "data: {json}"
                     if let Some(json_str) = line.strip_prefix("data: ") {
                         if json_str.trim() == "[DONE]" {
-                            return Ok(full_response);
+                            return Ok(response_buffer);
                         }
                         
                         if let Ok(response_chunk) = serde_json::from_str::<ChatResponse>(json_str) {
                             for choice in response_chunk.choices {
                                 if let Some(finish_reason) = choice.finish_reason {
                                     if finish_reason == "stop" {
-                                        return Ok(full_response);
+                                        return Ok(response_buffer);
                                     }
                                 }
                                 
                                 if let Some(delta) = choice.delta {
                                     if let Some(content) = delta.content {
-                                        full_response.push_str(&content);
+                                        response_buffer.push_str(&content);
+                                        
+                                        // Update Discord message periodically to show progress
+                                        if last_update.elapsed() >= update_interval {
+                                            let preview = if response_buffer.len() > 100 {
+                                                format!("🤖 Generating response... ({} characters so far)\n\n📝 Preview:\n```\n{}...\n```", 
+                                                    response_buffer.len(), 
+                                                    &response_buffer[..97])
+                                            } else {
+                                                format!("🤖 Generating response... ({} characters so far)", response_buffer.len())
+                                            };
+                                            
+                                            let _ = current_msg.edit(&ctx.http, |m| {
+                                                m.content(preview)
+                                            }).await;
+                                            
+                                            last_update = std::time::Instant::now();
+                                        }
                                     }
                                 }
                             }
@@ -309,11 +338,11 @@ async fn stream_chat_response(messages: Vec<ChatMessage>, config: &LMConfig) -> 
         }
     }
 
-    Ok(full_response)
+    Ok(response_buffer)
 }
 
-// Helper function to send response in Discord-sized chunks
-async fn send_response_chunks(
+// Helper function to send buffered response in Discord-sized chunks
+pub async fn send_buffered_response(
     ctx: &Context,
     current_msg: &mut Message,
     content: &str,
@@ -326,18 +355,41 @@ async fn send_response_chunks(
         return Ok(());
     }
 
-    let chunks: Vec<&str> = content
-        .as_bytes()
-        .chunks(config.max_discord_message_length - config.response_format_padding) // Leave some room for formatting
-        .map(|chunk| std::str::from_utf8(chunk).unwrap_or(""))
-        .collect();
+    // Calculate chunk size accounting for formatting overhead
+    let chunk_size = config.max_discord_message_length - config.response_format_padding;
+    
+    // Split content into word-boundary chunks to avoid breaking words
+    let mut chunks = Vec::new();
+    let mut current_chunk = String::new();
+    
+    for word in content.split_whitespace() {
+        // Check if adding this word would exceed the chunk size
+        if current_chunk.len() + word.len() + 1 > chunk_size && !current_chunk.is_empty() {
+            chunks.push(current_chunk.clone());
+            current_chunk.clear();
+        }
+        
+        if !current_chunk.is_empty() {
+            current_chunk.push(' ');
+        }
+        current_chunk.push_str(word);
+    }
+    
+    // Add the last chunk if it's not empty
+    if !current_chunk.is_empty() {
+        chunks.push(current_chunk);
+    }
 
-    // Edit the first message
+    println!("📊 Buffered response: {} characters split into {} chunks", content.len(), chunks.len());
+
+    // Edit the first message with the first chunk
     if let Some(first_chunk) = chunks.first() {
         let formatted_content = if chunks.len() > 1 {
-            format!("🤖 **AI Response (Part 1/{}):**\n```\n{}\n```", chunks.len(), first_chunk)
+            format!("🤖 **AI Response (Part 1/{}) - {} total characters:**\n```\n{}\n```", 
+                chunks.len(), content.len(), first_chunk)
         } else {
-            format!("🤖 **AI Response:**\n```\n{}\n```", first_chunk)
+            format!("🤖 **AI Response ({} characters):**\n```\n{}\n```", 
+                content.len(), first_chunk)
         };
 
         current_msg.edit(&ctx.http, |m| {
@@ -347,11 +399,15 @@ async fn send_response_chunks(
 
     // Send additional messages for remaining chunks
     for (i, chunk) in chunks.iter().skip(1).enumerate() {
-        let formatted_content = format!("🤖 **AI Response (Part {}/{}):**\n```\n{}\n```", i + 2, chunks.len(), chunk);
+        let formatted_content = format!("🤖 **AI Response (Part {}/{}):**\n```\n{}\n```", 
+            i + 2, chunks.len(), chunk);
         
         current_msg.channel_id.send_message(&ctx.http, |m| {
             m.content(formatted_content)
         }).await?;
+        
+        // Small delay between messages to avoid rate limiting
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
     }
 
     Ok(())
