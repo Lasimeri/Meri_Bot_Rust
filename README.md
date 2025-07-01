@@ -14,7 +14,8 @@ A simple Discord bot written in Rust using the Serenity framework.
 ## Features
 
 - `^ping` - Test bot response
-- `^echo <text>` - Repeat your message  
+- `^echo <text>` - Repeat your message
+- `^ppfp @user` - Show user's profile picture in a rich embed
 - `^help` - Show available commands
 
 ## Prerequisites
@@ -61,6 +62,7 @@ A simple Discord bot written in Rust using the Serenity framework.
    - Send Messages
    - Read Messages/View Channels
    - Read Message History
+   - Attach Files
 5. Copy the generated URL and open it in your browser
 6. Select a server and authorize the bot
 
@@ -89,7 +91,8 @@ cargo run
 meri_bot_rust/
 ├── src/
 │   ├── main.rs                # Entry point
-│   └── meri_bot.rs           # Main bot logic
+│   ├── meri_bot.rs           # Main bot logic
+│   └── profilepfp.rs         # Profile picture command
 ├── target/                   # Rust build artifacts
 ├── Cargo.toml                # Dependencies
 ├── bot_config.txt           # Bot configuration (create this)
@@ -110,13 +113,28 @@ The bot responds to commands with the configured prefix (default: `^`):
 - Type `^help` in any channel the bot can see to get a list of commands
 - Commands are case-insensitive
 
+### Profile Picture Command
+
+The `^ppfp` command displays user profile pictures in rich embeds:
+
+- **Usage**: `^ppfp @username` 
+- **Aliases**: `^avatar @username`, `^pfp @username`, `^profilepic @username`
+- **Features**:
+  - Shows user's profile picture in a rich embed
+  - Supports animated GIFs, PNG, JPG, and WebP formats
+  - Clickable title links to high-resolution original image
+  - Memory-efficient: downloads images to RAM, no disk storage
+  - Shows requester information and timestamp
+
 ## Development
 
 To add new commands:
 
-1. Add the command function in `meri_bot.rs`
-2. Add the command to the `#[commands()]` attribute in the General group
-3. Implement the command logic
+1. Create a new command function (in `meri_bot.rs` or a separate module file)
+2. Add the module to `main.rs` if using a separate file
+3. Import the command in `meri_bot.rs`
+4. Add the command to the `#[commands()]` attribute in the General group
+5. Implement the command logic
 
 Example:
 ```rust
@@ -126,6 +144,15 @@ async fn mycommand(ctx: &Context, msg: &Message) -> CommandResult {
     Ok(())
 }
 ```
+
+### Adding Dependencies
+
+The bot uses several key dependencies:
+- `serenity` - Discord API wrapper
+- `tokio` - Async runtime
+- `reqwest` - HTTP client for downloading images
+
+Add new dependencies to `Cargo.toml` as needed.
 
 ## License
 

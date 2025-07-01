@@ -14,10 +14,11 @@ use std::env;
 use std::fs;
 use std::collections::HashMap;
 use tokio::signal;
+use crate::profilepfp::*;
 
 // Command group declaration
 #[group]
-#[commands(ping, echo, help)]
+#[commands(ping, echo, help, ppfp)]
 struct General;
 
 // Event handler implementation
@@ -104,7 +105,7 @@ async fn echo(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
 #[command]
 async fn help(ctx: &Context, msg: &Message) -> CommandResult {
     let prefix = env::var("PREFIX").unwrap_or_else(|_| "!".to_string());
-    let response = format!("**Meri Bot Commands:**\n`{0}ping` - Test bot response\n`{0}echo <text>` - Repeat your message\n`{0}help` - Show this message", prefix);
+    let response = format!("**Meri Bot Commands:**\n`{0}ping` - Test bot response\n`{0}echo <text>` - Repeat your message\n`{0}ppfp @user` - Show user's profile picture\n`{0}help` - Show this message", prefix);
     msg.reply(ctx, &response).await?;
     Ok(())
 }

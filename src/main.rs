@@ -1,4 +1,5 @@
 mod meri_bot;
+mod profilepfp;
 
 #[tokio::main]
 async fn main() {
