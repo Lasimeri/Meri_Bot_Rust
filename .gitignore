@@ -1,6 +1,106 @@
-/target
+# Rust build artifacts
+/target/
 **/*.rs.bk
-Cargo.lock
+*.pdb
+
+# Bot configuration files containing sensitive information
+bot_config.txt
+*_config.txt
+!example_bot_config.txt
+
+# Environment files
 .env
-.env.local
+.env.*
+*.env
+!.env.example
+
+# Log files and debugging output
+*.log
+logs/
+debug/
+crash-*.txt
+
+# OS generated files
 .DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
+$RECYCLE.BIN/
+
+# IDE/Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.vimrc
+.vim/
+
+# Development and testing files
+*.orig
+*.rej
+*.patch
+.coverage
+.nyc_output
+node_modules/
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+*.backup
+*~
+\#*\#
+.\#*
+
+# Profiling and debugging
+*.prof
+*.trace
+*.out
+flamegraph.svg
+perf.data*
+
+# Documentation build output
+/book/
+/mdbook/
+
+# Any sensitive files
+*secret*
+*private*
+*credential*
+*token*
+*key*
+*password*
+
+# Local configuration overrides
+local_config.*
+dev_config.*
+test_config.*
+
+# Build artifacts on different platforms
+*.exe
+*.dll
+*.so
+*.dylib
+*.a
+*.lib
+
+# Package files
+*.deb
+*.rpm
+*.msi
+*.dmg
+*.pkg
+
+# Backup files from editors
+*.bak
+*.backup
+*.old
+*.save
+run_with_logging.ps1
+run_bot.ps1
+run_bot_with_logs.bat

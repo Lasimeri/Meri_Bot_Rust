@@ -2,11 +2,20 @@
 
 A simple Discord bot written in Rust using the Serenity framework.
 
+## ⚠️ Security Notice
+
+**NEVER commit your Discord bot token to version control!**
+
+- Your Discord token is like a password - keep it secret
+- The `.gitignore` file is configured to prevent accidental token uploads
+- Use the `bot_config.txt` file or environment variables to set your token
+- If you accidentally commit a token, regenerate it immediately in the Discord Developer Portal
+
 ## Features
 
-- `!ping` - Check if the bot is responsive
-- `!echo <text>` - Make the bot repeat your message
-- `!help` - Display available commands
+- `^ping` - Test bot response
+- `^echo <text>` - Repeat your message  
+- `^help` - Show available commands
 
 ## Prerequisites
 
@@ -29,10 +38,10 @@ A simple Discord bot written in Rust using the Serenity framework.
 
 3. **Set up environment variables**
    
-   Create a `.env` file in the project root:
+   Create a `bot_config.txt` file in the project root:
    ```
    DISCORD_TOKEN=your_bot_token_here
-   PREFIX=!
+   PREFIX=^
    ```
    
    Note: The PREFIX can be customized to any character(s) you prefer (default is "!")
@@ -55,16 +64,38 @@ A simple Discord bot written in Rust using the Serenity framework.
 5. Copy the generated URL and open it in your browser
 6. Select a server and authorize the bot
 
+## Running the Bot
+
+### Option 1: Using the Helper Script (Recommended)
+```powershell
+# Run with token as parameter (Windows)
+.\run_bot.ps1 -Token "your_actual_discord_token"
+
+# Or set environment variable first
+$env:DISCORD_TOKEN="your_actual_discord_token"
+.\run_bot.ps1
+```
+
+### Option 2: Direct Environment Variables
+```powershell
+$env:DISCORD_TOKEN="your_actual_discord_token"
+$env:PREFIX="^"
+cargo run
+```
+
 ## Project Structure
 
 ```
 meri_bot_rust/
 ├── src/
-│   ├── main.rs        # Entry point
-│   └── Meri_Bot.rs    # Main bot logic
-├── Cargo.toml         # Dependencies
-├── .env              # Environment variables (create this)
-└── README.md         # This file
+│   ├── main.rs                # Entry point
+│   └── meri_bot.rs           # Main bot logic
+├── target/                   # Rust build artifacts
+├── Cargo.toml                # Dependencies
+├── bot_config.txt           # Bot configuration (create this)
+├── example_bot_config.txt   # Example configuration file
+├── run_bot.ps1              # Helper script to run the bot
+└── README.md                # This file
 ```
 
 ## Configuration
@@ -73,11 +104,17 @@ The bot uses the following configuration:
 - Command prefix: Configurable via `PREFIX` environment variable (default: "!")
 - Case insensitive commands
 
+## Usage
+
+The bot responds to commands with the configured prefix (default: `^`):
+- Type `^help` in any channel the bot can see to get a list of commands
+- Commands are case-insensitive
+
 ## Development
 
 To add new commands:
 
-1. Add the command function in `Meri_Bot.rs`
+1. Add the command function in `meri_bot.rs`
 2. Add the command to the `#[commands()]` attribute in the General group
 3. Implement the command logic
 

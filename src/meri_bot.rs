@@ -11,6 +11,9 @@ use serenity::{
     prelude::GatewayIntents,
 };
 use std::env;
+use std::fs;
+use std::collections::HashMap;
+use tokio::signal;
 
 // Command group declaration
 #[group]
@@ -23,8 +26,61 @@ struct Handler;
 #[async_trait]
 impl EventHandler for Handler {
     async fn ready(&self, _: Context, ready: Ready) {
-        println!("Bot connected as {}!", ready.user.name);
+        println!("✅ Bot connected as {}!", ready.user.name);
     }
+}
+
+// Function to read configuration from bot_config.txt
+fn load_bot_config() -> Result<HashMap<String, String>, String> {
+    let config_paths = [
+        "bot_config.txt",
+        "../bot_config.txt", 
+        "../../bot_config.txt",
+        "src/bot_config.txt"
+    ];
+    
+    // Clear any existing relevant environment variables
+    env::remove_var("DISCORD_TOKEN");
+    env::remove_var("PREFIX");
+    env::remove_var("RUST_LOG");
+    
+    for config_path in &config_paths {
+        match fs::read_to_string(config_path) {
+            Ok(content) => {
+                // Remove BOM if present
+                let content = content.strip_prefix('\u{feff}').unwrap_or(&content);
+                let mut config = HashMap::new();
+                
+                // Parse the config file line by line
+                for line in content.lines() {
+                    let line = line.trim();
+                    
+                    // Skip empty lines and comments
+                    if line.is_empty() || line.starts_with('#') {
+                        continue;
+                    }
+                    
+                    // Parse KEY=VALUE format
+                    if let Some(equals_pos) = line.find('=') {
+                        let key = line[..equals_pos].trim().to_string();
+                        let value = line[equals_pos + 1..].trim().to_string();
+                        
+                        // Set environment variable for compatibility
+                        env::set_var(&key, &value);
+                        config.insert(key, value);
+                    }
+                }
+                
+                return Ok(config);
+            }
+            Err(_) => {
+                // Try next path
+                continue;
+            }
+        }
+    }
+    
+    Err("No bot_config.txt file found in any expected location".to_string())
 }
 
 // Command implementations
@@ -37,44 +93,53 @@ async fn ping(ctx: &Context, msg: &Message) -> CommandResult {
 #[command]
 async fn echo(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
     let text = args.message();
-    msg.reply(ctx, text).await?;
+    if text.is_empty() {
+        msg.reply(ctx, "Please provide text to echo!").await?;
+    } else {
+        msg.reply(ctx, text).await?;
+    }
     Ok(())
 }
 
 #[command]
 async fn help(ctx: &Context, msg: &Message) -> CommandResult {
     let prefix = env::var("PREFIX").unwrap_or_else(|_| "!".to_string());
-    msg.reply(ctx, &format!("**Commands:**\n`{0}ping` - Check latency\n`{0}echo <text>` - Repeat text\n`{0}help` - Show this help", prefix)).await?;
+    let response = format!("**Meri Bot Commands:**\n`{0}ping` - Test bot response\n`{0}echo <text>` - Repeat your message\n`{0}help` - Show this message", prefix);
+    msg.reply(ctx, &response).await?;
     Ok(())
 }
 
 // Main bot function
 pub async fn run() {
-    // Try to load environment variables from different locations
-    if let Err(_) = dotenv::from_filename(".env") {
-        if let Err(_) = dotenv::from_filename("src/.env") {
-            println!("Warning: Could not load .env file from root or src directory");
-        } else {
-            println!("Successfully loaded .env file from src directory");
+    // Load configuration from bot_config.txt file
+    match load_bot_config() {
+        Ok(_) => println!("✅ Configuration loaded from bot_config.txt"),
+        Err(error) => {
+            eprintln!("❌ Failed to load bot_config.txt: {}", error);
+            eprintln!("Create a bot_config.txt file in the project root with: DISCORD_TOKEN=your_token_here and PREFIX=^");
+            return;
         }
-    } else {
-        println!("Successfully loaded .env file from root directory");
-    }
+    };
     
-    // Debug: Print all environment variables that start with DISCORD or PREFIX
-    for (key, value) in env::vars() {
-        if key.starts_with("DISCORD") || key.starts_with("PREFIX") {
-            println!("Found env var: {}={}", key, if key.contains("TOKEN") { "[HIDDEN]" } else { &value });
+    // Get Discord token from configuration
+    let token = match env::var("DISCORD_TOKEN") {
+        Ok(token) => {
+            // Validate token is not placeholder
+            if token == "YOUR_BOT_TOKEN_HERE" || token.is_empty() {
+                eprintln!("❌ DISCORD_TOKEN in bot_config.txt is set to placeholder! Replace with your actual Discord bot token.");
+                return;
+            }
+            token
         }
-    }
+        Err(_) => {
+            eprintln!("❌ DISCORD_TOKEN not found in bot_config.txt file!");
+            return;
+        }
+    };
     
-    // Get token from environment variable
-    let token = env::var("DISCORD_TOKEN")
-        .expect("Expected DISCORD_TOKEN in the environment. Make sure your .env file contains DISCORD_TOKEN=your_token_here");
-    
-    // Get prefix from environment variable (default to "!" if not set)
+    // Get command prefix from configuration
     let prefix = env::var("PREFIX").unwrap_or_else(|_| "!".to_string());
-    println!("Using prefix: {}", prefix);
+    println!("🤖 Starting bot with prefix: '{}'", prefix);
     
     // Set up command framework
     let framework = StandardFramework::new()
@@ -86,14 +151,31 @@ pub async fn run() {
         | GatewayIntents::MESSAGE_CONTENT;
 
     // Create and start client
-    let mut client = Client::builder(token, intents)
+    let mut client = match Client::builder(token, intents)
         .event_handler(Handler)
         .framework(framework)
         .await
-        .expect("Error creating client");
+    {
+        Ok(client) => client,
+        Err(e) => {
+            eprintln!("❌ Error creating Discord client: {:?}", e);
+            eprintln!("Check your token in bot_config.txt file");
+            return;
+        }
+    };
 
-    // Start listening for events
-    if let Err(why) = client.start().await {
-        eprintln!("Client error: {:?}", why);
+    // Set up graceful shutdown on CTRL+C
+    println!("🚀 Bot is running... Press Ctrl+C to stop");
+    tokio::select! {
+        _ = signal::ctrl_c() => {
+            println!("\n⏹️ Stopping bot gracefully...");
+        }
+        result = client.start() => {
+            if let Err(why) = result {
+                eprintln!("❌ Client error: {:?}", why);
+            }
+        }
     }
+    
+    println!("✅ Bot stopped");
 } 
