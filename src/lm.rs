@@ -8,6 +8,21 @@ use std::fs;
 use std::collections::HashMap;
 use futures_util::StreamExt;
 
+// Structure to track streaming statistics
+#[derive(Debug)]
+struct StreamingStats {
+    total_characters: usize,
+    message_count: usize,
+}
+
+// Structure to track current message state during streaming
+struct MessageState {
+    current_content: String,
+    current_message: Message,
+    message_index: usize,
+    char_limit: usize,
+}
+
 // LM Studio API Configuration structure
 #[derive(Debug, Clone)]
 pub struct LMConfig {
@@ -222,27 +237,231 @@ pub async fn lm(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
     // Log which model is being used for LM command
     println!("💬 LM command: Using model '{}' for chat", config.default_model);
 
-    // Buffer the complete response from streaming
-    match buffer_chat_response(messages, &config.default_model, &config, ctx, &mut current_msg).await {
-        Ok(response_content) => {
-            // Send the complete buffered response in Discord-sized chunks
-            if let Err(e) = send_buffered_response(ctx, &mut current_msg, &response_content, &config).await {
-                eprintln!("❌ Failed to send response chunks: {}", e);
-                let _ = current_msg.edit(&ctx.http, |m| {
-                    m.content("❌ Failed to send complete response!")
-                }).await;
-            }
+    // Stream the response with real-time Discord post editing
+    match stream_chat_response(messages, &config.default_model, &config, ctx, &mut current_msg).await {
+        Ok(final_stats) => {
+            println!("💬 LM command: Streaming complete - {} total characters across {} messages", 
+                final_stats.total_characters, final_stats.message_count);
         }
         Err(e) => {
-            eprintln!("❌ Failed to get response from AI model: {}", e);
+            eprintln!("❌ Failed to stream response from AI model: {}", e);
             let _ = current_msg.edit(&ctx.http, |m| {
                 m.content("❌ Failed to get response from AI model!")
             }).await;
         }
     }
 
+        Ok(())
+}
+
+// Main streaming function that handles real-time response with Discord message editing for chat
+async fn stream_chat_response(
+    messages: Vec<ChatMessage>,
+    model: &str,
+    config: &LMConfig,
+    ctx: &Context,
+    initial_msg: &mut Message,
+) -> Result<StreamingStats, Box<dyn std::error::Error + Send + Sync>> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(config.timeout * 3))
+        .build()?;
+        
+    let chat_request = ChatRequest {
+        model: model.to_string(),
+        messages,
+        temperature: config.default_temperature,
+        max_tokens: config.default_max_tokens,
+        stream: true,
+    };
+
+    let response = client
+        .post(&format!("{}/v1/chat/completions", config.base_url))
+        .json(&chat_request)
+        .send()
+        .await?;
+
+    if !response.status().is_success() {
+        return Err(format!("API request failed: HTTP {}", response.status()).into());
+    }
+
+    let mut stream = response.bytes_stream();
+    let mut message_state = MessageState {
+        current_content: String::new(),
+        current_message: initial_msg.clone(),
+        message_index: 1,
+        char_limit: config.max_discord_message_length - config.response_format_padding,
+    };
+    
+    let mut raw_response = String::new();
+    let mut content_buffer = String::new();
+    let mut last_update = std::time::Instant::now();
+    let update_interval = std::time::Duration::from_millis(800); // Update every 0.8 seconds
+
+    println!("💬 Starting real-time streaming for chat response...");
+
+    while let Some(chunk) = stream.next().await {
+        match chunk {
+            Ok(bytes) => {
+                let text = String::from_utf8_lossy(&bytes);
+                
+                for line in text.lines() {
+                    if let Some(json_str) = line.strip_prefix("data: ") {
+                        if json_str.trim() == "[DONE]" {
+                            // Process any remaining content and finalize
+                            if !content_buffer.trim().is_empty() {
+                                if let Err(e) = finalize_chat_message(&mut message_state, &content_buffer, ctx, config).await {
+                                    eprintln!("❌ Failed to finalize message: {}", e);
+                                }
+                            }
+                            
+                            let stats = StreamingStats {
+                                total_characters: raw_response.len(),
+                                message_count: message_state.message_index,
+                            };
+                            
+                            println!("💬 Streaming complete - {} total characters", stats.total_characters);
+                            return Ok(stats);
+                        }
+                        
+                        if let Ok(response_chunk) = serde_json::from_str::<ChatResponse>(json_str) {    
+                            for choice in response_chunk.choices {
+                                if let Some(finish_reason) = choice.finish_reason {
+                                    if finish_reason == "stop" {
+                                        // Process final content
+                                        if !content_buffer.trim().is_empty() {
+                                            if let Err(e) = finalize_chat_message(&mut message_state, &content_buffer, ctx, config).await {
+                                                eprintln!("❌ Failed to finalize message: {}", e);
+                                            }
+                                        }
+                                        
+                                        let stats = StreamingStats {
+                                            total_characters: raw_response.len(),
+                                            message_count: message_state.message_index,
+                                        };
+                                        
+                                        return Ok(stats);
+                                    }
+                                }
+                                
+                                if let Some(delta) = choice.delta {
+                                    if let Some(content) = delta.content {
+                                        raw_response.push_str(&content);
+                                        content_buffer.push_str(&content);
+                                        
+                                        // Update Discord message periodically
+                                        if last_update.elapsed() >= update_interval && !content_buffer.trim().is_empty() {
+                                            if let Err(e) = update_chat_message(&mut message_state, &content_buffer, ctx, config).await {
+                                                eprintln!("❌ Failed to update Discord message: {}", e);
+                                            } else {
+                                                content_buffer.clear(); // Clear buffer after successful update
+                                            }
+                                            last_update = std::time::Instant::now();
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("❌ Stream error: {}", e);
+                break;
+            }
+        }
+    }
+
+    // Final cleanup - process any remaining content
+    if !content_buffer.trim().is_empty() {
+        if let Err(e) = finalize_chat_message(&mut message_state, &content_buffer, ctx, config).await {
+            eprintln!("❌ Failed to finalize remaining content: {}", e);
+        }
+    }
+
+    let stats = StreamingStats {
+        total_characters: raw_response.len(),
+        message_count: message_state.message_index,
+    };
+
+    Ok(stats)
+}
+
+// Helper function to update Discord message with new content for chat
+async fn update_chat_message(
+    state: &mut MessageState,
+    new_content: &str,
+    ctx: &Context,
+    config: &LMConfig,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let potential_content = if state.current_content.is_empty() {
+        format!("🤖 **AI Response (Part {}):**\n```\n{}\n```", 
+            state.message_index, new_content)
+    } else {
+        format!("🤖 **AI Response (Part {}):**\n```\n{}{}\n```", 
+            state.message_index, state.current_content, new_content)
+    };
+
+    // Check if we need to create a new message
+    if potential_content.len() > state.char_limit {
+        // Finalize current message
+        let final_content = format!("🤖 **AI Response (Part {}):**\n```\n{}\n```", 
+            state.message_index, state.current_content);
+        
+        state.current_message.edit(&ctx.http, |m| {
+            m.content(final_content)
+        }).await?;
+
+        // Create new message
+        state.message_index += 1;
+        let new_msg_content = format!("🤖 **AI Response (Part {}):**\n```\n{}\n```", 
+            state.message_index, new_content);
+        
+        let new_message = state.current_message.channel_id.send_message(&ctx.http, |m| {
+            m.content(new_msg_content)
+        }).await?;
+
+        state.current_message = new_message;
+        state.current_content = new_content.to_string();
+    } else {
+        // Update current message
+        state.current_content.push_str(new_content);
+        state.current_message.edit(&ctx.http, |m| {
+            m.content(&potential_content)
+        }).await?;
+    }
+
     Ok(())
 }
+
+// Helper function to finalize message content at the end of streaming for chat
+#[allow(unused_variables)]
+async fn finalize_chat_message(
+    state: &mut MessageState,
+    remaining_content: &str,
+    ctx: &Context,
+    config: &LMConfig,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if remaining_content.trim().is_empty() {
+        return Ok(());
+    }
+
+    // Add any remaining content and finalize
+    update_chat_message(state, remaining_content, ctx, config).await?;
+    
+    // Mark the final message as complete
+    let final_display = if state.message_index == 1 {
+        format!("🤖 **AI Response Complete** ✅\n```\n{}\n```", state.current_content)
+    } else {
+        format!("🤖 **AI Response Complete (Part {}/{})** ✅\n```\n{}\n```", 
+            state.message_index, state.message_index, state.current_content)
+    };
+
+    state.current_message.edit(&ctx.http, |m| {
+        m.content(final_display)
+    }).await?;
+
+    Ok(())
+} 
 
 // Helper function to load system prompt from file
 async fn load_system_prompt() -> Result<String, Box<dyn std::error::Error + Send + Sync>> {

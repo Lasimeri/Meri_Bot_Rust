@@ -1,6 +1,6 @@
 # Meri Bot Rust
 
-A simple Discord bot written in Rust using the Serenity framework.
+A powerful Discord bot written in Rust using the Serenity framework, featuring real-time AI chat streaming, advanced reasoning capabilities, and comprehensive user interaction features.
 
 ## ⚠️ Security Notice
 
@@ -30,15 +30,25 @@ A simple Discord bot written in Rust using the Serenity framework.
 ### 🤖 AI Chat Commands
 - `^lm <prompt>` - Chat with AI via LM Studio/Ollama
   - **Aliases**: `^llm`, `^ai`, `^chat` 
-  - **Features**: Buffered responses, smart message chunking, extended output length, progress indicators
+  - **Features**: **Real-time streaming responses**, smart message chunking, extended output length (8K tokens), live progress indicators, multi-part message support
 - `^reason <question>` - Deep reasoning with specialized AI model
   - **Aliases**: `^reasoning`
-  - **Features**: Step-by-step reasoning, dedicated reasoning model, thinking tag filtering, logical explanations
+  - **Features**: **Real-time streaming with thinking tag filtering**, step-by-step reasoning, dedicated reasoning model, automatic `<think>` content removal, logical explanations
 
 ### 💡 User Experience
 - **Typing indicators** on all commands for immediate feedback
+- **Real-time streaming** - Watch AI responses appear live as they're generated
+- **Smart message chunking** - Automatically splits long responses across multiple Discord messages
 - **Error handling** with helpful guidance messages
 - **Configuration validation** with clear error messages
+- **Progress tracking** - Live character counts and generation status
+
+### ⚡ Streaming Technology
+- **Server-Sent Events (SSE)** streaming from LM Studio/Ollama APIs
+- **Live Discord message editing** - Messages update in real-time every 0.8 seconds
+- **Thinking tag filtering** - Automatically removes `<think>...</think>` content from reasoning responses
+- **Memory efficient** - Processes responses incrementally without storing massive buffers
+- **Automatic fallback** - Handles connection issues and API errors gracefully
 
 ## Prerequisites
 
@@ -201,19 +211,22 @@ The `^ppfp` command displays user profile pictures in rich embeds:
 
 ### AI Chat Command (LM Studio/Ollama)
 
-The `^lm` command provides AI chat functionality via LM Studio or Ollama:
+The `^lm` command provides real-time AI chat functionality via LM Studio or Ollama:
 
 - **Usage**: `^lm <your prompt>` 
 - **Aliases**: `^llm <prompt>`, `^ai <prompt>`, `^chat <prompt>`
-- **Features**:
-  - **Buffered response system** for handling long AI outputs
-  - **Smart word-boundary chunking** into 2000-character Discord messages
-  - **Live progress indicators** showing response generation status
-  - **Extended response length** (up to 8192 tokens by default)
-  - **Multiple response parts** with clear numbering and character counts
-  - **Intelligent model management** (no manual loading/unloading)
-  - **Comprehensive error handling** and user feedback
-  - **Configurable parameters** (temperature=0.8, tokens, formatting)
+- **Core Features**:
+  - **🔄 Real-time streaming** - Responses appear live as the AI generates them
+  - **⚡ Live message editing** - Discord messages update every 0.8 seconds during generation
+  - **📝 Smart word-boundary chunking** - Automatically splits responses across multiple 2000-character Discord messages
+  - **📊 Live progress tracking** - See character counts and generation status in real-time
+  - **🎯 Extended response length** - Up to 8192 tokens by default for comprehensive answers
+  - **🔢 Multi-part responses** - Numbered parts (Part 1/N) for long responses with completion indicators
+- **Technical Features**:
+  - **🛠️ Intelligent model management** - No manual loading/unloading required
+  - **🔧 Configurable parameters** - Temperature (0.8), tokens, and formatting customizable
+  - **❌ Comprehensive error handling** - Detailed error messages and recovery guidance
+  - **⚙️ Server-Sent Events (SSE)** - Efficient streaming protocol for real-time updates
 - **Requirements**:
   - LM Studio (default: localhost:1234) or Ollama (default: localhost:11434)
   - Valid model loaded in your AI server
@@ -222,28 +235,33 @@ The `^lm` command provides AI chat functionality via LM Studio or Ollama:
 
 ### AI Reasoning Command (LM Studio/Ollama)
 
-The `^reason` command provides advanced AI reasoning capabilities:
+The `^reason` command provides advanced AI reasoning capabilities with real-time streaming and thinking content filtering:
 
 - **Usage**: `^reason <your reasoning question>` 
 - **Aliases**: `^reasoning <question>`
-- **Features**:
-  - **Dedicated reasoning model** for complex logical problems
-  - **Step-by-step thinking** with detailed explanations
-  - **Specialized system prompt** optimized for reasoning tasks
-  - **Thinking tag filtering** - automatically filters out `<think>...</think>` content from responses
-  - **Same buffering system** as the chat command for long responses
-  - **Fallback prompts** if custom reasoning prompt files aren't found
-- **Thinking Tag Filtering**:
-  - The command automatically filters out content between `<think>` and `</think>` tags
-  - This allows reasoning models to show their thought process internally without cluttering the user response
-  - Supports multiple thinking blocks within a single response
-  - Handles unclosed thinking tags by discarding everything after the opening tag
-  - If the response contains only thinking content, displays a helpful message to the user
+- **Core Features**:
+  - **🧠 Dedicated reasoning model** - Specialized models optimized for logical analysis and step-by-step thinking
+  - **🔄 Real-time streaming** - Watch reasoning unfold live as the AI processes your question
+  - **🎯 Thinking tag filtering** - Automatically removes `<think>...</think>` content in real-time during streaming
+  - **📋 Step-by-step explanations** - Detailed logical breakdowns and reasoning processes
+  - **⚙️ Specialized system prompts** - Optimized prompts for reasoning tasks and logical analysis
+- **Advanced Thinking Tag Filtering**:
+  - **🔍 Real-time filtering** - `<think>` content is removed as responses stream, not after completion
+  - **🧹 Clean user experience** - Only the final reasoning conclusions appear in Discord
+  - **🔄 Multi-block support** - Handles multiple thinking sections within a single response
+  - **🛡️ Robust handling** - Properly manages unclosed thinking tags and malformed content
+  - **📊 Statistics tracking** - Shows how much thinking content was filtered out
+  - **❓ Empty response handling** - Helpful messages when responses contain only thinking content
+- **Technical Features**:
+  - **📝 Same streaming architecture** - Uses the same real-time message editing as chat command
+  - **🔢 Multi-part responses** - Long reasoning explanations split intelligently across Discord messages
+  - **📁 Fallback prompts** - Uses `system_prompt.txt` if `reasoning_prompt.txt` isn't found
+  - **🔧 Independent configuration** - Separate model configuration and multi-path file search
 - **Requirements**:
   - Same as LM chat command plus `DEFAULT_REASON_MODEL` configuration
   - Optional: `reasoning_prompt.txt` file for specialized reasoning instructions
   - Falls back to `system_prompt.txt` if reasoning prompt not found
-  - Independent configuration loading with multi-path search for reliability
+  - Models that support thinking tags (e.g., qwen, deepseek-r1, specialized reasoning models)
 
 ## Development
 

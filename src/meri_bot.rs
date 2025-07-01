@@ -110,7 +110,41 @@ async fn echo(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
 async fn help(ctx: &Context, msg: &Message) -> CommandResult {
     let _typing = ctx.http.start_typing(msg.channel_id.0)?;
     let prefix = env::var("PREFIX").unwrap_or_else(|_| "!".to_string());
-    let response = format!("**🤖 Meri Bot Commands:**\n\n**📋 Basic Commands:**\n`{0}ping` - Test bot response\n`{0}echo <text>` - Repeat your message\n`{0}help` - Show this command list\n\n**🖼️ Profile Pictures:**\n`{0}ppfp @user` - Show user's profile picture\n*Aliases: {0}avatar, {0}pfp, {0}profilepic*\n\n**🤖 AI Chat:**\n`{0}lm <prompt>` - Chat with AI via LM Studio/Ollama\n*Aliases: {0}llm, {0}ai, {0}chat*\n\n**🧠 AI Reasoning:**\n`{0}reason <question>` - Deep reasoning with specialized AI model\n*Aliases: {0}reasoning*\n\n**💡 Tip:** All commands show typing indicators while processing!", prefix);
+    
+    let response = format!(
+        "**🤖 Meri Bot - Comprehensive Command Guide**\n\n\
+        **📋 Basic Commands:**\n\
+        • `{0}ping` - Test bot connectivity and response time\n\
+        • `{0}echo <text>` - Echo back your message\n\
+        • `{0}help` - Display this comprehensive command guide\n\n\
+        **🖼️ Profile Picture Commands:**\n\
+        • `{0}ppfp @user` - Display user's profile picture in rich embed\n\
+        • **Aliases:** `{0}avatar`, `{0}pfp`, `{0}profilepic`\n\
+        • **Features:** High-quality embeds, clickable links, animated GIF support\n\n\
+        **🤖 AI Chat (LM Studio/Ollama):**\n\
+        • `{0}lm <prompt>` - Interactive AI chat with real-time streaming\n\
+        • **Aliases:** `{0}llm`, `{0}ai`, `{0}chat`\n\
+        • **Features:** Live response streaming, multi-part messages, 8K token support\n\
+        • **Requirements:** LM Studio or Ollama with configured models\n\n\
+        **🧠 AI Reasoning (Advanced):**\n\
+        • `{0}reason <question>` - Specialized AI reasoning with step-by-step analysis\n\
+        • **Aliases:** `{0}reasoning`\n\
+        • **Features:** Thinking tag filtering, logical breakdown, dedicated reasoning models\n\
+        • **Best for:** Complex problems, logical analysis, step-by-step explanations\n\n\
+        **💡 User Experience Features:**\n\
+        • ⌨️ **Typing indicators** on all commands for immediate feedback\n\
+        • 🔄 **Real-time streaming** for AI responses with live updates\n\
+        • 📝 **Smart message chunking** respects Discord's 2000 character limit\n\
+        • ❌ **Comprehensive error handling** with helpful guidance messages\n\
+        • 🎯 **Case-insensitive commands** work with any capitalization\n\n\
+        **🛠️ Setup Requirements:**\n\
+        • Discord bot token in `botconfig.txt`\n\
+        • LM Studio/Ollama configuration in `lmapiconf.txt` (for AI features)\n\
+        • System prompts in `system_prompt.txt` and `reasoning_prompt.txt`\n\n\
+        **📚 Need help?** Check the README.md for detailed setup instructions!", 
+        prefix
+    );
+    
     msg.reply(ctx, &response).await?;
     Ok(())
 }

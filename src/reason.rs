@@ -5,7 +5,52 @@ use serenity::{
 };
 use std::fs;
 use std::collections::HashMap;
-use crate::lm::{LMConfig, buffer_chat_response, send_buffered_response, ChatMessage};
+use serde::{Deserialize, Serialize};
+use futures_util::StreamExt;
+use crate::lm::{LMConfig, ChatMessage};
+
+// Structures for streaming API responses
+#[derive(Deserialize)]
+struct ChatResponse {
+    choices: Vec<Choice>,
+}
+
+#[derive(Deserialize)]
+struct Choice {
+    delta: Option<Delta>,
+    finish_reason: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct Delta {
+    content: Option<String>,
+}
+
+// API Request structure
+#[derive(Serialize)]
+struct ChatRequest {
+    model: String,
+    messages: Vec<ChatMessage>,
+    temperature: f32,
+    max_tokens: i32,
+    stream: bool,
+}
+
+// Structure to track streaming statistics
+#[derive(Debug)]
+struct StreamingStats {
+    total_characters: usize,
+    message_count: usize,
+    filtered_characters: usize,
+}
+
+// Structure to track current message state during streaming
+struct MessageState {
+    current_content: String,
+    current_message: Message,
+    message_index: usize,
+    char_limit: usize,
+}
 
 #[command]
 #[aliases("reasoning")]
@@ -68,38 +113,14 @@ pub async fn reason(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
     // Log which reasoning model is being used
     println!("🧠 Reasoning command: Using model '{}' for reasoning task", config.default_reason_model);
 
-    // Buffer the complete response from streaming using the reasoning model
-    match buffer_chat_response(messages, &config.default_reason_model, &config, ctx, &mut current_msg).await {
-        Ok(response_content) => {
-            // Filter out thinking tags and content before sending to Discord
-            let filtered_content = filter_thinking_tags(&response_content);
-            
-            // Log the filtering results for debugging
-            println!("🧠 Reasoning command: Raw response length: {} characters", response_content.len());
-            println!("🧠 Reasoning command: Filtered response length: {} characters", filtered_content.len());
-            
-            if filtered_content.len() != response_content.len() {
-                println!("🧠 Reasoning command: Successfully filtered thinking content");
-            }
-            
-            // Check if we have any content left after filtering
-            if filtered_content.trim().is_empty() {
-                let _ = current_msg.edit(&ctx.http, |m| {
-                    m.content("🧠 **Reasoning Complete** ✅\n\nThe AI completed its reasoning process, but the response appears to contain only thinking content. The model may have used `<think>` tags for the entire response.")
-                }).await;
-                return Ok(());
-            }
-            
-            // Send the filtered response in Discord-sized chunks
-            if let Err(e) = send_buffered_response(ctx, &mut current_msg, &filtered_content, &config).await {
-                eprintln!("❌ Failed to send response chunks: {}", e);
-                let _ = current_msg.edit(&ctx.http, |m| {
-                    m.content("❌ Failed to send complete response!")
-                }).await;
-            }
+    // Stream the response with real-time filtering and Discord post editing
+    match stream_reasoning_response(messages, &config.default_reason_model, &config, ctx, &mut current_msg).await {
+        Ok(final_stats) => {
+            println!("🧠 Reasoning command: Streaming complete - {} total characters across {} messages", 
+                final_stats.total_characters, final_stats.message_count);
         }
         Err(e) => {
-            eprintln!("❌ Failed to get response from reasoning model: {}", e);
+            eprintln!("❌ Failed to stream response from reasoning model: {}", e);
             let _ = current_msg.edit(&ctx.http, |m| {
                 m.content("❌ Failed to get response from reasoning model!")
             }).await;
@@ -303,4 +324,264 @@ fn test_filter_thinking_tags() {
     assert_eq!(result4, "Just normal content here");
     
     println!("✅ All thinking tag filter tests passed!");
+}
+
+// Main streaming function that handles real-time response with Discord message editing
+async fn stream_reasoning_response(
+    messages: Vec<ChatMessage>,
+    model: &str,
+    config: &LMConfig,
+    ctx: &Context,
+    initial_msg: &mut Message,
+) -> Result<StreamingStats, Box<dyn std::error::Error + Send + Sync>> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(config.timeout * 3))
+        .build()?;
+        
+    let chat_request = ChatRequest {
+        model: model.to_string(),
+        messages,
+        temperature: config.default_temperature,
+        max_tokens: config.default_max_tokens,
+        stream: true,
+    };
+
+    let response = client
+        .post(&format!("{}/v1/chat/completions", config.base_url))
+        .json(&chat_request)
+        .send()
+        .await?;
+
+    if !response.status().is_success() {
+        return Err(format!("API request failed: HTTP {}", response.status()).into());
+    }
+
+    let mut stream = response.bytes_stream();
+    let mut message_state = MessageState {
+        current_content: String::new(),
+        current_message: initial_msg.clone(),
+        message_index: 1,
+        char_limit: config.max_discord_message_length - config.response_format_padding,
+    };
+    
+    let mut raw_response = String::new();
+    let mut last_update = std::time::Instant::now();
+    let update_interval = std::time::Duration::from_millis(800); // Update every 0.8 seconds
+    let mut total_filtered_chars = 0; // Track total filtered content length
+
+    println!("🧠 Starting real-time streaming for reasoning response...");
+
+    while let Some(chunk) = stream.next().await {
+        match chunk {
+            Ok(bytes) => {
+                let text = String::from_utf8_lossy(&bytes);
+                
+                for line in text.lines() {
+                    if let Some(json_str) = line.strip_prefix("data: ") {
+                        if json_str.trim() == "[DONE]" {
+                            // Apply final thinking tag filtering and finalize
+                            let final_filtered_content = filter_thinking_tags(&raw_response);
+                            
+                            // Check if there's any remaining content to display
+                            if final_filtered_content.len() > total_filtered_chars {
+                                let remaining_content = &final_filtered_content[total_filtered_chars..];
+                                if !remaining_content.trim().is_empty() {
+                                    if let Err(e) = finalize_message_content(&mut message_state, remaining_content, ctx, config).await {
+                                        eprintln!("❌ Failed to finalize message: {}", e);
+                                    }
+                                }
+                            } else if final_filtered_content.trim().is_empty() {
+                                // Handle case where entire response was thinking content
+                                let _ = message_state.current_message.edit(&ctx.http, |m| {
+                                    m.content("🧠 **Reasoning Complete** ✅\n\nThe AI completed its reasoning process, but the response appears to contain only thinking content. The model may have used `<think>` tags for the entire response.")
+                                }).await;
+                            }
+                            
+                            let stats = StreamingStats {
+                                total_characters: raw_response.len(),
+                                message_count: message_state.message_index,
+                                filtered_characters: raw_response.len() - final_filtered_content.len(),
+                            };
+                            
+                            println!("🧠 Streaming complete - filtered {} characters of thinking content", 
+                                stats.filtered_characters);
+                            return Ok(stats);
+                        }
+                        
+                        if let Ok(response_chunk) = serde_json::from_str::<ChatResponse>(json_str) {    
+                            for choice in response_chunk.choices {
+                                if let Some(finish_reason) = choice.finish_reason {
+                                    if finish_reason == "stop" {
+                                        // Apply final thinking tag filtering and finalize
+                                        let final_filtered_content = filter_thinking_tags(&raw_response);
+                                        
+                                        // Check if there's any remaining content to display
+                                        if final_filtered_content.len() > total_filtered_chars {
+                                            let remaining_content = &final_filtered_content[total_filtered_chars..];
+                                            if !remaining_content.trim().is_empty() {
+                                                if let Err(e) = finalize_message_content(&mut message_state, remaining_content, ctx, config).await {
+                                                    eprintln!("❌ Failed to finalize message: {}", e);
+                                                }
+                                            }
+                                        } else if final_filtered_content.trim().is_empty() {
+                                            // Handle case where entire response was thinking content
+                                            let _ = message_state.current_message.edit(&ctx.http, |m| {
+                                                m.content("🧠 **Reasoning Complete** ✅\n\nThe AI completed its reasoning process, but the response appears to contain only thinking content. The model may have used `<think>` tags for the entire response.")
+                                            }).await;
+                                        }
+                                        
+                                        let stats = StreamingStats {
+                                            total_characters: raw_response.len(),
+                                            message_count: message_state.message_index,
+                                            filtered_characters: raw_response.len() - final_filtered_content.len(),
+                                        };
+                                        
+                                        return Ok(stats);
+                                    }
+                                }
+                                
+                                if let Some(delta) = choice.delta {
+                                    if let Some(content) = delta.content {
+                                        raw_response.push_str(&content);
+                                        
+                                        // Update Discord message periodically with filtered content
+                                        if last_update.elapsed() >= update_interval && raw_response.len() > 50 {
+                                            // Apply thinking tag filtering to the accumulated response
+                                            let filtered_content = filter_thinking_tags(&raw_response);
+                                            
+                                            // Only update if we have meaningful filtered content
+                                            if !filtered_content.trim().is_empty() {
+                                                // Calculate what new content to show (difference from what's already displayed)
+                                                let new_content = if filtered_content.len() > total_filtered_chars {
+                                                    &filtered_content[total_filtered_chars..]
+                                                } else {
+                                                    ""
+                                                };
+                                                
+                                                if !new_content.trim().is_empty() {
+                                                    if let Err(e) = update_discord_message(&mut message_state, new_content, ctx, config).await {
+                                                        eprintln!("❌ Failed to update Discord message: {}", e);
+                                                    } else {
+                                                        total_filtered_chars = filtered_content.len();
+                                                    }
+                                                }
+                                            }
+                                            last_update = std::time::Instant::now();
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("❌ Stream error: {}", e);
+                break;
+            }
+        }
+    }
+
+    // Final cleanup - apply thinking tag filtering and process any remaining content
+    let final_filtered_content = filter_thinking_tags(&raw_response);
+    
+    if final_filtered_content.len() > total_filtered_chars {
+        let remaining_content = &final_filtered_content[total_filtered_chars..];
+        if !remaining_content.trim().is_empty() {
+            if let Err(e) = finalize_message_content(&mut message_state, remaining_content, ctx, config).await {
+                eprintln!("❌ Failed to finalize remaining content: {}", e);
+            }
+        }
+    } else if final_filtered_content.trim().is_empty() {
+        // Handle case where entire response was thinking content
+        let _ = message_state.current_message.edit(&ctx.http, |m| {
+            m.content("🧠 **Reasoning Complete** ✅\n\nThe AI completed its reasoning process, but the response appears to contain only thinking content. The model may have used `<think>` tags for the entire response.")
+        }).await;
+    }
+
+    let stats = StreamingStats {
+        total_characters: raw_response.len(),
+        message_count: message_state.message_index,
+        filtered_characters: raw_response.len() - final_filtered_content.len(),
+    };
+
+    Ok(stats)
+}
+
+// Helper function to update Discord message with new content
+#[allow(unused_variables)]
+async fn update_discord_message(
+    state: &mut MessageState,
+    new_content: &str,
+    ctx: &Context,
+    config: &LMConfig,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let potential_content = if state.current_content.is_empty() {
+        format!("🧠 **Reasoning Response (Part {}):**\n```\n{}\n```", 
+            state.message_index, new_content)
+    } else {
+        format!("🧠 **Reasoning Response (Part {}):**\n```\n{}{}\n```", 
+            state.message_index, state.current_content, new_content)
+    };
+
+    // Check if we need to create a new message
+    if potential_content.len() > state.char_limit {
+        // Finalize current message
+        let final_content = format!("🧠 **Reasoning Response (Part {}):**\n```\n{}\n```", 
+            state.message_index, state.current_content);
+        
+        state.current_message.edit(&ctx.http, |m| {
+            m.content(final_content)
+        }).await?;
+
+        // Create new message
+        state.message_index += 1;
+        let new_msg_content = format!("🧠 **Reasoning Response (Part {}):**\n```\n{}\n```", 
+            state.message_index, new_content);
+        
+        let new_message = state.current_message.channel_id.send_message(&ctx.http, |m| {
+            m.content(new_msg_content)
+        }).await?;
+
+        state.current_message = new_message;
+        state.current_content = new_content.to_string();
+    } else {
+        // Update current message
+        state.current_content.push_str(new_content);
+        state.current_message.edit(&ctx.http, |m| {
+            m.content(&potential_content)
+        }).await?;
+    }
+
+    Ok(())
+}
+
+// Helper function to finalize message content at the end of streaming
+#[allow(unused_variables)]
+async fn finalize_message_content(
+    state: &mut MessageState,
+    remaining_content: &str,
+    ctx: &Context,
+    config: &LMConfig,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if remaining_content.trim().is_empty() {
+        return Ok(());
+    }
+
+    // Add any remaining content and finalize
+    update_discord_message(state, remaining_content, ctx, config).await?;
+    
+    // Mark the final message as complete
+    let final_display = if state.message_index == 1 {
+        format!("🧠 **Reasoning Complete** ✅\n```\n{}\n```", state.current_content)
+    } else {
+        format!("🧠 **Reasoning Complete (Part {}/{})** ✅\n```\n{}\n```", 
+            state.message_index, state.message_index, state.current_content)
+    };
+
+    state.current_message.edit(&ctx.http, |m| {
+        m.content(final_display)
+    }).await?;
+
+    Ok(())
 } 

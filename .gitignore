@@ -112,6 +112,16 @@ test_config.*
 *.backup
 *.old
 *.save
+
+# PowerShell and batch scripts (may contain sensitive data)
 run_with_logging.ps1
 run_bot.ps1
 run_bot_with_logs.bat
+*.ps1
+*.bat
+*.cmd
+
+# Streaming and development artifacts
+streaming_test.*
+response_test.*
+filter_test.*
