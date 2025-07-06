@@ -7,8 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use futures_util::StreamExt;
 use crate::search::{
-    ddg_search, format_search_results, load_lm_config, perform_basic_search, 
-    perform_ai_enhanced_search, LMConfig, ChatMessage
+    load_lm_config, perform_ai_enhanced_search, LMConfig, ChatMessage
 };
 
 // Structure to track streaming statistics
@@ -84,8 +83,8 @@ pub async fn lm(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
             Ok(config) => config,
             Err(e) => {
                 eprintln!("❌ Failed to load LM Studio configuration for search: {}", e);
-                // Fallback to basic search without AI enhancement
-                return perform_basic_search(ctx, msg, search_query).await.map_err(|e| e.into());
+                msg.reply(ctx, &format!("❌ LM Studio configuration error: {}\n\nMake sure `lmapiconf.txt` exists and contains all required settings. Check `example_lmapiconf.txt` for reference.", e)).await?;
+                return Ok(());
             }
         };
 
@@ -108,29 +107,60 @@ pub async fn lm(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
             }
             Err(e) => {
                 eprintln!("❌ AI-enhanced search failed: {}", e);
-                // Fallback to basic search
-                if let Err(fallback_error) = search_msg.edit(&ctx.http, |m| {
-                    m.content("🔍 AI enhancement failed, performing basic search...")
-                }).await {
-                    eprintln!("❌ Failed to update message for fallback: {}", fallback_error);
-                }
+                let error_msg = format!("❌ **Search Failed**\n\nQuery: `{}`\nError: {}\n\n💡 Check your SerpAPI configuration in lmapiconf.txt", search_query, e);
+                let _ = search_msg.edit(&ctx.http, |m| {
+                    m.content(&error_msg)
+                }).await;
+            }
+        }
+
+        return Ok(());
+    }
+
+    // Check if this is a connectivity test request
+    if input.starts_with("--test") || input == "-t" {
+        // Load LM Studio configuration for connectivity test
+        let config = match load_lm_config().await {
+            Ok(config) => config,
+            Err(e) => {
+                eprintln!("❌ Failed to load LM Studio configuration for test: {}", e);
+                msg.reply(ctx, &format!("❌ LM Studio configuration error: {}\n\nMake sure `lmapiconf.txt` exists and contains all required settings. Check `example_lmapiconf.txt` for reference.", e)).await?;
+                return Ok(());
+            }
+        };
+
+        // Send initial test message
+        let mut test_msg = match msg.channel_id.send_message(&ctx.http, |m| {
+            m.content("🔗 Testing API connectivity to remote server...")
+        }).await {
+            Ok(message) => message,
+            Err(e) => {
+                eprintln!("❌ Failed to send initial test message: {}", e);
+                msg.reply(ctx, "❌ Failed to send message!").await?;
+                return Ok(());
+            }
+        };
+
+        // Perform connectivity test
+        match crate::search::test_api_connectivity(&config).await {
+            Ok(success_message) => {
+                let final_message = format!("✅ **Connectivity Test Results**\n\n{}\n\n**Configuration:**\n• Server: `{}`\n• Default Model: `{}`\n• Reasoning Model: `{}`\n• Timeout: `{}s`", 
+                    success_message, config.base_url, config.default_model, config.default_reason_model, config.timeout);
                 
-                // Perform basic search as fallback
-                match ddg_search(search_query).await {
-                    Ok(results) => {
-                        let formatted_results = format_search_results(&results, search_query);
-                        if let Err(e) = search_msg.edit(&ctx.http, |m| {
-                            m.content(&formatted_results)
-                        }).await {
-                            eprintln!("❌ Failed to update search message: {}", e);
-                        }
-                    }
-                    Err(basic_error) => {
-                        let error_msg = format!("❌ **Search Failed**\n\nQuery: `{}`\nError: {}\n\n💡 Try rephrasing your search query or check your internet connection.", search_query, basic_error);
-                        let _ = search_msg.edit(&ctx.http, |m| {
-                            m.content(&error_msg)
-                        }).await;
-                    }
+                if let Err(e) = test_msg.edit(&ctx.http, |m| {
+                    m.content(&final_message)
+                }).await {
+                    eprintln!("❌ Failed to update test message: {}", e);
+                }
+            }
+            Err(e) => {
+                let error_message = format!("❌ **Connectivity Test Failed**\n\n**Error:** {}\n\n**Troubleshooting:**\n• Check if LM Studio/Ollama is running on `{}`\n• Verify the model `{}` is loaded\n• Check firewall settings\n• Ensure the server is accessible from this network\n\n**Configuration:**\n• Server: `{}`\n• Default Model: `{}`\n• Timeout: `{}s`", 
+                    e, config.base_url, config.default_model, config.base_url, config.default_model, config.timeout);
+                
+                if let Err(edit_error) = test_msg.edit(&ctx.http, |m| {
+                    m.content(&error_message)
+                }).await {
+                    eprintln!("❌ Failed to update test message with error: {}", edit_error);
                 }
             }
         }
@@ -213,6 +243,10 @@ async fn stream_chat_response(
     ctx: &Context,
     initial_msg: &mut Message,
 ) -> Result<StreamingStats, Box<dyn std::error::Error + Send + Sync>> {
+    println!("🔗 [STREAMING] Attempting connection to API server: {}", config.base_url);
+    println!("🔗 [STREAMING] Using model: {}", model);
+    println!("🔗 [STREAMING] Timeout: {} seconds (extended to {}s for streaming)", config.timeout, config.timeout * 3);
+    
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(config.timeout * 3))
         .build()?;
@@ -225,16 +259,49 @@ async fn stream_chat_response(
         stream: true,
     };
 
-    let response = client
-        .post(&format!("{}/v1/chat/completions", config.base_url))
-        .json(&chat_request)
-        .send()
-        .await?;
+    let api_url = format!("{}/v1/chat/completions", config.base_url);
+    println!("🔗 [STREAMING] Full API URL: {}", api_url);
+    println!("🔗 [STREAMING] Request payload: model={}, max_tokens={}, temperature={}, stream=true", 
+        chat_request.model, chat_request.max_tokens, chat_request.temperature);
 
-    if !response.status().is_success() {
-        return Err(format!("API request failed: HTTP {}", response.status()).into());
+    // First, test basic connectivity to the server
+    println!("🔗 [STREAMING] Testing basic connectivity to {}...", config.base_url);
+    match client.get(&config.base_url).send().await {
+        Ok(response) => {
+            println!("✅ [STREAMING] Basic connectivity test successful - Status: {}", response.status());
+        }
+        Err(e) => {
+            println!("❌ [STREAMING] Basic connectivity test failed: {}", e);
+            return Err(format!("Cannot reach remote server {}: {}", config.base_url, e).into());
+        }
     }
 
+    // Now attempt the actual streaming API call
+    println!("🔗 [STREAMING] Making streaming API request to chat completions endpoint...");
+    let response = match client
+        .post(&api_url)
+        .json(&chat_request)
+        .send()
+        .await
+    {
+        Ok(resp) => {
+            println!("✅ [STREAMING] API request sent successfully - Status: {}", resp.status());
+            resp
+        }
+        Err(e) => {
+            println!("❌ [STREAMING] API request failed: {}", e);
+            return Err(format!("Streaming API request to {} failed: {}", api_url, e).into());
+        }
+    };
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let error_text = response.text().await.unwrap_or_else(|_| "Unable to read error response".to_string());
+        println!("❌ [STREAMING] API returned error status {}: {}", status, error_text);
+        return Err(format!("Streaming API request failed: HTTP {} - {}", status, error_text).into());
+    }
+
+    println!("✅ [STREAMING] Starting to process response stream...");
     let mut stream = response.bytes_stream();
     let mut message_state = MessageState {
         current_content: String::new(),
@@ -247,17 +314,26 @@ async fn stream_chat_response(
     let mut content_buffer = String::new();
     let mut last_update = std::time::Instant::now();
     let update_interval = std::time::Duration::from_millis(800); // Update every 0.8 seconds
+    let mut chunk_count = 0;
 
     println!("💬 Starting real-time streaming for chat response...");
 
     while let Some(chunk) = stream.next().await {
         match chunk {
             Ok(bytes) => {
+                chunk_count += 1;
+                if chunk_count == 1 {
+                    println!("✅ [STREAMING] Received first chunk ({} bytes)", bytes.len());
+                } else if chunk_count % 10 == 0 {
+                    println!("📊 [STREAMING] Processed {} chunks, total response: {} chars", chunk_count, raw_response.len());
+                }
+                
                 let text = String::from_utf8_lossy(&bytes);
                 
                 for line in text.lines() {
                     if let Some(json_str) = line.strip_prefix("data: ") {
                         if json_str.trim() == "[DONE]" {
+                            println!("✅ [STREAMING] Received [DONE] signal, finalizing response");
                             // Process any remaining content and finalize
                             if !content_buffer.trim().is_empty() {
                                 if let Err(e) = finalize_chat_message(&mut message_state, &content_buffer, ctx, config).await {
@@ -278,6 +354,7 @@ async fn stream_chat_response(
                             for choice in response_chunk.choices {
                                 if let Some(finish_reason) = choice.finish_reason {
                                     if finish_reason == "stop" {
+                                        println!("✅ [STREAMING] Received finish_reason=stop, finalizing response");
                                         // Process final content
                                         if !content_buffer.trim().is_empty() {
                                             if let Err(e) = finalize_chat_message(&mut message_state, &content_buffer, ctx, config).await {
@@ -311,17 +388,21 @@ async fn stream_chat_response(
                                     }
                                 }
                             }
+                        } else {
+                            println!("⚠️ [STREAMING] Failed to parse JSON chunk: {}", json_str);
                         }
                     }
                 }
             }
             Err(e) => {
-                eprintln!("❌ Stream error: {}", e);
+                eprintln!("❌ [STREAMING] Stream error: {}", e);
                 break;
             }
         }
     }
 
+    println!("📊 [STREAMING] Stream ended, processed {} chunks total", chunk_count);
+    
     // Final cleanup - process any remaining content
     if !content_buffer.trim().is_empty() {
         if let Err(e) = finalize_chat_message(&mut message_state, &content_buffer, ctx, config).await {

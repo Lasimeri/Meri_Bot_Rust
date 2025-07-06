@@ -143,3 +143,4 @@ test_*.rs
 debug_*.rs
 temp_*.rs
 *.tmp.rs
+serpapi.txt

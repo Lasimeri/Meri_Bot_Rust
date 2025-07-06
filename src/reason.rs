@@ -84,8 +84,8 @@ pub async fn reason(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
             Ok(config) => config,
             Err(e) => {
                 eprintln!("❌ Failed to load LM Studio configuration for reasoning search: {}", e);
-                // Fallback to basic search without AI enhancement
-                return crate::search::perform_basic_search(ctx, msg, search_query).await.map_err(|e| e.into());
+                msg.reply(ctx, &format!("❌ LM Studio configuration error: {}\n\nMake sure `lmapiconf.txt` exists and contains all required settings. Check `example_lmapiconf.txt` for reference.", e)).await?;
+                return Ok(());
             }
         };
 
@@ -108,30 +108,10 @@ pub async fn reason(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
             }
             Err(e) => {
                 eprintln!("❌ Reasoning-enhanced search failed: {}", e);
-                // Fallback to basic search
-                if let Err(fallback_error) = search_msg.edit(&ctx.http, |m| {
-                    m.content("🔍 AI enhancement failed, performing basic search...")
-                }).await {
-                    eprintln!("❌ Failed to update message for fallback: {}", fallback_error);
-                }
-                
-                // Perform basic search as fallback
-                match crate::search::ddg_search(search_query).await {
-                    Ok(results) => {
-                        let formatted_results = crate::search::format_search_results(&results, search_query);
-                        if let Err(e) = search_msg.edit(&ctx.http, |m| {
-                            m.content(&formatted_results)
-                        }).await {
-                            eprintln!("❌ Failed to update search message: {}", e);
-                        }
-                    }
-                    Err(basic_error) => {
-                        let error_msg = format!("❌ **Reasoning Search Failed**\n\nQuery: `{}`\nError: {}\n\n💡 Try rephrasing your search query or check your internet connection.", search_query, basic_error);
-                        let _ = search_msg.edit(&ctx.http, |m| {
-                            m.content(&error_msg)
-                        }).await;
-                    }
-                }
+                let error_msg = format!("❌ **Reasoning Search Failed**\n\nQuery: `{}`\nError: {}\n\n💡 Check your SerpAPI configuration in lmapiconf.txt", search_query, e);
+                let _ = search_msg.edit(&ctx.http, |m| {
+                    m.content(&error_msg)
+                }).await;
             }
         }
 
@@ -686,7 +666,7 @@ async fn perform_reasoning_enhanced_search(
     }).await.map_err(|e| format!("Failed to update message: {}", e))?;
 
     // Step 2: Perform the web search with user's exact query
-    let results = crate::search::ddg_search(user_query).await
+    let results = crate::search::multi_search(user_query).await
         .map_err(|e| format!("Search failed: {}", e))?;
     
     // Update message to show reasoning analysis progress
@@ -695,34 +675,25 @@ async fn perform_reasoning_enhanced_search(
     }).await.map_err(|e| format!("Failed to update message: {}", e))?;
 
     // Step 3: Analyze the search results using reasoning model with embedded links
-    let analysis = analyze_search_results_with_reasoning(&results, user_query, user_query, config).await?;
-    
-    // Add search metadata to the analysis
-    let final_response = format!(
-        "{}\n\n---\n*🧠 Reasoning Search: {}*",
-        analysis,
-        user_query
-    );
-
-    // Step 4: Post the final reasoning-enhanced analysis
-    search_msg.edit(&ctx.http, |m| {
-        m.content(&final_response)
-    }).await.map_err(|e| format!("Failed to update message: {}", e))?;
+    // This function now handles its own streaming and metadata
+    analyze_search_results_with_reasoning(&results, user_query, user_query, config, ctx, search_msg).await?;
 
     Ok(())
 }
 
-/// Analyze search results using reasoning model with embedded links
+/// Analyze search results using reasoning model with embedded links, streaming the response
 async fn analyze_search_results_with_reasoning(
     results: &[crate::search::SearchResult],
     _search_query: &str,
     user_query: &str,
     config: &LMConfig,
-) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    ctx: &Context,
+    search_msg: &mut Message,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     println!("🧠 Reasoning analysis: Generating analytical summary for {} results", results.len());
     
     let analysis_prompt = load_reasoning_search_analysis_prompt().await.unwrap_or_else(|_| {
-        "You are an expert analytical reasoner. Analyze these web search results to provide a comprehensive, logical analysis that addresses the user's query. Focus on reasoning through the information, identifying patterns, drawing connections, and providing insights. Use Discord formatting and embed relevant links naturally in your analysis using [title](URL) format. Keep under 1800 characters.".to_string()
+        "You are an expert analytical reasoner. Analyze these web search results to provide a concise, logical analysis. Use Discord formatting and embed relevant links using [title](URL) format. CRITICAL: Your ENTIRE response must be under 1200 characters including all formatting. Be extremely concise.".to_string()
     });
 
     // Format the results for the reasoning model with both text and links
@@ -738,7 +709,7 @@ async fn analyze_search_results_with_reasoning(
     }
 
     let user_prompt = format!(
-        "User's search query: {}\n\nSources to analyze:\n{}\n\nPlease provide a comprehensive analytical reasoning response that:\n1. Addresses the user's question through logical analysis\n2. Synthesizes information from multiple sources\n3. Draws meaningful connections and insights\n4. Embeds 2-3 most relevant source links naturally using [title](URL) format\n5. Uses clear reasoning and step-by-step thinking where appropriate",
+        "User's search query: {}\n\nSources to analyze:\n{}\n\nProvide a VERY CONCISE analytical response that:\n1. Addresses the user's question directly\n2. Cites 2-3 sources with [title](URL) format\n3. Uses clear reasoning\n\nCRITICAL: Keep your ENTIRE response under 1200 characters. Be extremely concise and direct.",
         user_query, formatted_results
     );
 
@@ -753,15 +724,223 @@ async fn analyze_search_results_with_reasoning(
         },
     ];
 
-    let analysis = chat_completion_reasoning(
-        messages,
-        &config.default_reason_model,
-        config,
-        Some(512), // Limit tokens for analysis to ensure it fits Discord
-    ).await?;
+    // Create a new initial message for the streaming response
+    let mut analysis_msg = match search_msg.channel_id.send_message(&ctx.http, |m| {
+        m.content("🧠 Analyzing search results with reasoning model...")
+    }).await {
+        Ok(message) => message,
+        Err(e) => {
+            eprintln!("❌ Failed to send initial analysis message: {}", e);
+            return Err(format!("Failed to send analysis message: {}", e).into());
+        }
+    };
 
-    println!("🧠 Reasoning analysis: Generated analysis of {} characters", analysis.len());
-    Ok(analysis)
+    // Use dedicated streaming function for reason -s with proper chunking
+    let _stats = stream_reasoning_search_response(messages, &config.default_reason_model, config, ctx, &mut analysis_msg).await?;
+    
+    // Add search metadata to the final message
+    let final_msg = format!(
+        "\n\n---\n*🧠 Reasoning Search: {}*",
+        user_query
+    );
+    
+    // Try to append the metadata to the last message, or create a new one if it's too long
+    let current_content = &analysis_msg.content;
+    let potential_content = format!("{}{}", current_content, final_msg);
+    
+    if potential_content.len() <= 2000 {
+        // Can fit in current message
+        analysis_msg.edit(&ctx.http, |m| {
+            m.content(&potential_content)
+        }).await.map_err(|e| format!("Failed to update final message: {}", e))?;
+    } else {
+        // Need to create a new message for metadata
+        analysis_msg.channel_id.send_message(&ctx.http, |m| {
+            m.content(&final_msg)
+        }).await.map_err(|e| format!("Failed to send metadata message: {}", e))?;
+    }
+    
+    Ok(())
+}
+
+// Dedicated streaming function for reason -s with proper message chunking
+async fn stream_reasoning_search_response(
+    messages: Vec<ChatMessage>,
+    model: &str,
+    config: &LMConfig,
+    ctx: &Context,
+    initial_msg: &mut Message,
+) -> Result<StreamingStats, Box<dyn std::error::Error + Send + Sync>> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(config.timeout * 3))
+        .build()?;
+        
+    let chat_request = ChatRequest {
+        model: model.to_string(),
+        messages,
+        temperature: config.default_temperature,
+        max_tokens: config.default_max_tokens,
+        stream: true,
+    };
+
+    let response = client
+        .post(&format!("{}/v1/chat/completions", config.base_url))
+        .json(&chat_request)
+        .send()
+        .await?;
+
+    if !response.status().is_success() {
+        return Err(format!("API request failed: HTTP {}", response.status()).into());
+    }
+
+    let mut stream = response.bytes_stream();
+    let mut raw_response = String::new();
+    let mut filtered_buffer = String::new();
+    let mut message_count = 1;
+    let mut current_message = initial_msg.clone();
+    let char_limit = config.max_discord_message_length - config.response_format_padding;
+
+    println!("🧠 Starting streaming for reasoning search response (buffered chunks)...");
+
+    while let Some(chunk) = stream.next().await {
+        match chunk {
+            Ok(bytes) => {
+                let text = String::from_utf8_lossy(&bytes);
+                
+                for line in text.lines() {
+                    if let Some(json_str) = line.strip_prefix("data: ") {
+                        if json_str.trim() == "[DONE]" {
+                            // Post any remaining content in the buffer
+                            if !filtered_buffer.trim().is_empty() {
+                                if let Err(e) = post_chunked_message(&filtered_buffer, &mut current_message, &mut message_count, ctx, char_limit).await {
+                                    eprintln!("❌ Failed to post final chunk: {}", e);
+                                }
+                            }
+                            
+                            let stats = StreamingStats {
+                                total_characters: raw_response.len(),
+                                message_count,
+                                filtered_characters: raw_response.len() - filtered_buffer.len(),
+                            };
+                            
+                            return Ok(stats);
+                        }
+                        
+                        if let Ok(response_chunk) = serde_json::from_str::<ChatResponse>(json_str) {    
+                            for choice in response_chunk.choices {
+                                if let Some(finish_reason) = choice.finish_reason {
+                                    if finish_reason == "stop" {
+                                        // Post any remaining content in the buffer
+                                        if !filtered_buffer.trim().is_empty() {
+                                            if let Err(e) = post_chunked_message(&filtered_buffer, &mut current_message, &mut message_count, ctx, char_limit).await {
+                                                eprintln!("❌ Failed to post final chunk: {}", e);
+                                            }
+                                        }
+                                        
+                                        let stats = StreamingStats {
+                                            total_characters: raw_response.len(),
+                                            message_count,
+                                            filtered_characters: raw_response.len() - filtered_buffer.len(),
+                                        };
+                                        
+                                        return Ok(stats);
+                                    }
+                                }
+                                
+                                if let Some(delta) = choice.delta {
+                                    if let Some(content) = delta.content {
+                                        raw_response.push_str(&content);
+                                        
+                                        // Apply thinking tag filtering to accumulated content
+                                        let new_filtered = filter_thinking_tags(&raw_response);
+                                        
+                                        // Only update if we have new filtered content
+                                        if new_filtered.len() > filtered_buffer.len() {
+                                            let new_content = &new_filtered[filtered_buffer.len()..];
+                                            filtered_buffer.push_str(new_content);
+                                            
+                                            // Check if we have enough content to post a chunk
+                                            if filtered_buffer.len() >= char_limit {
+                                                if let Err(e) = post_chunked_message(&filtered_buffer, &mut current_message, &mut message_count, ctx, char_limit).await {
+                                                    eprintln!("❌ Failed to post chunked message: {}", e);
+                                                }
+                                                // Clear the buffer after posting
+                                                filtered_buffer.clear();
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("❌ Stream error: {}", e);
+                break;
+            }
+        }
+    }
+
+    // Final cleanup - post any remaining content
+    if !filtered_buffer.trim().is_empty() {
+        if let Err(e) = post_chunked_message(&filtered_buffer, &mut current_message, &mut message_count, ctx, char_limit).await {
+            eprintln!("❌ Failed to post final chunk: {}", e);
+        }
+    }
+
+    let stats = StreamingStats {
+        total_characters: raw_response.len(),
+        message_count,
+        filtered_characters: raw_response.len() - filtered_buffer.len(),
+    };
+
+    Ok(stats)
+}
+
+// Helper function to post content in chunks with proper message creation
+async fn post_chunked_message(
+    content: &str,
+    current_message: &mut Message,
+    message_count: &mut usize,
+    ctx: &Context,
+    char_limit: usize,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if content.trim().is_empty() {
+        return Ok(());
+    }
+
+    // Split content into chunks that fit within Discord's limit
+    let mut remaining_content = content;
+
+    while !remaining_content.trim().is_empty() {
+        let chunk_size = if remaining_content.len() > char_limit {
+            // Find a good breaking point (end of sentence or word boundary)
+            let mut break_point = char_limit;
+            if let Some(last_period) = remaining_content[..char_limit].rfind('.') {
+                break_point = last_period + 1;
+            } else if let Some(last_space) = remaining_content[..char_limit].rfind(' ') {
+                break_point = last_space;
+            }
+            break_point
+        } else {
+            remaining_content.len()
+        };
+
+        let chunk = &remaining_content[..chunk_size];
+        remaining_content = &remaining_content[chunk_size..];
+
+        // Create a new message for this chunk
+        let message_content = format!("🧠 **Analytical Summary (Part {}):**\n\n{}", *message_count, chunk);
+        let new_message = current_message.channel_id.send_message(&ctx.http, |m| {
+            m.content(message_content)
+        }).await?;
+
+        *current_message = new_message;
+        *message_count += 1;
+    }
+
+    Ok(())
 }
 
 /// Load reasoning-specific search analysis prompt

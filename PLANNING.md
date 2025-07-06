@@ -1,3 +1,77 @@
+# Meri Bot Rust - Development Planning
+
+## ✅ Buffered Chunking for Reason -s Command Complete
+
+**Implementation Status:** ✅ COMPLETED
+
+The `reason -s` command has been updated to use buffered chunking instead of real-time editing, providing a more stable and user-friendly experience.
+
+### 🎯 **Problem Solved**
+
+**Previous Issue:** The `reason -s` command was using real-time streaming with message editing, which caused content to disappear or "scroll" when the character limit was reached, creating a confusing user experience.
+
+**Solution Implemented:** Switched to buffered chunking approach that accumulates content and posts it in discrete 2000-character chunks.
+
+### 🔧 **Technical Implementation**
+
+**New Streaming Function:**
+- `stream_reasoning_search_response()` - Dedicated function for `reason -s` with buffered chunking
+- `post_chunked_message()` - Helper function that creates new messages for each chunk
+- Smart text wrapping that breaks at sentence endings or word boundaries
+
+**Key Changes:**
+1. **Removed Real-time Editing** - No more periodic Discord message updates during streaming
+2. **Buffered Accumulation** - Content streams into a buffer with thinking tags filtered out
+3. **Chunk Detection** - When buffer reaches ~1900 characters, it's ready to post
+4. **Message Creation** - Each chunk becomes a new Discord message with "Part X" numbering
+5. **Buffer Reset** - After posting, buffer is cleared to accumulate the next chunk
+
+### 🎯 **User Experience Improvements**
+
+**Before (Real-time Editing):**
+- Content would "scroll" or disappear when limits were reached
+- Confusing flickering and editing behavior
+- Unpredictable message structure
+
+**After (Buffered Chunking):**
+- ✅ **Stable Messages** - Each chunk is a complete, stable message
+- ✅ **Predictable Behavior** - Content appears in discrete, readable chunks
+- ✅ **Clear Structure** - Each chunk is properly formatted and numbered
+- ✅ **No Flickering** - No real-time editing that can cause confusion
+- ✅ **Thinking Tag Filtering** - Still filters out `<think>` content in real-time
+
+### 📝 **Updated Documentation**
+
+**Help Command:**
+- Updated to reflect "buffered chunking" approach
+- Clear description that content is posted in 2000-character chunks
+
+**README.md:**
+- Updated reasoning command sections to reflect new behavior
+- Clarified differences between `reason` (real-time streaming) and `reason -s` (buffered chunking)
+- Added buffered chunking to feature list
+
+### 🚀 **Benefits Achieved**
+
+**Stability:**
+- No more disappearing content or scrolling issues
+- Each message is complete and stable
+- Predictable user experience
+
+**Performance:**
+- More efficient Discord API usage (fewer edit operations)
+- Reduced rate limiting risk
+- Cleaner message history
+
+**User Experience:**
+- Clear message structure with part numbering
+- No confusing real-time editing behavior
+- Better readability with proper chunking
+
+The `reason -s` command now provides a much more stable and user-friendly experience while maintaining all the powerful reasoning and analytical capabilities!
+
+---
+
 ## ✅ DuckDuckGo Search Integration Complete
 
 **Implementation Status:** ✅ COMPLETED

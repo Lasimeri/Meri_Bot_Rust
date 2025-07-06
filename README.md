@@ -39,7 +39,7 @@ A powerful Discord bot written in Rust using the Serenity framework, featuring r
   - **Features**: **Real-time streaming with thinking tag filtering**, step-by-step reasoning, dedicated reasoning model, automatic `<think>` content removal, logical explanations
 - `^reason -s <search query>` - Reasoning-enhanced web search with analytical insights
   - **Aliases**: `^reasoning -s`, `^reasoning --search`
-  - **Features**: **Analytical research synthesis**, reasoning-focused query optimization, embedded source links, specialized reasoning model analysis
+  - **Features**: **Analytical research synthesis**, reasoning-focused query optimization, embedded source links, specialized reasoning model analysis, **buffered chunking** (posts content in 2000-character chunks)
 
 ### 🔍 Web Search Commands
 - `^lm -s <search query>` - AI-enhanced web search with intelligent processing
@@ -271,6 +271,8 @@ The `^reason` command provides advanced AI reasoning capabilities with real-time
   - **🎯 Thinking tag filtering** - Automatically removes `<think>...</think>` content in real-time during streaming
   - **📋 Step-by-step explanations** - Detailed logical breakdowns and reasoning processes
   - **⚙️ Specialized system prompts** - Optimized prompts for reasoning tasks and logical analysis
+  - **🔄 Real-time message editing** - Discord messages update every 0.8 seconds during generation
+  - **📝 Smart word-boundary chunking** - Automatically splits responses across multiple 2000-character Discord messages
 - **Advanced Thinking Tag Filtering**:
   - **🔍 Real-time filtering** - `<think>` content is removed as responses stream, not after completion
   - **🧹 Clean user experience** - Only the final reasoning conclusions appear in Discord
@@ -283,6 +285,7 @@ The `^reason` command provides advanced AI reasoning capabilities with real-time
   - **🔢 Multi-part responses** - Long reasoning explanations split intelligently across Discord messages
   - **📁 Fallback prompts** - Uses `system_prompt.txt` if `reasoning_prompt.txt` isn't found
   - **🔧 Independent configuration** - Separate model configuration and multi-path file search
+  - **Models that support thinking tags (e.g., qwen, deepseek-r1, specialized reasoning models)**
 - **Requirements**:
   - Same as LM chat command plus `DEFAULT_REASON_MODEL` configuration
   - Optional: `reasoning_prompt.txt` file for specialized reasoning instructions
@@ -296,11 +299,12 @@ The `^reason -s` command provides analytical web search capabilities using the r
 - **Usage**: `^reason -s <search query>` or `^reason --search <search query>`
 - **Reasoning-Enhanced Mode** (when LM Studio/Ollama is configured):
   1. **🧠 Query Optimization** - Reasoning model refines your query for analytical research
-  2. **🔍 Web Search** - Searches DuckDuckGo with the optimized query
+  2. **🔍 Web Search** - Searches SerpAPI with the optimized query
   3. **🤖 Analytical Synthesis** - Reasoning model provides deep analysis with embedded links
   4. **📊 Progress Updates** - Real-time status: "Refining for reasoning analysis..." → "Searching..." → "Analyzing with reasoning model..."
+  5. **📝 Buffered Chunking** - Content is accumulated in a buffer and posted in 2000-character chunks with proper text wrapping
 - **Basic Mode** (fallback when AI is unavailable):
-  - Direct DuckDuckGo search with formatted results
+  - Direct SerpAPI search with formatted results
   - Shows top 5 results with titles, descriptions, and clickable links
 - **Examples**:
   ```
@@ -313,8 +317,10 @@ The `^reason -s` command provides analytical web search capabilities using the r
   - **📝 Research-Oriented** - Optimizes queries for academic and analytical content
   - **🔗 Embedded Links** - Source links naturally integrated in analytical responses
   - **⚡ Real-time Progress** - Live updates during the analysis process
+  - **📝 Buffered Chunking** - Content is posted in discrete 2000-character chunks with proper formatting
   - **🛡️ Robust Fallback** - Falls back to basic search when reasoning enhancement fails
   - **🎯 Specialized Prompts** - Uses reasoning-specific prompts for analytical synthesis
+  - **🧹 Thinking Tag Filtering** - Automatically removes `<think>` content during processing
 
 ### Setup for Reasoning-Enhanced Search
 
@@ -486,8 +492,7 @@ The bot uses these key dependencies:
 - `tokio-stream` (0.1) - Async stream utilities with io-util features
 
 #### Web Scraping & Search
-- `scraper` (0.13) - HTML parsing and CSS selector support for web search
-- `urlencoding` (2.1) - URL encoding for search queries
+- `serpapi` (1.0) - Official SerpAPI client for web search functionality
 
 #### Data Handling
 - `serde` (1.0) - JSON serialization/deserialization with derive macros

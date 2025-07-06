@@ -1,14 +1,36 @@
 use reqwest;
-use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::fmt;
 use std::fs;
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 use serenity::{client::Context, model::channel::Message};
+use serpapi::serpapi::Client;
+use tokio::time::sleep;
+
+// Rate limiting for search requests
+static mut LAST_SEARCH_TIME: Option<Instant> = None;
+const MIN_SEARCH_INTERVAL: Duration = Duration::from_millis(1000); // 1 second between searches
+
+/// Rate limiter for search requests
+async fn rate_limit_search() {
+    unsafe {
+        if let Some(last_time) = LAST_SEARCH_TIME {
+            let elapsed = last_time.elapsed();
+            if elapsed < MIN_SEARCH_INTERVAL {
+                let sleep_duration = MIN_SEARCH_INTERVAL - elapsed;
+                println!("⏱️ Rate limiting: waiting {:?}", sleep_duration);
+                sleep(sleep_duration).await;
+            }
+        }
+        LAST_SEARCH_TIME = Some(Instant::now());
+    }
+}
 
 /// Error types for search operations
 #[derive(Debug)]
+#[allow(dead_code)]
 pub enum SearchError {
     HttpError(reqwest::Error),
     ParseError(String),
@@ -98,6 +120,87 @@ struct Choice {
 #[allow(dead_code)]
 struct MessageContent {
     content: Option<String>,
+}
+
+/// SerpAPI Configuration structure
+#[derive(Debug, Clone)]
+pub struct SerpConfig {
+    pub api_key: String,
+    pub engine: String,
+    pub country: String,
+    pub language: String,
+}
+
+/// Load SerpAPI configuration from file (required)
+pub async fn load_serp_config() -> Result<SerpConfig, Box<dyn std::error::Error + Send + Sync>> {
+    // First, load the SerpAPI key from serpapi.txt (single line, multi-path)
+    let serpapi_paths = [
+        "serpapi.txt",
+        "../serpapi.txt",
+        "../../serpapi.txt",
+        "src/serpapi.txt"
+    ];
+    let mut api_key = None;
+    for path in &serpapi_paths {
+        if let Ok(content) = fs::read_to_string(path) {
+            let key = content.trim();
+            if !key.is_empty() && key != "your_serpapi_key_here" {
+                api_key = Some(key.to_string());
+                println!("✅ SerpAPI: Loaded API key from {}", path);
+                break;
+            }
+        }
+    }
+    if api_key.is_none() {
+        return Err("serpapi.txt file not found or API key missing/placeholder in any expected location (., .., ../.., src/)".into());
+    }
+    // Next, load the rest of the config from lmapiconf.txt (multi-path, as before)
+    let config_paths = [
+        "lmapiconf.txt",
+        "../lmapiconf.txt", 
+        "../../lmapiconf.txt",
+        "src/lmapiconf.txt"
+    ];
+    let mut content = String::new();
+    let mut found_file = false;
+    let mut config_source = "";
+    for config_path in &config_paths {
+        match fs::read_to_string(config_path) {
+            Ok(file_content) => {
+                content = file_content;
+                found_file = true;
+                config_source = config_path;
+                println!("🔍 SerpAPI: Loaded config from {}", config_path);
+                break;
+            }
+            Err(_) => continue,
+        }
+    }
+    if !found_file {
+        return Err("lmapiconf.txt file not found in any expected location (., .., ../.., src/)".into());
+    }
+    let content = content.strip_prefix('\u{feff}').unwrap_or(&content);
+    let mut config_map = HashMap::new();
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some(equals_pos) = line.find('=') {
+            let key = line[..equals_pos].trim().to_string();
+            let value = line[equals_pos + 1..].trim().to_string();
+            config_map.insert(key, value);
+        }
+    }
+    let config = SerpConfig {
+        api_key: api_key.unwrap(),
+        engine: config_map.get("SERPAPI_ENGINE").cloned().unwrap_or_else(|| "google".to_string()),
+        country: config_map.get("SERPAPI_COUNTRY").cloned().unwrap_or_else(|| "us".to_string()),
+        language: config_map.get("SERPAPI_LANGUAGE").cloned().unwrap_or_else(|| "en".to_string()),
+    };
+    println!("✅ SerpAPI: Configuration loaded successfully from {} and serpapi.txt", config_source);
+    println!("🔍 SerpAPI: Engine={}, Country={}, Language={}", config.engine, config.country, config.language);
+    Ok(config)
 }
 
 /// Load LM Studio configuration from file using multi-path fallback
@@ -273,6 +376,10 @@ async fn chat_completion(
     config: &LMConfig,
     max_tokens: Option<i32>,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    println!("🔗 Attempting connection to API server: {}", config.base_url);
+    println!("🔗 Using model: {}", model);
+    println!("🔗 Timeout: {} seconds", config.timeout);
+    
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(config.timeout))
         .build()?;
@@ -285,31 +392,69 @@ async fn chat_completion(
         stream: false,
     };
 
-    let response = client
-        .post(&format!("{}/v1/chat/completions", config.base_url))
+    let api_url = format!("{}/v1/chat/completions", config.base_url);
+    println!("🔗 Full API URL: {}", api_url);
+    println!("🔗 Request payload: model={}, max_tokens={}, temperature={}", 
+        chat_request.model, chat_request.max_tokens, chat_request.temperature);
+
+    // First, test basic connectivity to the server
+    println!("🔗 Testing basic connectivity to {}...", config.base_url);
+    match client.get(&config.base_url).send().await {
+        Ok(response) => {
+            println!("✅ Basic connectivity test successful - Status: {}", response.status());
+        }
+        Err(e) => {
+            println!("❌ Basic connectivity test failed: {}", e);
+            return Err(format!("Cannot reach remote server {}: {}", config.base_url, e).into());
+        }
+    }
+
+    // Now attempt the actual API call
+    println!("🔗 Making API request to chat completions endpoint...");
+    let response = match client
+        .post(&api_url)
         .json(&chat_request)
         .send()
-        .await?;
+        .await 
+    {
+        Ok(resp) => {
+            println!("✅ API request sent successfully - Status: {}", resp.status());
+            resp
+        }
+        Err(e) => {
+            println!("❌ API request failed: {}", e);
+            return Err(format!("API request to {} failed: {}", api_url, e).into());
+        }
+    };
 
     if !response.status().is_success() {
-        return Err(format!("API request failed: HTTP {}", response.status()).into());
+        let status = response.status();
+        let error_text = response.text().await.unwrap_or_else(|_| "Unable to read error response".to_string());
+        println!("❌ API returned error status {}: {}", status, error_text);
+        return Err(format!("API request failed: HTTP {} - {}", status, error_text).into());
     }
 
     // Parse non-streaming response
     let response_text = response.text().await?;
-    let response_json: serde_json::Value = serde_json::from_str(&response_text)?;
+    println!("✅ Received API response: {} characters", response_text.len());
+    
+    let response_json: serde_json::Value = serde_json::from_str(&response_text)
+        .map_err(|e| format!("Failed to parse JSON response: {}", e))?;
     
     // Extract content from response
     if let Some(choices) = response_json["choices"].as_array() {
         if let Some(first_choice) = choices.get(0) {
             if let Some(message) = first_choice["message"].as_object() {
                 if let Some(content) = message["content"].as_str() {
+                    println!("✅ Successfully extracted content: {} characters", content.len());
                     return Ok(content.trim().to_string());
                 }
             }
         }
     }
     
+    println!("❌ Failed to extract content from response structure");
+    println!("Response JSON: {}", serde_json::to_string_pretty(&response_json).unwrap_or_else(|_| "Cannot format JSON".to_string()));
     Err("Failed to extract content from API response".into())
 }
 
@@ -358,7 +503,7 @@ pub async fn summarize_search_results(
     println!("🔍 Result summary: Generating AI summary for {} results", results.len());
     
     let summarize_prompt = load_summarize_search_prompt().await.unwrap_or_else(|_| {
-        "You are an expert information synthesizer. Summarize these web search results into a comprehensive, well-organized response under 1800 characters. Use Discord formatting (bold, code blocks) for better readability. Include relevant links directly embedded in your response.".to_string()
+        "You are an expert information synthesizer. Summarize these web search results into a concise, well-organized response. Use Discord formatting and embed links using [title](URL) format. CRITICAL: Keep your ENTIRE response under 1600 characters including all formatting.".to_string()
     });
 
     // Format the results for the AI with both text and links
@@ -374,7 +519,7 @@ pub async fn summarize_search_results(
     }
 
     let user_prompt = format!(
-        "User's search query: {}\n\nSearch results to summarize:\n{}\n\nPlease provide a comprehensive summary that directly answers the user's question. Include relevant links by embedding them naturally in your response using Discord markdown format [title](URL). Focus on the most important information and cite 2-3 of the most relevant sources.",
+        "User's search query: {}\n\nSearch results to summarize:\n{}\n\nProvide a CONCISE summary that directly answers the user's question. Include relevant links by embedding them using Discord markdown format [title](URL). Cite 2-3 of the most relevant sources. CRITICAL: Keep your ENTIRE response under 1600 characters.",
         user_query, formatted_results
     );
 
@@ -393,8 +538,21 @@ pub async fn summarize_search_results(
         messages,
         &config.default_model,
         config,
-        Some(512), // Limit tokens for summary to ensure it fits Discord
+        Some(400), // Reduced from 512 to ensure shorter responses
     ).await?;
+
+    // Additional safety check - truncate if still too long
+    let summary = if summary.len() > 1700 {
+        println!("⚠️ Search summary still too long ({} chars), truncating", summary.len());
+        let truncated = if let Some(last_period) = summary[..1600].rfind('.') {
+            &summary[..=last_period]
+        } else {
+            &summary[..1600]
+        };
+        format!("{}...", truncated.trim())
+    } else {
+        summary
+    };
 
     println!("🔍 Result summary: Generated summary of {} characters", summary.len());
     Ok(summary)
@@ -416,7 +574,7 @@ pub async fn perform_ai_enhanced_search(
     }).await.map_err(|e| format!("Failed to update message: {}", e))?;
 
     // Step 2: Perform the web search with user's exact query
-    let results = ddg_search(user_query).await?;
+    let results = multi_search(user_query).await?;
     
     // Update message to show summarization progress
     search_msg.edit(&ctx.http, |m| {
@@ -441,112 +599,216 @@ pub async fn perform_ai_enhanced_search(
     Ok(())
 }
 
-/// Perform a DuckDuckGo search and return top results
-pub async fn ddg_search(query: &str) -> Result<Vec<SearchResult>, SearchError> {
+/// Test connectivity to the remote API server
+pub async fn test_api_connectivity(config: &LMConfig) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    println!("🔗 Starting comprehensive API connectivity test...");
+    println!("🔗 Target server: {}", config.base_url);
+    
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(config.timeout))
+        .build()?;
+
+    // Test 1: Basic connectivity (ping)
+    println!("🔗 Test 1: Basic connectivity test...");
+    match client.get(&config.base_url).send().await {
+        Ok(response) => {
+            println!("✅ Basic connectivity: SUCCESS - Status: {}", response.status());
+        }
+        Err(e) => {
+            let error_msg = format!("❌ Basic connectivity: FAILED - {}", e);
+            println!("{}", error_msg);
+            return Err(error_msg.into());
+        }
+    }
+
+    // Test 2: API endpoint accessibility
+    let api_url = format!("{}/v1/chat/completions", config.base_url);
+    println!("🔗 Test 2: API endpoint accessibility...");
+    
+    // Try a simple POST to see if the endpoint responds (even with an error is fine)
+    let test_request = ChatRequest {
+        model: "test".to_string(),
+        messages: vec![ChatMessage {
+            role: "user".to_string(),
+            content: "test".to_string(),
+        }],
+        temperature: 0.5,
+        max_tokens: 1,
+        stream: false,
+    };
+
+    match client.post(&api_url).json(&test_request).send().await {
+        Ok(response) => {
+            println!("✅ API endpoint: ACCESSIBLE - Status: {} ({})", response.status(), response.status().as_str());
+            
+            // Test 3: Check if it's a valid LLM API (should return JSON even on error)
+            match response.text().await {
+                Ok(body) => {
+                    if body.contains("error") || body.contains("choices") || body.contains("model") {
+                        println!("✅ API format: VALID - Response contains expected LLM API fields");
+                    } else {
+                        println!("⚠️ API format: UNKNOWN - Response doesn't look like LLM API: {}", &body[..body.len().min(200)]);
+                    }
+                }
+                Err(e) => {
+                    println!("⚠️ Response reading: FAILED - {}", e);
+                }
+            }
+        }
+        Err(e) => {
+            let error_msg = format!("❌ API endpoint: FAILED - {}", e);
+            println!("{}", error_msg);
+            return Err(error_msg.into());
+        }
+    }
+
+    // Test 4: Model availability check
+    println!("🔗 Test 4: Testing with configured models...");
+    println!("🔗 Default model: {}", config.default_model);
+    println!("🔗 Reasoning model: {}", config.default_reason_model);
+
+    let model_test_request = ChatRequest {
+        model: config.default_model.clone(),
+        messages: vec![ChatMessage {
+            role: "user".to_string(),
+            content: "Hello, this is a connectivity test.".to_string(),
+        }],
+        temperature: config.default_temperature,
+        max_tokens: 10, // Very small response
+        stream: false,
+    };
+
+    match client.post(&api_url).json(&model_test_request).send().await {
+        Ok(response) => {
+            let status = response.status();
+            match response.text().await {
+                Ok(body) => {
+                    if status.is_success() {
+                        println!("✅ Model test: SUCCESS - Model '{}' is available and responding", config.default_model);
+                        return Ok(format!("🎉 All connectivity tests passed! Remote API server {} is accessible and responding correctly.", config.base_url));
+                    } else {
+                        if body.contains("model") && body.contains("not found") {
+                            println!("❌ Model test: FAILED - Model '{}' not found on server", config.default_model);
+                            return Err(format!("Model '{}' is not available on the remote server. Check your model name or load the model in LM Studio/Ollama.", config.default_model).into());
+                        } else {
+                            println!("⚠️ Model test: ERROR - Status: {}, Response: {}", status, &body[..body.len().min(300)]);
+                            return Err(format!("API returned error for model '{}': {} - {}", config.default_model, status, body).into());
+                        }
+                    }
+                }
+                Err(e) => {
+                    println!("❌ Model test: FAILED - Could not read response: {}", e);
+                    return Err(format!("Failed to read model test response: {}", e).into());
+                }
+            }
+        }
+        Err(e) => {
+            println!("❌ Model test: FAILED - Request failed: {}", e);
+            return Err(format!("Model test request failed: {}", e).into());
+        }
+    }
+}
+
+
+
+
+
+/// Perform SerpAPI search (premium option)
+pub async fn serpapi_search(query: &str, config: &SerpConfig) -> Result<Vec<SearchResult>, SearchError> {
     if query.trim().is_empty() {
         return Err(SearchError::NoResults("Empty search query provided".to_string()));
     }
 
-    println!("🔍 Performing DuckDuckGo search for: '{}'", query);
+    println!("🔍 Performing SerpAPI search for: '{}'", query);
 
-    // Build DuckDuckGo search URL
-    let encoded_query = urlencoding::encode(query);
-    let search_url = format!("https://html.duckduckgo.com/html/?q={}", encoded_query);
+    let mut default_params = HashMap::new();
+    default_params.insert("api_key".to_string(), config.api_key.clone());
+    default_params.insert("engine".to_string(), config.engine.clone());
     
-    // Create HTTP client with timeout
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36")
-        .build()?;
+    let client = Client::new(default_params);
 
-    // Send GET request
-    let response = client.get(&search_url).send().await?;
-    
-    if !response.status().is_success() {
-        return Err(SearchError::ParseError(
-            format!("HTTP request failed with status: {}", response.status())
-        ));
-    }
+    let mut search_params = HashMap::new();
+    search_params.insert("q".to_string(), query.to_string());
+    search_params.insert("gl".to_string(), config.country.clone());
+    search_params.insert("hl".to_string(), config.language.clone());
+    search_params.insert("num".to_string(), "10".to_string()); // Limit to 10 results
 
-    let html_content = response.text().await?;
-    
-    // Parse HTML content
-    let document = Html::parse_document(&html_content);
-    
-    // DuckDuckGo result selectors
-    let result_selector = Selector::parse("div.result").map_err(|e| {
-        SearchError::ParseError(format!("Failed to parse result selector: {:?}", e))
-    })?;
-    
-    let title_selector = Selector::parse("a.result__a").map_err(|e| {
-        SearchError::ParseError(format!("Failed to parse title selector: {:?}", e))
-    })?;
-    
-    let snippet_selector = Selector::parse("a.result__snippet").map_err(|e| {
-        SearchError::ParseError(format!("Failed to parse snippet selector: {:?}", e))
-    })?;
-
-    let mut search_results = Vec::new();
-    let max_results = 5; // Limit to top 5 results
-
-    // Extract search results
-    for result_element in document.select(&result_selector).take(max_results) {
-        let title_element = result_element.select(&title_selector).next();
-        let snippet_element = result_element.select(&snippet_selector).next();
-
-        if let (Some(title_elem), Some(snippet_elem)) = (title_element, snippet_element) {
-            let title = title_elem.inner_html();
-            let link = title_elem.value().attr("href").unwrap_or("").to_string();
-            let snippet = snippet_elem.inner_html();
-
-            // Clean up the extracted text (remove HTML tags, decode entities)
-            let clean_title = clean_html_text(&title);
-            let clean_snippet = clean_html_text(&snippet);
-            let clean_link = if link.starts_with("//") {
-                format!("https:{}", link)
-            } else if link.starts_with("/") {
-                format!("https://duckduckgo.com{}", link)
-            } else {
-                link
-            };
-
-            if !clean_title.is_empty() && !clean_link.is_empty() {
-                search_results.push(SearchResult::new(
-                    clean_title,
-                    clean_link,
-                    clean_snippet,
-                ));
+    match client.search(search_params).await {
+        Ok(results) => {
+            let mut search_results = Vec::new();
+            
+            // Parse organic results
+            if let Some(organic_results) = results["organic_results"].as_array() {
+                for result in organic_results.iter().take(5) {
+                    let title = result["title"].as_str().unwrap_or("").to_string();
+                    let link = result["link"].as_str().unwrap_or("").to_string();
+                    let snippet = result["snippet"].as_str().unwrap_or("").to_string();
+                    
+                    if !title.is_empty() && !link.is_empty() {
+                        search_results.push(SearchResult::new(title, link, snippet));
+                    }
+                }
             }
+            
+            println!("🔍 Found {} search results from SerpAPI", search_results.len());
+            
+            if search_results.is_empty() {
+                return Err(SearchError::NoResults(format!(
+                    "No results found for query: '{}' using SerpAPI", query
+                )));
+            }
+            
+            Ok(search_results)
+        }
+        Err(e) => {
+            println!("⚠️ SerpAPI search failed: {}", e);
+            Err(SearchError::NoResults(format!("SerpAPI error: {}", e)))
         }
     }
-
-    println!("🔍 Found {} search results", search_results.len());
-
-    if search_results.is_empty() {
-        return Err(SearchError::NoResults(format!(
-            "No results found for query: '{}'", query
-        )));
-    }
-
-    Ok(search_results)
 }
 
-/// Helper function to clean HTML text and decode HTML entities
-fn clean_html_text(html: &str) -> String {
-    // Remove HTML tags
-    let document = Html::parse_fragment(html);
-    let text = document.root_element().text().collect::<Vec<_>>().join(" ");
+/// Perform search using SerpAPI (only search method)
+pub async fn multi_search(query: &str) -> Result<Vec<SearchResult>, SearchError> {
+    println!("🔍 Performing SerpAPI search for: '{}'", query);
     
-    // Basic HTML entity decoding
-    text.replace("&amp;", "&")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&#39;", "'")
-        .replace("&nbsp;", " ")
-        .trim()
-        .to_string()
+    // Apply rate limiting
+    rate_limit_search().await;
+    
+    // Validate query
+    if query.trim().is_empty() {
+        return Err(SearchError::NoResults("Empty search query provided".to_string()));
+    }
+    
+    let query = query.trim();
+    
+    // Load SerpAPI configuration (required)
+    let serp_config = match load_serp_config().await {
+        Ok(config) => config,
+        Err(e) => {
+            return Err(SearchError::NoResults(format!(
+                "SerpAPI configuration error: {}. Please add SERPAPI_KEY to lmapiconf.txt", e
+            )));
+        }
+    };
+    
+    // Perform SerpAPI search
+    match serpapi_search(query, &serp_config).await {
+        Ok(results) => {
+            println!("✅ SerpAPI search successful with {} results", results.len());
+            Ok(results)
+        }
+        Err(e) => {
+            println!("❌ SerpAPI search failed: {}", e);
+            Err(e)
+        }
+    }
 }
+
+
+
+
+
+
 
 /// Format search results into a user-friendly string
 pub fn format_search_results(results: &[SearchResult], query: &str) -> String {
@@ -573,69 +835,13 @@ pub fn format_search_results(results: &[SearchResult], query: &str) -> String {
     formatted
 }
 
-/// Perform basic search without AI enhancement (fallback)
-pub async fn perform_basic_search(
-    ctx: &Context,
-    msg: &Message,
-    search_query: &str,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Send initial search message
-    let mut search_msg = match msg.channel_id.send_message(&ctx.http, |m| {
-        m.content("🔍 Searching DuckDuckGo...")
-    }).await {
-        Ok(message) => message,
-        Err(e) => {
-            eprintln!("❌ Failed to send initial search message: {}", e);
-            msg.reply(ctx, "❌ Failed to send message!").await?;
-            return Err(e.into());
-        }
-    };
 
-    // Perform basic search
-    match ddg_search(search_query).await {
-        Ok(results) => {
-            let formatted_results = format_search_results(&results, search_query);
-            
-            // Update message with search results
-            if let Err(e) = search_msg.edit(&ctx.http, |m| {
-                m.content(&formatted_results)
-            }).await {
-                eprintln!("❌ Failed to update search message: {}", e);
-                msg.reply(ctx, "❌ Failed to display search results!").await?;
-                return Err(e.into());
-            }
-            
-            println!("🔍 Basic search completed successfully for query: '{}'", search_query);
-        }
-        Err(e) => {
-            eprintln!("❌ Basic search failed: {}", e);
-            let error_msg = format!("❌ **Search Failed**\n\nQuery: `{}`\nError: {}\n\n💡 Try rephrasing your search query or check your internet connection.", search_query, e);
-            
-            if let Err(edit_error) = search_msg.edit(&ctx.http, |m| {
-                m.content(&error_msg)
-            }).await {
-                eprintln!("❌ Failed to update search message with error: {}", edit_error);
-                msg.reply(ctx, &error_msg).await?;
-            }
-            return Err(e.into());
-        }
-    }
-
-    Ok(())
-}
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn test_clean_html_text() {
-        let html = "&lt;b&gt;Hello &amp; World&lt;/b&gt;";
-        let cleaned = clean_html_text(html);
-        assert_eq!(cleaned, "<b>Hello & World</b>");
-    }
-
-    #[test] 
     fn test_search_result_creation() {
         let result = SearchResult::new(
             "  Test Title  ".to_string(),
@@ -697,6 +903,27 @@ mod tests {
             }
             Err(e) => {
                 println!("❌ Failed to load summarize search prompt: {}", e);
+            }
+        }
+    }
+    
+    #[tokio::test]
+    async fn test_serpapi_config_loading() {
+        println!("🔍 Testing SerpAPI config loading...");
+        
+        match load_serp_config().await {
+            Ok(config) => {
+                println!("✅ SerpAPI config loaded successfully!");
+                println!("🔍 API Key length: {}", config.api_key.len());
+                println!("🔍 Engine: {}", config.engine);
+                println!("🔍 Country: {}", config.country);
+                println!("🔍 Language: {}", config.language);
+                assert!(!config.api_key.is_empty());
+                assert_ne!(config.api_key, "your_serpapi_key_here");
+            }
+            Err(e) => {
+                println!("❌ Failed to load SerpAPI config: {}", e);
+                // Don't fail the test, just log the error for debugging
             }
         }
     }

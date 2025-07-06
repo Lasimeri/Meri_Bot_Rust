@@ -5,6 +5,7 @@
 # Server configuration
 # LM Studio: http://localhost:1234
 # Ollama: http://localhost:11434 or http://127.0.0.1:11434
+# Remote server example: http://192.168.0.87:11434
 LM_STUDIO_BASE_URL=http://127.0.0.1:11434
 LM_STUDIO_TIMEOUT=30
 
@@ -24,4 +25,11 @@ DEFAULT_MAX_TOKENS=8192
 
 # Discord integration settings
 MAX_DISCORD_MESSAGE_LENGTH=2000
-RESPONSE_FORMAT_PADDING=100 
+RESPONSE_FORMAT_PADDING=100
+
+# SerpAPI Configuration (Required - for search functionality)
+# Get your free API key from https://serpapi.com/users/sign_up
+# This is the ONLY search method supported
+SERPAPI_ENGINE=google
+SERPAPI_COUNTRY=us
+SERPAPI_LANGUAGE=en 
