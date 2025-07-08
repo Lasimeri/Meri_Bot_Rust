@@ -36,10 +36,10 @@ A powerful Discord bot written in Rust using the Serenity framework, featuring r
   - **Features**: **AI query refinement**, **intelligent summarization with embedded links**, real-time progress updates, fallback to basic search
 - `^reason <question>` - Deep reasoning with specialized AI model
   - **Aliases**: `^reasoning`
-  - **Features**: **Real-time streaming with thinking tag filtering**, step-by-step reasoning, dedicated reasoning model, automatic `<think>` content removal, logical explanations
+  - **Features**: **Real-time streaming with thinking tag filtering**, step-by-step reasoning, dedicated reasoning model (DeepSeek R1), automatic `<think>` content removal, logical explanations
 - `^reason -s <search query>` - Reasoning-enhanced web search with analytical insights
   - **Aliases**: `^reasoning -s`, `^reasoning --search`
-  - **Features**: **Analytical research synthesis**, reasoning-focused query optimization, embedded source links, specialized reasoning model analysis, **buffered chunking** (posts content in 2000-character chunks)
+  - **Features**: **Analytical research synthesis**, reasoning-focused query optimization, embedded source links, specialized reasoning model analysis (DeepSeek R1), **buffered chunking** (posts content in 2000-character chunks)
 
 ### 🔍 Web Search Commands
 - `^lm -s <search query>` - AI-enhanced web search with intelligent processing
@@ -116,7 +116,7 @@ A powerful Discord bot written in Rust using the Serenity framework, featuring r
    LM_STUDIO_BASE_URL=http://127.0.0.1:11434  # Ollama default
    LM_STUDIO_TIMEOUT=30
    DEFAULT_MODEL=your-chat-model-name
-   DEFAULT_REASON_MODEL=your-reasoning-model-name
+   DEFAULT_REASON_MODEL=deepseek/deepseek-r1-0528-qwen3-8b  # DeepSeek R1 reasoning model
    DEFAULT_TEMPERATURE=0.8
    DEFAULT_MAX_TOKENS=8192                    # Extended for longer responses
    MAX_DISCORD_MESSAGE_LENGTH=2000           # Discord's limit
@@ -266,7 +266,7 @@ The `^reason` command provides advanced AI reasoning capabilities with real-time
 - **Usage**: `^reason <your reasoning question>` 
 - **Aliases**: `^reasoning <question>`
 - **Core Features**:
-  - **🧠 Dedicated reasoning model** - Specialized models optimized for logical analysis and step-by-step thinking
+  - **🧠 Dedicated reasoning model** - DeepSeek R1 model optimized for logical analysis and step-by-step thinking
   - **🔄 Real-time streaming** - Watch reasoning unfold live as the AI processes your question
   - **🎯 Thinking tag filtering** - Automatically removes `<think>...</think>` content in real-time during streaming
   - **📋 Step-by-step explanations** - Detailed logical breakdowns and reasoning processes
@@ -290,7 +290,7 @@ The `^reason` command provides advanced AI reasoning capabilities with real-time
   - Same as LM chat command plus `DEFAULT_REASON_MODEL` configuration
   - Optional: `reasoning_prompt.txt` file for specialized reasoning instructions
   - Falls back to `system_prompt.txt` if reasoning prompt not found
-  - Models that support thinking tags (e.g., qwen, deepseek-r1, specialized reasoning models)
+  - **Current Model**: `deepseek/deepseek-r1-0528-qwen3-8b` (supports thinking tags and advanced reasoning)
 
 ### Reasoning-Enhanced Web Search Command
 
@@ -313,14 +313,14 @@ The `^reason -s` command provides analytical web search capabilities using the r
   ^reasoning --search artificial intelligence ethics
   ```
 - **Key Features**:
-  - **🧠 Analytical Focus** - Uses reasoning model for deeper analysis beyond simple summarization
-  - **📝 Research-Oriented** - Optimizes queries for academic and analytical content
-  - **🔗 Embedded Links** - Source links naturally integrated in analytical responses
-  - **⚡ Real-time Progress** - Live updates during the analysis process
-  - **📝 Buffered Chunking** - Content is posted in discrete 2000-character chunks with proper formatting
-  - **🛡️ Robust Fallback** - Falls back to basic search when reasoning enhancement fails
-  - **🎯 Specialized Prompts** - Uses reasoning-specific prompts for analytical synthesis
-  - **🧹 Thinking Tag Filtering** - Automatically removes `<think>` content during processing
+  - **🧠 Analytical Focus** - Uses DeepSeek R1 reasoning model for deeper analysis beyond simple summarization
+- **📝 Research-Oriented** - Optimizes queries for academic and analytical content
+- **🔗 Embedded Links** - Source links naturally integrated in analytical responses
+- **⚡ Real-time Progress** - Live updates during the analysis process
+- **📝 Buffered Chunking** - Content is posted in discrete 2000-character chunks with proper formatting
+- **🛡️ Robust Fallback** - Falls back to basic search when reasoning enhancement fails
+- **🎯 Specialized Prompts** - Uses reasoning-specific prompts for analytical synthesis
+- **🧹 Thinking Tag Filtering** - Automatically removes `<think>` content during processing
 
 ### Setup for Reasoning-Enhanced Search
 
@@ -337,12 +337,12 @@ To enable reasoning-enhanced search features, ensure you have:
    ```
 
 2. **LM Studio/Ollama Setup** (same as AI chat):
-   - Valid `lmapiconf.txt` configuration with `DEFAULT_REASON_MODEL`
+   - Valid `lmapiconf.txt` configuration with `DEFAULT_REASON_MODEL=deepseek/deepseek-r1-0528-qwen3-8b`
    - Running LM Studio or Ollama instance
-   - Reasoning model loaded and accessible
+   - DeepSeek R1 reasoning model loaded and accessible
 
 3. **Specialized Features**:
-   - **Reasoning Model**: Uses `DEFAULT_REASON_MODEL` for analytical capabilities
+   - **Reasoning Model**: Uses `deepseek/deepseek-r1-0528-qwen3-8b` for analytical capabilities
    - **Analytical Prompts**: Specialized prompts for reasoning-focused analysis
    - **Fallback Behavior**: Uses regular search prompts if reasoning-specific ones aren't found
    - **Independent Operation**: Works separately from regular AI chat and search functions

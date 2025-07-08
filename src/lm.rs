@@ -9,6 +9,7 @@ use futures_util::StreamExt;
 use crate::search::{
     load_lm_config, perform_ai_enhanced_search, LMConfig, ChatMessage
 };
+use crate::LmContextMap; // TypeMap key defined in main.rs
 
 // Structure to track streaming statistics
 #[derive(Debug)]
@@ -64,7 +65,7 @@ pub async fn lm(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
         return Ok(());
     }
 
-    // Check if this is a search request
+    // Skip context logic for search and test flags
     if input.starts_with("-s ") || input.starts_with("--search ") {
         // Extract search query
         let search_query = if input.starts_with("-s ") {
@@ -117,7 +118,6 @@ pub async fn lm(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
         return Ok(());
     }
 
-    // Check if this is a connectivity test request
     if input.starts_with("--test") || input == "-t" {
         // Load LM Studio configuration for connectivity test
         let config = match load_lm_config().await {
@@ -168,8 +168,25 @@ pub async fn lm(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
         return Ok(());
     }
 
+    // Check if this is a clear context request
+    if input.starts_with("--clear") || input == "-c" {
+        let mut data_map = ctx.data.write().await;
+        let lm_map = data_map.get_mut::<LmContextMap>().expect("LM context map not initialized");
+        lm_map.remove(&msg.author.id);
+        msg.reply(ctx, "🧹 **LM Chat Context Cleared**\nYour conversation history has been reset.").await?;
+        return Ok(());
+    }
+
     // Regular AI chat functionality
     let prompt = input;
+
+    // Record user prompt in per-user context history
+    {
+        let mut data_map = ctx.data.write().await;
+        let lm_map = data_map.get_mut::<LmContextMap>().expect("LM context map not initialized");
+        let history = lm_map.entry(msg.author.id).or_insert_with(Vec::new);
+        history.push(ChatMessage { role: "user".to_string(), content: prompt.to_string() });
+    }
 
     // Load LM Studio configuration
     let config = match load_lm_config().await {
@@ -191,38 +208,51 @@ pub async fn lm(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
         }
     };
 
-    // Send initial "thinking" message
-    let mut current_msg = match msg.channel_id.send_message(&ctx.http, |m| {
-        m.content("🤖 Generating response...")
-    }).await {
-        Ok(message) => message,
-        Err(e) => {
-            eprintln!("❌ Failed to send initial message: {}", e);
-            msg.reply(ctx, "❌ Failed to send message!").await?;
-            return Ok(());
+    // Build message list including system prompt and per-user history
+    let mut messages = Vec::new();
+    messages.push(ChatMessage { role: "system".to_string(), content: system_prompt });
+    {
+        let data_map = ctx.data.read().await;
+        let lm_map = data_map.get::<LmContextMap>().expect("LM context map not initialized");
+        if let Some(history) = lm_map.get(&msg.author.id) {
+            println!("💬 LM command: Including {} context messages for user {}", history.len(), msg.author.name);
+            for entry in history.iter() {
+                messages.push(entry.clone());
+            }
+        } else {
+            println!("💬 LM command: No context history found for user {}", msg.author.name);
         }
-    };
-
-    // Prepare messages for the API
-    let messages = vec![
-        ChatMessage {
-            role: "system".to_string(),
-            content: system_prompt,
-        },
-        ChatMessage {
-            role: "user".to_string(),
-            content: prompt.to_string(),
-        },
-    ];
+    }
 
     // Log which model is being used for LM command
     println!("💬 LM command: Using model '{}' for chat", config.default_model);
 
     // Stream the response with real-time Discord post editing
+    let mut current_msg = msg.channel_id.send_message(&ctx.http, |m| {
+        m.content("🤖 **AI Response (Part 1):**\n```\n\n```")
+    }).await?;
+
+    // Ensure current_msg is in scope for this match
     match stream_chat_response(messages, &config.default_model, &config, ctx, &mut current_msg).await {
         Ok(final_stats) => {
             println!("💬 LM command: Streaming complete - {} total characters across {} messages", 
                 final_stats.total_characters, final_stats.message_count);
+            
+            // Record AI response in per-user context history
+            let response_content = current_msg.content.clone();
+            let mut data_map = ctx.data.write().await;
+            let lm_map = data_map.get_mut::<LmContextMap>().expect("LM context map not initialized");
+            if let Some(history) = lm_map.get_mut(&msg.author.id) {
+                history.push(ChatMessage { 
+                    role: "assistant".to_string(), 
+                    content: response_content 
+                });
+                
+                // Limit history to last 10 messages to prevent token overflow
+                if history.len() > 10 {
+                    history.drain(0..history.len()-10);
+                }
+            }
         }
         Err(e) => {
             eprintln!("❌ Failed to stream response from AI model: {}", e);

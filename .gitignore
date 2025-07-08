@@ -14,6 +14,7 @@ reasoning_prompt.txt
 reasoning_search_analysis_prompt.txt
 refine_search_prompt.txt
 summarize_search_prompt.txt
+summarization_prompt.txt
 lmapiconf.txt
 !example_lmapiconf.txt
 !example_system_prompt.txt
@@ -21,6 +22,7 @@ lmapiconf.txt
 !example_reasoning_search_analysis_prompt.txt
 !example_refine_search_prompt.txt
 !example_summarize_search_prompt.txt
+!example_summarization_prompt.txt
 
 # Environment files
 .env
@@ -144,3 +146,4 @@ debug_*.rs
 temp_*.rs
 *.tmp.rs
 serpapi.txt
+.cursorignore

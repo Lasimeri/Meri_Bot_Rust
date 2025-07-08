@@ -22,15 +22,27 @@ pub async fn help(ctx: &Context, msg: &Message, _args: Args) -> CommandResult {
         **🖼️ Profile Picture:**\n\
         • `{0}ppfp @user` - Show user's profile picture\n\
         • **Aliases:** `{0}avatar`, `{0}pfp`, `{0}profilepic`\n\n\
-        **🤖 AI Chat (LM Studio/Ollama):**\n\
-        • `{0}lm <prompt>` - AI chat with real-time streaming\n\
-        • `{0}lm -s <query>` - AI-enhanced web search with embedded links (SerpAPI only)\n\
-        • `{0}lm --test` - Test connectivity to remote API server\n\
-        • **Aliases:** `{0}llm`, `{0}ai`, `{0}chat`\n\n\
-        **🧠 AI Reasoning:**\n\
-        • `{0}reason <question>` - Specialized reasoning with real-time streaming and thinking tag filtering\n\
-        • `{0}reason -s <query>` - Reasoning-enhanced analytical search with buffered chunking and <think> tag filtering (posts content in 2000-character chunks)\n\
-        • **Aliases:** `{0}reasoning`\n\n\
+        **🤖 AI Chat (LM Studio/Ollama):**
+
+        • `{0}lm <prompt>` - AI chat with real-time streaming and **per-user conversation memory**
+        • `{0}lm -s <query>` - AI-enhanced web search with embedded links (SerpAPI only)
+        • `{0}lm --test` - Test connectivity to remote API server
+        • `{0}lm --clear` - Clear your conversation history
+        • **Aliases:** `{0}llm`, `{0}ai`, `{0}chat`
+
+        **🧠 AI Reasoning:**
+
+        • `{0}reason <question>` - Specialized reasoning with real-time streaming, thinking tag filtering, and **per-user conversation memory** (using DeepSeek R1 model)
+        • `{0}reason -s <query>` - Reasoning-enhanced analytical search with buffered chunking and <think> tag filtering (posts content in 2000-character chunks)
+        • `{0}reason --clear` - Clear your reasoning conversation history
+        • **Aliases:** `{0}reasoning`
+
+        **📄 Webpage Summarization:**
+
+        • `{0}sum <url>` - Summarize webpage content using the reasoning model
+        • **Aliases:** `{0}summarize`, `{0}webpage`
+        • **Features:** HTML content extraction, intelligent summarization, automatic chunking for long summaries
+
         **🔍 Search Features:**\n\
         • **SerpAPI Integration:** Official search API with AI enhancement\n\
         • **AI Mode:** Direct search → SerpAPI → AI summary with embedded links\n\
@@ -47,7 +59,7 @@ pub async fn help(ctx: &Context, msg: &Message, _args: Args) -> CommandResult {
         • **AI Features:** `lmapiconf.txt` with LM Studio/Ollama config and SerpAPI key\n\
         • **Optional:** Custom prompts for search and reasoning\n\n\
         **🚀 Quick Test:**\n\
-        `{0}ping` (shows response time) → `{0}lm -s rust tutorial` → `{0}lm Hello!` → `{0}reason Why is the sky blue?`\n\n\
+        `{0}ping` (shows response time) → `{0}lm -s rust tutorial` → `{0}lm Hello!` → `{0}reason Why is the sky blue?` → `{0}sum https://example.com`\n\n\
         **📚 Full setup guide:** Check README.md for detailed instructions!", 
         prefix
     );
