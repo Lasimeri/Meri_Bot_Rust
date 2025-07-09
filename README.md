@@ -30,20 +30,20 @@ A powerful Discord bot written in Rust using the Serenity framework, featuring r
 ### 🤖 AI Chat Commands
 - `^lm <prompt>` - Chat with AI via LM Studio/Ollama
   - **Aliases**: `^llm`, `^ai`, `^chat` 
-  - **Features**: **Real-time streaming responses**, smart message chunking, extended output length (8K tokens), live progress indicators, multi-part message support
+  - **Features**: **Real-time streaming responses**, smart message chunking, extended output length (8K tokens), live progress indicators, multi-part message support, robust buffered streaming for improved reliability
 - `^lm -s <search query>` - AI-enhanced web search with intelligent query optimization and result summarization
   - **Aliases**: `^lm --search <query>`
   - **Features**: **AI query refinement**, **intelligent summarization with embedded links**, real-time progress updates, fallback to basic search
 - `^reason <question>` - Deep reasoning with specialized AI model
   - **Aliases**: `^reasoning`
-  - **Features**: **Real-time streaming with thinking tag filtering**, step-by-step reasoning, dedicated reasoning model (DeepSeek R1), automatic `<think>` content removal, logical explanations
+  - **Features**: **Real-time streaming with thinking tag filtering**, step-by-step reasoning, dedicated reasoning model (DeepSeek R1), automatic `<think>` content removal, logical explanations, robust buffered streaming for improved reliability
 - `^reason -s <search query>` - Reasoning-enhanced web search with analytical insights
   - **Aliases**: `^reasoning -s`, `^reasoning --search`
-  - **Features**: **Analytical research synthesis**, reasoning-focused query optimization, embedded source links, specialized reasoning model analysis (DeepSeek R1), **buffered chunking** (posts content in 2000-character chunks)
+  - **Features**: **Analytical research synthesis**, reasoning-focused query optimization, embedded source links, specialized reasoning model analysis (Qwen3 4B), **buffered chunking** (posts content in 2000-character chunks)
 
 ### 🔍 Web Search Commands
 - `^lm -s <search query>` - AI-enhanced web search with intelligent processing
-  - **AI Mode (with LM Studio/Ollama)**: Query refinement → web search → AI summarization with embedded links
+  - **AI Mode (with LM Studio)**: Query refinement → web search → AI summarization with embedded links
   - **Basic Mode (fallback)**: Direct DuckDuckGo search with formatted results
   - **Features**: Real-time progress updates, smart query optimization, comprehensive summaries with embedded source links
   - **Examples**: `^lm -s rust programming`, `^lm -s "discord bot tutorial"`
@@ -57,11 +57,11 @@ A powerful Discord bot written in Rust using the Serenity framework, featuring r
 - **Progress tracking** - Live character counts and generation status
 
 ### ⚡ Streaming Technology
-- **Server-Sent Events (SSE)** streaming from LM Studio/Ollama APIs
-- **Live Discord message editing** - Messages update in real-time every 0.8 seconds
-- **Thinking tag filtering** - Automatically removes `<think>...</think>` content from reasoning responses
-- **Memory efficient** - Processes responses incrementally without storing massive buffers
-- **Automatic fallback** - Handles connection issues and API errors gracefully
+- **Robust Connection Handling** - Uses a `connect_timeout` to prevent premature disconnection during long AI generations, ensuring that even slow responses are fully received.
+- **Buffered Stream Processing** - Assembles incoming data into a line buffer before parsing. This prevents errors caused by data packets being split across network chunks, making the stream processing significantly more reliable.
+- **Live Discord Message Editing** - Messages update in real-time every 0.8 seconds with the latest content from the stream.
+- **Thinking Tag Filtering** - Automatically removes `<think>...</think>` content from reasoning responses in real-time.
+- **Graceful Error Handling** - If a Discord message fails to update mid-stream, the entire operation is safely halted to prevent content loss, and the error is logged.
 
 ## Prerequisites
 
@@ -253,6 +253,7 @@ The `^lm` command provides real-time AI chat functionality via LM Studio or Olla
   - **🔧 Configurable parameters** - Temperature (0.8), tokens, and formatting customizable
   - **❌ Comprehensive error handling** - Detailed error messages and recovery guidance
   - **⚙️ Server-Sent Events (SSE)** - Efficient streaming protocol for real-time updates
+  - **🔌 Robust Connection Handling** - Uses a connection timeout and line buffering to ensure reliable stream processing, even for long-running AI tasks.
 - **Requirements**:
   - LM Studio (default: localhost:1234) or Ollama (default: localhost:11434)
   - Valid model loaded in your AI server
@@ -285,7 +286,7 @@ The `^reason` command provides advanced AI reasoning capabilities with real-time
   - **🔢 Multi-part responses** - Long reasoning explanations split intelligently across Discord messages
   - **📁 Fallback prompts** - Uses `system_prompt.txt` if `reasoning_prompt.txt` isn't found
   - **🔧 Independent configuration** - Separate model configuration and multi-path file search
-  - **Models that support thinking tags (e.g., qwen, deepseek-r1, specialized reasoning models)**
+  - **🔌 Robust Connection Handling** - Employs a connection timeout and line buffering to maintain a stable connection to the API, even during lengthy or delayed responses.
 - **Requirements**:
   - Same as LM chat command plus `DEFAULT_REASON_MODEL` configuration
   - Optional: `reasoning_prompt.txt` file for specialized reasoning instructions

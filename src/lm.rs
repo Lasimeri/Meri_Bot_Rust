@@ -275,10 +275,10 @@ async fn stream_chat_response(
 ) -> Result<StreamingStats, Box<dyn std::error::Error + Send + Sync>> {
     println!("🔗 [STREAMING] Attempting connection to API server: {}", config.base_url);
     println!("🔗 [STREAMING] Using model: {}", model);
-    println!("🔗 [STREAMING] Timeout: {} seconds (extended to {}s for streaming)", config.timeout, config.timeout * 3);
+    println!("🔗 [STREAMING] Connect timeout: {} seconds", config.timeout);
     
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(config.timeout * 3))
+        .connect_timeout(std::time::Duration::from_secs(config.timeout))
         .build()?;
         
     let chat_request = ChatRequest {
@@ -345,6 +345,7 @@ async fn stream_chat_response(
     let mut last_update = std::time::Instant::now();
     let update_interval = std::time::Duration::from_millis(800); // Update every 0.8 seconds
     let mut chunk_count = 0;
+    let mut line_buffer = String::new();
 
     println!("💬 Starting real-time streaming for chat response...");
 
@@ -358,60 +359,48 @@ async fn stream_chat_response(
                     println!("📊 [STREAMING] Processed {} chunks, total response: {} chars", chunk_count, raw_response.len());
                 }
                 
-                let text = String::from_utf8_lossy(&bytes);
-                
-                for line in text.lines() {
+                line_buffer.push_str(&String::from_utf8_lossy(&bytes));
+
+                while let Some(i) = line_buffer.find('\n') {
+                    let line = line_buffer.drain(..=i).collect::<String>();
+                    let line = line.trim();
+
                     if let Some(json_str) = line.strip_prefix("data: ") {
                         if json_str.trim() == "[DONE]" {
                             println!("✅ [STREAMING] Received [DONE] signal, finalizing response");
-                            // Process any remaining content and finalize
-                            if !content_buffer.trim().is_empty() {
+                            if !content_buffer.is_empty() {
                                 if let Err(e) = finalize_chat_message(&mut message_state, &content_buffer, ctx, config).await {
                                     eprintln!("❌ Failed to finalize message: {}", e);
                                 }
                             }
-                            
-                            let stats = StreamingStats {
-                                total_characters: raw_response.len(),
-                                message_count: message_state.message_index,
-                            };
-                            
-                            println!("💬 Streaming complete - {} total characters", stats.total_characters);
-                            return Ok(stats);
+                            return Ok(StreamingStats { total_characters: raw_response.len(), message_count: message_state.message_index });
                         }
-                        
-                        if let Ok(response_chunk) = serde_json::from_str::<ChatResponse>(json_str) {    
+
+                        if let Ok(response_chunk) = serde_json::from_str::<ChatResponse>(json_str) {
                             for choice in response_chunk.choices {
                                 if let Some(finish_reason) = choice.finish_reason {
                                     if finish_reason == "stop" {
                                         println!("✅ [STREAMING] Received finish_reason=stop, finalizing response");
-                                        // Process final content
-                                        if !content_buffer.trim().is_empty() {
+                                        if !content_buffer.is_empty() {
                                             if let Err(e) = finalize_chat_message(&mut message_state, &content_buffer, ctx, config).await {
                                                 eprintln!("❌ Failed to finalize message: {}", e);
                                             }
                                         }
-                                        
-                                        let stats = StreamingStats {
-                                            total_characters: raw_response.len(),
-                                            message_count: message_state.message_index,
-                                        };
-                                        
-                                        return Ok(stats);
+                                        return Ok(StreamingStats { total_characters: raw_response.len(), message_count: message_state.message_index });
                                     }
                                 }
-                                
+
                                 if let Some(delta) = choice.delta {
                                     if let Some(content) = delta.content {
                                         raw_response.push_str(&content);
                                         content_buffer.push_str(&content);
-                                        
-                                        // Update Discord message periodically
-                                        if last_update.elapsed() >= update_interval && !content_buffer.trim().is_empty() {
+
+                                        if last_update.elapsed() >= update_interval && !content_buffer.is_empty() {
                                             if let Err(e) = update_chat_message(&mut message_state, &content_buffer, ctx, config).await {
                                                 eprintln!("❌ Failed to update Discord message: {}", e);
+                                                return Err(e);
                                             } else {
-                                                content_buffer.clear(); // Clear buffer after successful update
+                                                content_buffer.clear();
                                             }
                                             last_update = std::time::Instant::now();
                                         }
@@ -419,14 +408,19 @@ async fn stream_chat_response(
                                 }
                             }
                         } else {
-                            println!("⚠️ [STREAMING] Failed to parse JSON chunk: {}", json_str);
+                            if !json_str.trim().is_empty() {
+                                println!("⚠️ [STREAMING] Failed to parse JSON chunk: {}", json_str);
+                            }
                         }
                     }
                 }
             }
             Err(e) => {
                 eprintln!("❌ [STREAMING] Stream error: {}", e);
-                break;
+                if !content_buffer.is_empty() {
+                    let _ = finalize_chat_message(&mut message_state, &content_buffer, ctx, config).await;
+                }
+                return Err(e.into());
             }
         }
     }
@@ -434,7 +428,7 @@ async fn stream_chat_response(
     println!("📊 [STREAMING] Stream ended, processed {} chunks total", chunk_count);
     
     // Final cleanup - process any remaining content
-    if !content_buffer.trim().is_empty() {
+    if !content_buffer.is_empty() {
         if let Err(e) = finalize_chat_message(&mut message_state, &content_buffer, ctx, config).await {
             eprintln!("❌ Failed to finalize remaining content: {}", e);
         }

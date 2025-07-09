@@ -437,7 +437,7 @@ async fn stream_reasoning_response(
     initial_msg: &mut Message,
 ) -> Result<StreamingStats, Box<dyn std::error::Error + Send + Sync>> {
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(config.timeout * 3))
+        .connect_timeout(std::time::Duration::from_secs(config.timeout * 3))
         .build()?;
         
     let chat_request = ChatRequest {
@@ -470,15 +470,19 @@ async fn stream_reasoning_response(
     let mut last_update = std::time::Instant::now();
     let update_interval = std::time::Duration::from_millis(800); // Update every 0.8 seconds
     let mut total_filtered_chars = 0; // Track total filtered content length
+    let mut line_buffer = String::new();
 
     println!("🧠 Starting real-time streaming for reasoning response...");
 
     while let Some(chunk) = stream.next().await {
         match chunk {
             Ok(bytes) => {
-                let text = String::from_utf8_lossy(&bytes);
-                
-                for line in text.lines() {
+                line_buffer.push_str(&String::from_utf8_lossy(&bytes));
+
+                while let Some(i) = line_buffer.find('\n') {
+                    let line = line_buffer.drain(..=i).collect::<String>();
+                    let line = line.trim();
+                    
                     if let Some(json_str) = line.strip_prefix("data: ") {
                         if json_str.trim() == "[DONE]" {
                             // Apply final thinking tag filtering and finalize
@@ -563,6 +567,7 @@ async fn stream_reasoning_response(
                                                 if !new_content.trim().is_empty() {
                                                     if let Err(e) = update_discord_message(&mut message_state, new_content, ctx, config).await {
                                                         eprintln!("❌ Failed to update Discord message: {}", e);
+                                                        return Err(e);
                                                     } else {
                                                         total_filtered_chars = filtered_content.len();
                                                     }
@@ -579,7 +584,14 @@ async fn stream_reasoning_response(
             }
             Err(e) => {
                 eprintln!("❌ Stream error: {}", e);
-                break;
+                let final_filtered_content = filter_thinking_tags(&raw_response);
+                if final_filtered_content.len() > total_filtered_chars {
+                    let remaining_content = &final_filtered_content[total_filtered_chars..];
+                    if !remaining_content.trim().is_empty() {
+                        let _ = finalize_message_content(&mut message_state, remaining_content, ctx, config).await;
+                    }
+                }
+                return Err(e.into());
             }
         }
     }
