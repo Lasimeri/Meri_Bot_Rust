@@ -55,13 +55,28 @@ struct Delta {
 #[command]
 #[aliases("llm", "ai", "chat")]
 pub async fn lm(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
-    let input = args.message().trim();
+    let mut input = args.message().trim().to_string();
     
     // Start typing indicator
     let _typing = ctx.http.start_typing(msg.channel_id.0)?;
     
+    // Check if this is a reply and handle it appropriately
+    if let Some(referenced_message) = &msg.referenced_message {
+        println!("LM command: Detected reply to message from {}", referenced_message.author.name);
+        
+        // If the reply has no content, use the referenced message content as the prompt
+        if input.is_empty() {
+            input = referenced_message.content.clone();
+            println!("LM command: Using referenced message content as prompt: {}", input);
+        } else {
+            // If the reply has content, combine it with the referenced message
+            input = format!("Original message: {}\n\nYour response: {}", referenced_message.content, input);
+            println!("LM command: Combined referenced message with reply content");
+        }
+    }
+    
     if input.is_empty() {
-        msg.reply(ctx, "❌ Please provide a prompt! Usage: `^lm <your prompt>` or `^lm -s <search query>`").await?;
+        msg.reply(ctx, "Please provide a prompt! Usage: `^lm <your prompt>` or `^lm -s <search query>`\n\nYou can also reply to a message with `^lm` to respond to that message.").await?;
         return Ok(());
     }
 
@@ -75,7 +90,7 @@ pub async fn lm(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
         };
 
         if search_query.trim().is_empty() {
-            msg.reply(ctx, "❌ Please provide a search query! Usage: `^lm -s <search query>`").await?;
+            msg.reply(ctx, "Please provide a search query! Usage: `^lm -s <search query>`").await?;
             return Ok(());
         }
 
@@ -83,20 +98,20 @@ pub async fn lm(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
         let config = match load_lm_config().await {
             Ok(config) => config,
             Err(e) => {
-                eprintln!("❌ Failed to load LM Studio configuration for search: {}", e);
-                msg.reply(ctx, &format!("❌ LM Studio configuration error: {}\n\nMake sure `lmapiconf.txt` exists and contains all required settings. Check `example_lmapiconf.txt` for reference.", e)).await?;
+                eprintln!("Failed to load LM Studio configuration for search: {}", e);
+                msg.reply(ctx, &format!("LM Studio configuration error: {}\n\nMake sure `lmapiconf.txt` exists and contains all required settings. Check `example_lmapiconf.txt` for reference.", e)).await?;
                 return Ok(());
             }
         };
 
         // Send initial search message
         let mut search_msg = match msg.channel_id.send_message(&ctx.http, |m| {
-            m.content("🧠 Refining search query...")
+            m.content("Refining search query...")
         }).await {
             Ok(message) => message,
             Err(e) => {
-                eprintln!("❌ Failed to send initial search message: {}", e);
-                msg.reply(ctx, "❌ Failed to send message!").await?;
+                eprintln!("Failed to send initial search message: {}", e);
+                msg.reply(ctx, "Failed to send message!").await?;
                 return Ok(());
             }
         };
@@ -104,11 +119,11 @@ pub async fn lm(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
         // AI-Enhanced Search Flow
         match perform_ai_enhanced_search(search_query, &config, &mut search_msg, ctx).await {
             Ok(()) => {
-                println!("🔍 AI-enhanced search completed successfully for query: '{}'", search_query);
+                println!("AI-enhanced search completed successfully for query: '{}'", search_query);
             }
             Err(e) => {
-                eprintln!("❌ AI-enhanced search failed: {}", e);
-                let error_msg = format!("❌ **Search Failed**\n\nQuery: `{}`\nError: {}\n\n💡 Check your SerpAPI configuration in lmapiconf.txt", search_query, e);
+                eprintln!("AI-enhanced search failed: {}", e);
+                let error_msg = format!("**Search Failed**\n\nQuery: `{}`\nError: {}\n\nCheck your SerpAPI configuration in lmapiconf.txt", search_query, e);
                 let _ = search_msg.edit(&ctx.http, |m| {
                     m.content(&error_msg)
                 }).await;
@@ -123,20 +138,20 @@ pub async fn lm(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
         let config = match load_lm_config().await {
             Ok(config) => config,
             Err(e) => {
-                eprintln!("❌ Failed to load LM Studio configuration for test: {}", e);
-                msg.reply(ctx, &format!("❌ LM Studio configuration error: {}\n\nMake sure `lmapiconf.txt` exists and contains all required settings. Check `example_lmapiconf.txt` for reference.", e)).await?;
+                eprintln!("Failed to load LM Studio configuration for test: {}", e);
+                msg.reply(ctx, &format!("LM Studio configuration error: {}\n\nMake sure `lmapiconf.txt` exists and contains all required settings. Check `example_lmapiconf.txt` for reference.", e)).await?;
                 return Ok(());
             }
         };
 
         // Send initial test message
         let mut test_msg = match msg.channel_id.send_message(&ctx.http, |m| {
-            m.content("🔗 Testing API connectivity to remote server...")
+            m.content("Testing API connectivity to remote server...")
         }).await {
             Ok(message) => message,
             Err(e) => {
-                eprintln!("❌ Failed to send initial test message: {}", e);
-                msg.reply(ctx, "❌ Failed to send message!").await?;
+                eprintln!("Failed to send initial test message: {}", e);
+                msg.reply(ctx, "Failed to send message!").await?;
                 return Ok(());
             }
         };
@@ -144,23 +159,23 @@ pub async fn lm(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
         // Perform connectivity test
         match crate::search::test_api_connectivity(&config).await {
             Ok(success_message) => {
-                let final_message = format!("✅ **Connectivity Test Results**\n\n{}\n\n**Configuration:**\n• Server: `{}`\n• Default Model: `{}`\n• Reasoning Model: `{}`\n• Timeout: `{}s`", 
+                let final_message = format!("**Connectivity Test Results**\n\n{}\n\n**Configuration:**\n• Server: `{}`\n• Default Model: `{}`\n• Reasoning Model: `{}`\n• Timeout: `{}s`", 
                     success_message, config.base_url, config.default_model, config.default_reason_model, config.timeout);
                 
                 if let Err(e) = test_msg.edit(&ctx.http, |m| {
                     m.content(&final_message)
                 }).await {
-                    eprintln!("❌ Failed to update test message: {}", e);
+                    eprintln!("Failed to update test message: {}", e);
                 }
             }
             Err(e) => {
-                let error_message = format!("❌ **Connectivity Test Failed**\n\n**Error:** {}\n\n**Troubleshooting:**\n• Check if LM Studio/Ollama is running on `{}`\n• Verify the model `{}` is loaded\n• Check firewall settings\n• Ensure the server is accessible from this network\n\n**Configuration:**\n• Server: `{}`\n• Default Model: `{}`\n• Timeout: `{}s`", 
+                let error_message = format!("**Connectivity Test Failed**\n\n**Error:** {}\n\n**Troubleshooting:**\n• Check if LM Studio/Ollama is running on `{}`\n• Verify the model `{}` is loaded\n• Check firewall settings\n• Ensure the server is accessible from this network\n\n**Configuration:**\n• Server: `{}`\n• Default Model: `{}`\n• Timeout: `{}s`", 
                     e, config.base_url, config.default_model, config.base_url, config.default_model, config.timeout);
                 
                 if let Err(edit_error) = test_msg.edit(&ctx.http, |m| {
                     m.content(&error_message)
                 }).await {
-                    eprintln!("❌ Failed to update test message with error: {}", edit_error);
+                    eprintln!("Failed to update test message with error: {}", edit_error);
                 }
             }
         }
@@ -173,7 +188,7 @@ pub async fn lm(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
         let mut data_map = ctx.data.write().await;
         let lm_map = data_map.get_mut::<LmContextMap>().expect("LM context map not initialized");
         lm_map.remove(&msg.author.id);
-        msg.reply(ctx, "🧹 **LM Chat Context Cleared**\nYour conversation history has been reset.").await?;
+        msg.reply(ctx, "**LM Chat Context Cleared**\nYour conversation history has been reset.").await?;
         return Ok(());
     }
 
@@ -192,8 +207,8 @@ pub async fn lm(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
     let config = match load_lm_config().await {
         Ok(config) => config,
         Err(e) => {
-            eprintln!("❌ Failed to load LM Studio configuration: {}", e);
-            msg.reply(ctx, &format!("❌ LM Studio configuration error: {}\n\nMake sure `lmapiconf.txt` exists and contains all required settings. Check `example_lmapiconf.txt` for reference.", e)).await?;
+            eprintln!("Failed to load LM Studio configuration: {}", e);
+            msg.reply(ctx, &format!("LM Studio configuration error: {}\n\nMake sure `lmapiconf.txt` exists and contains all required settings. Check `example_lmapiconf.txt` for reference.", e)).await?;
             return Ok(());
         }
     };
@@ -202,8 +217,8 @@ pub async fn lm(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
     let system_prompt = match load_system_prompt().await {
         Ok(prompt) => prompt,
         Err(e) => {
-            eprintln!("❌ Failed to load system prompt: {}", e);
-            msg.reply(ctx, "❌ Failed to load system configuration!").await?;
+            eprintln!("Failed to load system prompt: {}", e);
+            msg.reply(ctx, "Failed to load system configuration!").await?;
             return Ok(());
         }
     };
@@ -215,27 +230,27 @@ pub async fn lm(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
         let data_map = ctx.data.read().await;
         let lm_map = data_map.get::<LmContextMap>().expect("LM context map not initialized");
         if let Some(history) = lm_map.get(&msg.author.id) {
-            println!("💬 LM command: Including {} context messages for user {}", history.len(), msg.author.name);
+            println!("LM command: Including {} context messages for user {}", history.len(), msg.author.name);
             for entry in history.iter() {
                 messages.push(entry.clone());
             }
         } else {
-            println!("💬 LM command: No context history found for user {}", msg.author.name);
+            println!("LM command: No context history found for user {}", msg.author.name);
         }
     }
 
     // Log which model is being used for LM command
-    println!("💬 LM command: Using model '{}' for chat", config.default_model);
+    println!("LM command: Using model '{}' for chat", config.default_model);
 
     // Stream the response with real-time Discord post editing
     let mut current_msg = msg.channel_id.send_message(&ctx.http, |m| {
-        m.content("🤖 **AI Response (Part 1):**\n```\n\n```")
+        m.content("**AI Response (Part 1):**\n```\n\n```")
     }).await?;
 
     // Ensure current_msg is in scope for this match
     match stream_chat_response(messages, &config.default_model, &config, ctx, &mut current_msg).await {
         Ok(final_stats) => {
-            println!("💬 LM command: Streaming complete - {} total characters across {} messages", 
+            println!("LM command: Streaming complete - {} total characters across {} messages", 
                 final_stats.total_characters, final_stats.message_count);
             
             // Record AI response in per-user context history
@@ -255,9 +270,9 @@ pub async fn lm(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
             }
         }
         Err(e) => {
-            eprintln!("❌ Failed to stream response from AI model: {}", e);
+            eprintln!("Failed to stream response from AI model: {}", e);
             let _ = current_msg.edit(&ctx.http, |m| {
-                m.content("❌ Failed to get response from AI model!")
+                m.content("Failed to get response from AI model!")
             }).await;
         }
     }
@@ -273,12 +288,12 @@ async fn stream_chat_response(
     ctx: &Context,
     initial_msg: &mut Message,
 ) -> Result<StreamingStats, Box<dyn std::error::Error + Send + Sync>> {
-    println!("🔗 [STREAMING] Attempting connection to API server: {}", config.base_url);
-    println!("🔗 [STREAMING] Using model: {}", model);
-    println!("🔗 [STREAMING] Connect timeout: {} seconds", config.timeout);
+    println!("[STREAMING] Attempting connection to API server: {}", config.base_url);
+    println!("[STREAMING] Using model: {}", model);
+    println!("[STREAMING] Connect timeout: {} seconds", config.timeout);
     
     let client = reqwest::Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(config.timeout))
+        .timeout(std::time::Duration::from_secs(60))
         .build()?;
         
     let chat_request = ChatRequest {
@@ -290,24 +305,24 @@ async fn stream_chat_response(
     };
 
     let api_url = format!("{}/v1/chat/completions", config.base_url);
-    println!("🔗 [STREAMING] Full API URL: {}", api_url);
-    println!("🔗 [STREAMING] Request payload: model={}, max_tokens={}, temperature={}, stream=true", 
+    println!("[STREAMING] Full API URL: {}", api_url);
+    println!("[STREAMING] Request payload: model={}, max_tokens={}, temperature={}, stream=true", 
         chat_request.model, chat_request.max_tokens, chat_request.temperature);
 
     // First, test basic connectivity to the server
-    println!("🔗 [STREAMING] Testing basic connectivity to {}...", config.base_url);
+    println!("[STREAMING] Testing basic connectivity to {}...", config.base_url);
     match client.get(&config.base_url).send().await {
         Ok(response) => {
-            println!("✅ [STREAMING] Basic connectivity test successful - Status: {}", response.status());
+            println!("[STREAMING] Basic connectivity test successful - Status: {}", response.status());
         }
         Err(e) => {
-            println!("❌ [STREAMING] Basic connectivity test failed: {}", e);
+            println!("[STREAMING] Basic connectivity test failed: {}", e);
             return Err(format!("Cannot reach remote server {}: {}", config.base_url, e).into());
         }
     }
 
     // Now attempt the actual streaming API call
-    println!("🔗 [STREAMING] Making streaming API request to chat completions endpoint...");
+    println!("[STREAMING] Making streaming API request to chat completions endpoint...");
     let response = match client
         .post(&api_url)
         .json(&chat_request)
@@ -315,11 +330,11 @@ async fn stream_chat_response(
         .await
     {
         Ok(resp) => {
-            println!("✅ [STREAMING] API request sent successfully - Status: {}", resp.status());
+            println!("[STREAMING] API request sent successfully - Status: {}", resp.status());
             resp
         }
         Err(e) => {
-            println!("❌ [STREAMING] API request failed: {}", e);
+            println!("[STREAMING] API request failed: {}", e);
             return Err(format!("Streaming API request to {} failed: {}", api_url, e).into());
         }
     };
@@ -327,11 +342,11 @@ async fn stream_chat_response(
     if !response.status().is_success() {
         let status = response.status();
         let error_text = response.text().await.unwrap_or_else(|_| "Unable to read error response".to_string());
-        println!("❌ [STREAMING] API returned error status {}: {}", status, error_text);
+        println!("[STREAMING] API returned error status {}: {}", status, error_text);
         return Err(format!("Streaming API request failed: HTTP {} - {}", status, error_text).into());
     }
 
-    println!("✅ [STREAMING] Starting to process response stream...");
+    println!("[STREAMING] Starting to process response stream...");
     let mut stream = response.bytes_stream();
     let mut message_state = MessageState {
         current_content: String::new(),
@@ -347,16 +362,16 @@ async fn stream_chat_response(
     let mut chunk_count = 0;
     let mut line_buffer = String::new();
 
-    println!("💬 Starting real-time streaming for chat response...");
+    println!("Starting real-time streaming for chat response...");
 
     while let Some(chunk) = stream.next().await {
         match chunk {
             Ok(bytes) => {
                 chunk_count += 1;
                 if chunk_count == 1 {
-                    println!("✅ [STREAMING] Received first chunk ({} bytes)", bytes.len());
+                    println!("[STREAMING] Received first chunk ({} bytes)", bytes.len());
                 } else if chunk_count % 10 == 0 {
-                    println!("📊 [STREAMING] Processed {} chunks, total response: {} chars", chunk_count, raw_response.len());
+                    println!("[STREAMING] Processed {} chunks, total response: {} chars", chunk_count, raw_response.len());
                 }
                 
                 line_buffer.push_str(&String::from_utf8_lossy(&bytes));
@@ -367,10 +382,10 @@ async fn stream_chat_response(
 
                     if let Some(json_str) = line.strip_prefix("data: ") {
                         if json_str.trim() == "[DONE]" {
-                            println!("✅ [STREAMING] Received [DONE] signal, finalizing response");
+                            println!("[STREAMING] Received [DONE] signal, finalizing response");
                             if !content_buffer.is_empty() {
                                 if let Err(e) = finalize_chat_message(&mut message_state, &content_buffer, ctx, config).await {
-                                    eprintln!("❌ Failed to finalize message: {}", e);
+                                    eprintln!("Failed to finalize message: {}", e);
                                 }
                             }
                             return Ok(StreamingStats { total_characters: raw_response.len(), message_count: message_state.message_index });
@@ -380,10 +395,10 @@ async fn stream_chat_response(
                             for choice in response_chunk.choices {
                                 if let Some(finish_reason) = choice.finish_reason {
                                     if finish_reason == "stop" {
-                                        println!("✅ [STREAMING] Received finish_reason=stop, finalizing response");
+                                        println!("[STREAMING] Received finish_reason=stop, finalizing response");
                                         if !content_buffer.is_empty() {
                                             if let Err(e) = finalize_chat_message(&mut message_state, &content_buffer, ctx, config).await {
-                                                eprintln!("❌ Failed to finalize message: {}", e);
+                                                eprintln!("Failed to finalize message: {}", e);
                                             }
                                         }
                                         return Ok(StreamingStats { total_characters: raw_response.len(), message_count: message_state.message_index });
@@ -397,7 +412,7 @@ async fn stream_chat_response(
 
                                         if last_update.elapsed() >= update_interval && !content_buffer.is_empty() {
                                             if let Err(e) = update_chat_message(&mut message_state, &content_buffer, ctx, config).await {
-                                                eprintln!("❌ Failed to update Discord message: {}", e);
+                                                eprintln!("Failed to update Discord message: {}", e);
                                                 return Err(e);
                                             } else {
                                                 content_buffer.clear();
@@ -409,14 +424,14 @@ async fn stream_chat_response(
                             }
                         } else {
                             if !json_str.trim().is_empty() {
-                                println!("⚠️ [STREAMING] Failed to parse JSON chunk: {}", json_str);
+                                println!("[STREAMING] Failed to parse JSON chunk: {}", json_str);
                             }
                         }
                     }
                 }
             }
             Err(e) => {
-                eprintln!("❌ [STREAMING] Stream error: {}", e);
+                eprintln!("[STREAMING] Stream error: {}", e);
                 if !content_buffer.is_empty() {
                     let _ = finalize_chat_message(&mut message_state, &content_buffer, ctx, config).await;
                 }
@@ -425,12 +440,12 @@ async fn stream_chat_response(
         }
     }
 
-    println!("📊 [STREAMING] Stream ended, processed {} chunks total", chunk_count);
+    println!("[STREAMING] Stream ended, processed {} chunks total", chunk_count);
     
     // Final cleanup - process any remaining content
     if !content_buffer.is_empty() {
         if let Err(e) = finalize_chat_message(&mut message_state, &content_buffer, ctx, config).await {
-            eprintln!("❌ Failed to finalize remaining content: {}", e);
+            eprintln!("Failed to finalize remaining content: {}", e);
         }
     }
 
@@ -451,17 +466,17 @@ async fn update_chat_message(
     config: &LMConfig,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let potential_content = if state.current_content.is_empty() {
-        format!("🤖 **AI Response (Part {}):**\n```\n{}\n```", 
+        format!("**AI Response (Part {}):**\n```\n{}\n```", 
             state.message_index, new_content)
     } else {
-        format!("🤖 **AI Response (Part {}):**\n```\n{}{}\n```", 
+        format!("**AI Response (Part {}):**\n```\n{}{}\n```", 
             state.message_index, state.current_content, new_content)
     };
 
     // Check if we need to create a new message
     if potential_content.len() > state.char_limit {
         // Finalize current message
-        let final_content = format!("🤖 **AI Response (Part {}):**\n```\n{}\n```", 
+        let final_content = format!("**AI Response (Part {}):**\n```\n{}\n```", 
             state.message_index, state.current_content);
         
         state.current_message.edit(&ctx.http, |m| {
@@ -470,7 +485,7 @@ async fn update_chat_message(
 
         // Create new message
         state.message_index += 1;
-        let new_msg_content = format!("🤖 **AI Response (Part {}):**\n```\n{}\n```", 
+        let new_msg_content = format!("**AI Response (Part {}):**\n```\n{}\n```", 
             state.message_index, new_content);
         
         let new_message = state.current_message.channel_id.send_message(&ctx.http, |m| {
@@ -507,9 +522,9 @@ async fn finalize_chat_message(
     
     // Mark the final message as complete
     let final_display = if state.message_index == 1 {
-        format!("🤖 **AI Response Complete** ✅\n```\n{}\n```", state.current_content)
+        format!("**AI Response Complete**\n```\n{}\n```", state.current_content)
     } else {
-        format!("🤖 **AI Response Complete (Part {}/{})** ✅\n```\n{}\n```", 
+        format!("**AI Response Complete (Part {}/{})**\n```\n{}\n```", 
             state.message_index, state.message_index, state.current_content)
     };
 
@@ -534,7 +549,7 @@ async fn load_system_prompt() -> Result<String, Box<dyn std::error::Error + Send
             Ok(content) => {
                 // Remove BOM if present
                 let content = content.strip_prefix('\u{feff}').unwrap_or(&content);
-                println!("💬 LM command: Loaded system prompt from {}", path);
+                println!("LM command: Loaded system prompt from {}", path);
                 return Ok(content.trim().to_string());
             }
             Err(_) => continue,
@@ -572,12 +587,12 @@ mod tests {
         // Test system prompt loading
         match load_system_prompt().await {
             Ok(prompt) => {
-                println!("✅ System prompt loaded successfully:");
+                println!("System prompt loaded successfully:");
                 println!("Length: {} characters", prompt.len());
                 println!("Content preview: {}", &prompt[..prompt.len().min(200)]);
             }
             Err(e) => {
-                println!("❌ Failed to load system prompt: {}", e);
+                println!("Failed to load system prompt: {}", e);
             }
         }
     }

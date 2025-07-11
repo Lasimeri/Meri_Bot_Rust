@@ -5,114 +5,71 @@ use serenity::{
 };
 
 #[command]
-#[aliases("profilepic", "avatar", "pfp")]
+#[aliases("avatar", "pfp", "profilepic")]
 pub async fn ppfp(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
-    let args_str = args.message().trim();
-    
-    // Start typing indicator
     let _typing = ctx.http.start_typing(msg.channel_id.0)?;
-    
-    // Check if a user was mentioned
-    if args_str.is_empty() {
-        msg.reply(ctx, "❌ Please mention a user! Usage: `^ppfp @user`").await?;
-        return Ok(());
-    }
-
-    // Parse the user mention - extract user ID from mention format <@123456789>
-    let user_id = if args_str.starts_with("<@") && args_str.ends_with(">") {
-        let id_str = args_str.trim_start_matches("<@").trim_end_matches(">").trim_start_matches("!");
-        match id_str.parse::<u64>() {
-            Ok(id) => UserId(id),
-            Err(_) => {
-                msg.reply(ctx, "❌ Invalid user mention! Please use `^ppfp @user`").await?;
-                return Ok(());
-            }
-        }
+    let mentioned_user = if let Some(user) = msg.mentions.first() {
+        user
     } else {
-        msg.reply(ctx, "❌ Invalid user mention! Please use `^ppfp @user`").await?;
+        msg.reply(ctx, "Please mention a user! Usage: `^ppfp @user`").await?;
         return Ok(());
     };
 
-    // Get the user
-    let user = match ctx.http.get_user(user_id.into()).await {
-        Ok(user) => user,
-        Err(_) => {
-            msg.reply(ctx, "❌ User not found!").await?;
-            return Ok(());
-        }
-    };
-
-    // Get the user's avatar URL
-    let avatar_url = match user.avatar_url() {
+    let avatar_url = match mentioned_user.avatar_url() {
         Some(url) => url,
         None => {
-            // If no custom avatar, use default avatar
-            user.default_avatar_url()
-        }
-    };
-
-    // Download the image data
-    let image_data = match download_image(&avatar_url).await {
-        Ok(data) => data,
-        Err(e) => {
-            eprintln!("❌ Failed to download avatar: {}", e);
-            msg.reply(ctx, "❌ Failed to download the profile picture!").await?;
+            msg.reply(ctx, "User does not have a profile picture.").await?;
             return Ok(());
         }
     };
+    
+    // Append size parameter for higher resolution
+    let high_res_url = format!("{}?size=4096", avatar_url);
 
-    // Determine file extension from URL
-    let file_extension = if avatar_url.contains(".gif") {
-        "gif"
-    } else if avatar_url.contains(".webp") {
-        "webp" 
-    } else if avatar_url.contains(".jpg") {
-        "jpg"
-    } else {
-        "png" // Default to PNG
-    };
+    match download_image(&high_res_url).await {
+        Ok(image_data) => {
+            let filename = if high_res_url.contains(".gif") {
+                "avatar.gif"
+            } else {
+                "avatar.png"
+            };
 
-    let filename = format!("{}_avatar.{}", user.name, file_extension);
-
-    // Create attachment from image data in memory
-    let attachment = AttachmentType::Bytes {
-        data: image_data.into(),
-        filename: filename.clone(),
-    };
-
-    // Send the message with embed and attachment
-    if let Err(e) = msg.channel_id.send_message(&ctx.http, |m| {
-        m.add_file(attachment);
-        m.embed(|e| {
-            e.title(format!("{}'s Profile Picture", user.name));
-            e.description(format!("**User:** <@{}>", user.id));
-            e.color(0x7289DA); // Discord blurple color
-            e.image(format!("attachment://{}", filename));
-            e.url(&avatar_url); // Make the title clickable to the original image
-                         e.footer(|f| f.text(format!("Requested by {}", msg.author.name)));
-             e.timestamp(Timestamp::now());
-            e
-        });
-        m
-    }).await {
-        eprintln!("❌ Failed to send message: {}", e);
-        msg.reply(ctx, "❌ Failed to send the profile picture!").await?;
+            if let Err(e) = msg.channel_id.send_message(&ctx.http, |m| {
+                m.embed(|e| {
+                    e.title(&format!("{}'s Profile Picture", mentioned_user.name))
+                     .url(&high_res_url)
+                     .image(&format!("attachment://{}", filename))
+                     .color(0x00BFFF) // Deep sky blue
+                     .footer(|f| {
+                         f.text(&format!("Requested by {}", msg.author.name))
+                          .icon_url(msg.author.face())
+                     })
+                     .timestamp(chrono::Utc::now())
+                })
+                .add_file((image_data.as_slice(), filename))
+            }).await {
+                eprintln!("Failed to send profile picture embed: {}", e);
+                msg.reply(ctx, "Failed to send profile picture.").await?;
+            }
+        },
+        Err(e) => {
+            eprintln!("Failed to download avatar image: {}", e);
+            msg.reply(ctx, "Failed to download user's profile picture.").await?;
+        }
     }
-
+    
     Ok(())
 }
 
-// Helper function to download image data into memory
+// Helper function to download image to memory with proper headers
 async fn download_image(url: &str) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30)) // 30 second timeout for image downloads
-        .build()?;
+    let client = reqwest::Client::new();
     let response = client.get(url).send().await?;
     
     if !response.status().is_success() {
-        return Err(format!("HTTP error: {}", response.status()).into());
+        return Err(format!("Failed to download image: HTTP {}", response.status()).into());
     }
-
+    
     let bytes = response.bytes().await?;
     Ok(bytes.to_vec())
 } 

@@ -54,6 +54,8 @@ struct Handler;
 #[async_trait]
 impl EventHandler for Handler {
     async fn ready(&self, _: Context, ready: Ready) {
+        // log::info!("✅ Bot connected as {}! (ID: {})", ready.user.name, ready.user.id);
+        // log::info!("📊 Connected to {} guilds", ready.guilds.len());
         println!("✅ Bot connected as {}!", ready.user.name);
     }
 }
@@ -114,10 +116,21 @@ fn load_bot_config() -> Result<HashMap<String, String>, String> {
 
 #[tokio::main]
 async fn main() {
+    // Initialize logger - must be done before any logging calls
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("error"))
+        .format_timestamp_secs()
+        .init();
+    
+    // log::info!("🚀 Meri Bot starting up...");
+    
     // Load configuration from botconfig.txt file
     match load_bot_config() {
-        Ok(_) => println!("✅ Configuration loaded from botconfig.txt"),
+        Ok(_) => {
+            // log::info!("✅ Configuration loaded from botconfig.txt");
+            println!("✅ Configuration loaded from botconfig.txt");
+        },
         Err(error) => {
+            log::error!("❌ Failed to load botconfig.txt: {}", error);
             eprintln!("❌ Failed to load botconfig.txt: {}", error);
             eprintln!("Create a botconfig.txt file in the project root with: DISCORD_TOKEN=your_token_here and PREFIX=^");
             return;
@@ -129,12 +142,15 @@ async fn main() {
         Ok(token) => {
             // Validate token is not placeholder
             if token == "YOUR_BOT_TOKEN_HERE" || token.is_empty() {
+                log::error!("❌ DISCORD_TOKEN in botconfig.txt is set to placeholder value");
                 eprintln!("❌ DISCORD_TOKEN in botconfig.txt is set to placeholder! Replace with your actual Discord bot token.");
                 return;
             }
+            // log::debug!("✅ Discord token validated (length: {} chars)", token.len());
             token
         }
         Err(_) => {
+            log::error!("❌ DISCORD_TOKEN not found in botconfig.txt file");
             eprintln!("❌ DISCORD_TOKEN not found in botconfig.txt file!");
             return;
         }
@@ -142,9 +158,11 @@ async fn main() {
     
     // Get command prefix from configuration
     let prefix = env::var("PREFIX").unwrap_or_else(|_| "^".to_string());
+    // log::info!("🤖 Starting bot with prefix: '{}'", prefix);
     println!("🤖 Starting bot with prefix: '{}'", prefix);
     
     // Set up command framework
+    // log::debug!("🔧 Setting up command framework with prefix: '{}'", prefix);
     let framework = StandardFramework::new()
         .configure(|c| {
             c.prefix(&prefix)
@@ -152,11 +170,21 @@ async fn main() {
             .no_dm_prefix(true)
             .with_whitespace(true)
         })
-        .after(|_ctx, _msg, command_name, result| Box::pin(async move {
-            println!("🔧 Command executed: '{}' - Result: {:?}", command_name, result);
+        .after(|_ctx, msg, command_name, result| Box::pin(async move {
+            match result {
+                Ok(()) => {
+                    // log::info!("✅ Command '{}' executed successfully by user {} ({})", 
+                    //           command_name, msg.author.name, msg.author.id);
+                },
+                Err(e) => {
+                    log::error!("❌ Command '{}' failed for user {} ({}): {:?}", 
+                               command_name, msg.author.name, msg.author.id, e);
+                }
+            }
         }))
-        .unrecognised_command(|_ctx, _msg, unrecognized_command_name| Box::pin(async move {
-            println!("❓ Unrecognized command attempted: '{}'", unrecognized_command_name);
+        .unrecognised_command(|_ctx, msg, unrecognized_command_name| Box::pin(async move {
+            // log::warn!("❓ Unrecognized command '{}' attempted by user {} ({})", 
+            //           unrecognized_command_name, msg.author.name, msg.author.id);
         }))
         .group(&GENERAL_GROUP);
 
@@ -165,13 +193,18 @@ async fn main() {
         | GatewayIntents::MESSAGE_CONTENT;
 
     // Create and start client
+    // log::info!("🔧 Creating Discord client...");
     let mut client = match Client::builder(token, intents)
         .event_handler(Handler)
         .framework(framework)
         .await
     {
-        Ok(client) => client,
+        Ok(client) => {
+            // log::info!("✅ Discord client created successfully");
+            client
+        },
         Err(e) => {
+            log::error!("❌ Error creating Discord client: {:?}", e);
             eprintln!("❌ Error creating Discord client: {:?}", e);
             eprintln!("Check your token in botconfig.txt file");
             return;
@@ -180,23 +213,30 @@ async fn main() {
 
     // Initialize per-user context maps for LM and Reason commands
     {
+        // log::debug!("🔧 Initializing context maps...");
         let mut data = client.data.write().await;
         data.insert::<LmContextMap>(HashMap::new());
         data.insert::<ReasonContextMap>(HashMap::new());
+        // log::debug!("✅ Context maps initialized");
     }
 
     // Set up graceful shutdown on CTRL+C
+    // log::info!("🚀 Bot is running... Press Ctrl+C to stop");
     println!("🚀 Bot is running... Press Ctrl+C to stop");
     tokio::select! {
         _ = signal::ctrl_c() => {
+            // log::info!("📡 Received SIGINT, stopping bot gracefully...");
             println!("\n⏹️ Stopping bot gracefully...");
         }
         result = client.start() => {
             if let Err(why) = result {
+                log::error!("❌ Client error: {:?}", why);
                 eprintln!("❌ Client error: {:?}", why);
             }
         }
     }
+    
+    // log::info!("👋 Bot shutdown complete");
     
     println!("✅ Bot stopped");
 }

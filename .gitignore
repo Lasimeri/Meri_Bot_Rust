@@ -76,6 +76,19 @@ test_config.exe
 \#*\#
 .\#*
 
+# YouTube transcript and yt-dlp temporary files
+yt_transcript_*
+test_transcript*
+.vtt
+*.srt
+*.ass
+*.ssa
+vtt
+*.mp3
+*.m4a
+*.webm
+*.mp4
+
 # Profiling and debugging
 *.prof
 *.trace

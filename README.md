@@ -30,16 +30,30 @@ A powerful Discord bot written in Rust using the Serenity framework, featuring r
 ### 🤖 AI Chat Commands
 - `^lm <prompt>` - Chat with AI via LM Studio/Ollama
   - **Aliases**: `^llm`, `^ai`, `^chat` 
-  - **Features**: **Real-time streaming responses**, smart message chunking, extended output length (8K tokens), live progress indicators, multi-part message support, robust buffered streaming for improved reliability
+  - **Features**: **Real-time streaming responses**, smart message chunking, extended output length (8K tokens), live progress indicators, multi-part message support, robust buffered streaming for improved reliability, **60-second timeout**
 - `^lm -s <search query>` - AI-enhanced web search with intelligent query optimization and result summarization
   - **Aliases**: `^lm --search <query>`
-  - **Features**: **AI query refinement**, **intelligent summarization with embedded links**, real-time progress updates, fallback to basic search
+  - **Features**: **AI query refinement**, **intelligent summarization with embedded links**, real-time progress updates, fallback to basic search, **60-second timeout**
 - `^reason <question>` - Deep reasoning with specialized AI model
   - **Aliases**: `^reasoning`
-  - **Features**: **Real-time streaming with thinking tag filtering**, step-by-step reasoning, dedicated reasoning model (DeepSeek R1), automatic `<think>` content removal, logical explanations, robust buffered streaming for improved reliability
+  - **Features**: **Real-time streaming with thinking tag filtering**, step-by-step reasoning, dedicated reasoning model (DeepSeek R1), automatic `<think>` content removal, logical explanations, robust buffered streaming for improved reliability, **60-second timeout**
 - `^reason -s <search query>` - Reasoning-enhanced web search with analytical insights
   - **Aliases**: `^reasoning -s`, `^reasoning --search`
-  - **Features**: **Analytical research synthesis**, reasoning-focused query optimization, embedded source links, specialized reasoning model analysis (Qwen3 4B), **buffered chunking** (posts content in 2000-character chunks)
+  - **Features**: **Analytical research synthesis**, reasoning-focused query optimization, embedded source links, specialized reasoning model analysis (Qwen3 4B), **buffered chunking** (posts content in 2000-character chunks), **60-second timeout**
+
+### 📺 Content Summarization Commands
+- `^sum <url>` - Summarize webpage content or YouTube videos using AI reasoning model
+  - **Aliases**: `^summarize`, `^webpage`
+  - **Features**: 
+    - **YouTube transcript extraction** with yt-dlp (automatic subtitle download)
+    - **HTML content extraction** and intelligent cleaning
+    - **RAG (map-reduce) summarization** for long content (chunks content >8K chars)
+    - **Automatic reasoning tag filtering** (removes `<think>` sections from responses)
+    - **60-second timeout** for reliable processing
+    - **Streaming responses** with progress updates
+    - **Smart message chunking** for long summaries
+  - **Examples**: `^sum https://youtube.com/watch?v=...`, `^sum https://example.com`
+  - **Requirements**: yt-dlp installed for YouTube support
 
 ### 🔍 Web Search Commands
 - `^lm -s <search query>` - AI-enhanced web search with intelligent processing
@@ -57,10 +71,11 @@ A powerful Discord bot written in Rust using the Serenity framework, featuring r
 - **Progress tracking** - Live character counts and generation status
 
 ### ⚡ Streaming Technology
-- **Robust Connection Handling** - Uses a `connect_timeout` to prevent premature disconnection during long AI generations, ensuring that even slow responses are fully received.
+- **Robust Connection Handling** - Uses a **60-second timeout** to prevent hanging requests while ensuring complete responses from AI models
 - **Buffered Stream Processing** - Assembles incoming data into a line buffer before parsing. This prevents errors caused by data packets being split across network chunks, making the stream processing significantly more reliable.
 - **Live Discord Message Editing** - Messages update in real-time every 0.8 seconds with the latest content from the stream.
 - **Thinking Tag Filtering** - Automatically removes `<think>...</think>` content from reasoning responses in real-time.
+- **YouTube Transcript Processing** - Automatic subtitle extraction using yt-dlp with intelligent VTT cleaning and RAG summarization for long content.
 - **Graceful Error Handling** - If a Discord message fails to update mid-stream, the entire operation is safely halted to prevent content loss, and the error is logged.
 
 ## Prerequisites
@@ -68,6 +83,7 @@ A powerful Discord bot written in Rust using the Serenity framework, featuring r
 - Rust (latest stable version)
 - A Discord bot token
 - LM Studio or Ollama (for AI chat and reasoning functionality) - optional
+- yt-dlp (for YouTube transcript extraction) - optional, required for YouTube summarization
 - Internet connection (for web search functionality)
 
 ## Setup
@@ -134,6 +150,47 @@ A powerful Discord bot written in Rust using the Serenity framework, featuring r
    cargo build --release
    cargo run
    ```
+
+## YouTube Support Setup (Optional)
+
+For YouTube video summarization, install yt-dlp:
+
+### Windows
+```powershell
+# Using winget
+winget install yt-dlp
+
+# Or using pip
+pip install yt-dlp
+
+# Or download from https://github.com/yt-dlp/yt-dlp/releases
+```
+
+### macOS
+```bash
+# Using Homebrew
+brew install yt-dlp
+
+# Or using pip
+pip install yt-dlp
+```
+
+### Linux
+```bash
+# Using package manager
+sudo apt install yt-dlp  # Ubuntu/Debian
+sudo dnf install yt-dlp  # Fedora
+
+# Or using pip
+pip install yt-dlp
+```
+
+### Verify Installation
+```bash
+yt-dlp --version
+```
+
+**Note**: The `^sum` command will automatically detect if yt-dlp is available and provide helpful error messages if it's not installed.
 
 ## Inviting the Bot to Your Server
 

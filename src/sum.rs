@@ -7,224 +7,383 @@ use crate::search::{LMConfig, ChatMessage, load_lm_config};
 use reqwest;
 use std::time::Duration;
 use std::fs;
+use std::process::Command;
+use uuid::Uuid;
+use log::{info, warn, error, debug};
+use serde::Deserialize;
+use regex::Regex;
+use crate::search::chat_completion;
+use std::time::Instant;
 
-// Struct for chat completion request
-#[derive(serde::Serialize)]
-struct ChatRequest {
-    model: String,
-    messages: Vec<ChatMessage>,
-    temperature: f32,
-    max_tokens: i32,
-    stream: bool,
+// SSE response structures
+#[derive(Deserialize)]
+struct StreamResponse {
+    choices: Vec<StreamChoice>,
 }
 
-// Struct for streaming chat completion response
-#[derive(serde::Deserialize)]
-struct ChatResponse {
-    choices: Vec<Choice>,
-}
-
-#[derive(serde::Deserialize)]
-struct Choice {
-    delta: Option<Delta>,
+#[derive(Deserialize)]
+struct StreamChoice {
+    delta: StreamDelta,
     finish_reason: Option<String>,
 }
 
-#[derive(serde::Deserialize)]
-struct Delta {
+#[derive(Deserialize)]
+struct StreamDelta {
     content: Option<String>,
-}
-
-// Struct for message state management during streaming
-struct MessageState {
-    current_content: String,
-    current_message: Message,
-    message_index: usize,
-    char_limit: usize,
-}
-
-// Struct for streaming statistics
-struct StreamingStats {
-    total_characters: usize,
-    message_count: usize,
 }
 
 #[command]
 #[aliases("summarize", "webpage")]
 pub async fn sum(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
-    let _typing = ctx.http.start_typing(msg.channel_id.0)?;
+    let start_time = std::time::Instant::now();
+    info!("📺 Sum command initiated by user {} ({}) in channel {}", 
+          msg.author.name, msg.author.id, msg.channel_id);
     
     let url = args.message().trim();
+    debug!("🔗 Received URL: {}", url);
     
-    // Validate URL input
     if url.is_empty() {
-        msg.reply(ctx, "❌ Please provide a URL to summarize!\n\n**Usage:** `^sum <url>`\n**Example:** `^sum https://example.com/article`").await?;
+        warn!("❌ Empty URL provided by user {} ({})", msg.author.name, msg.author.id);
+        msg.reply(ctx, "Please provide a URL to summarize!\n\n**Usage:** `^sum <url>`").await?;
         return Ok(());
     }
     
-    // Basic URL validation
     if !url.starts_with("http://") && !url.starts_with("https://") {
-        msg.reply(ctx, "❌ Please provide a valid URL starting with `http://` or `https://`").await?;
+        warn!("❌ Invalid URL format provided: {}", url);
+        msg.reply(ctx, "Please provide a valid URL starting with `http://` or `https://`").await?;
         return Ok(());
     }
     
-    println!("🔍 Summarizing webpage: {}", url);
+    // Load LM configuration from lmapiconf.txt BEFORE starting typing indicator
+    debug!("🔧 Loading LM configuration from lmapiconf.txt...");
     
-    // Load configuration with detailed logging
-    println!("⚙️ Loading LM configuration for summarization...");
     let config = match load_lm_config().await {
-        Ok(config) => {
-            println!("✅ LM configuration loaded successfully");
-            println!("🔧 Using reasoning model: {}", config.default_reason_model);
-            println!("🌐 API endpoint: {}", config.base_url);
-            config
+        Ok(cfg) => {
+            info!("✅ LM configuration loaded successfully");
+            debug!("🧠 Using reasoning model: {}", cfg.default_reason_model);
+            debug!("🌐 API endpoint: {}", cfg.base_url);
+            cfg
         },
         Err(e) => {
-            println!("❌ Failed to load LM configuration: {}", e);
-            msg.reply(ctx, &format!("❌ Failed to load LM configuration: {}\n\n**Setup required:** Ensure `lmapiconf.txt` is properly configured with your reasoning model.", e)).await?;
+            error!("❌ Failed to load LM configuration: {}", e);
+            msg.reply(ctx, &format!("Failed to load LM configuration: {}\n\n**Setup required:** Ensure `lmapiconf.txt` is properly configured with your reasoning model.", e)).await?;
             return Ok(());
         }
     };
     
-    // Create initial response message
-    let mut response_msg = match msg.reply(ctx, "🌐 Fetching webpage content...").await {
-        Ok(msg) => {
-            println!("✅ Initial Discord message sent successfully");
-            msg
-        },
-        Err(e) => {
-            eprintln!("❌ Failed to send initial message: {}", e);
-            return Ok(());
+    debug!("🔧 Configuration loaded, proceeding with next steps");
+    
+    // Start typing indicator AFTER config is loaded
+    let _typing = ctx.http.start_typing(msg.channel_id.0)?;
+    
+    let is_youtube = url.contains("youtube.com/") || url.contains("youtu.be/");
+    info!("🎯 Processing {} URL: {}", if is_youtube { "YouTube" } else { "webpage" }, url);
+    
+    // Create response message
+    let mut response_msg = msg.reply(ctx, "🔄 Fetching content...").await?;
+    debug!("✅ Initial Discord message sent successfully");
+    
+    // Fetch content
+    info!("🌐 Starting content fetching process...");
+    let content = if is_youtube {
+        match fetch_youtube_transcript(url).await {
+            Ok(transcript) => {
+                info!("✅ YouTube transcript fetched successfully: {} characters", transcript.len());
+                debug!("📝 Transcript preview: {}", &transcript[..std::cmp::min(200, transcript.len())]);
+                transcript
+            },
+            Err(e) => {
+                error!("❌ Failed to fetch YouTube transcript: {}", e);
+                response_msg.edit(ctx, |m| {
+                    m.content(format!("❌ Failed to fetch YouTube transcript: {}", e))
+                }).await?;
+                return Ok(());
+            }
+        }
+    } else {
+        match fetch_webpage_content(url).await {
+            Ok(content) => {
+                info!("✅ Webpage content fetched successfully: {} characters", content.len());
+                debug!("📄 Content preview: {}", &content[..std::cmp::min(200, content.len())]);
+                content
+            },
+            Err(e) => {
+                error!("❌ Failed to fetch webpage content: {}", e);
+                response_msg.edit(ctx, |m| {
+                    m.content(format!("❌ Failed to fetch webpage: {}", e))
+                }).await?;
+                return Ok(());
+            }
         }
     };
     
-    // Fetch webpage content with detailed logging
-    println!("📥 Starting webpage content fetching process...");
-    let webpage_content = match fetch_webpage_content(url).await {
-        Ok(content) => {
-            println!("✅ Webpage content fetched successfully: {} characters", content.len());
-            content
-        },
-        Err(e) => {
-            println!("❌ Failed to fetch webpage content: {}", e);
-            response_msg.edit(ctx, |m| {
-                m.content(&format!("❌ Failed to fetch webpage: {}\n\n**Possible issues:**\n• URL might be invalid or unreachable\n• Website may block automated requests (403 Forbidden)\n• Network connectivity issues\n• Server errors on the target website", e))
-            }).await?;
-            return Ok(());
-        }
-    };
-    
-    // Update message to show processing
-    println!("📝 Updating Discord message to show AI processing...");
+    // Update status
+    debug!("📝 Updating Discord message to show AI processing...");
     response_msg.edit(ctx, |m| {
-        m.content("🤖 Sending content to reasoning model for summarization...")
+        m.content("🤖 Generating summary...")
     }).await?;
     
-    // Generate summary using reasoning model with enhanced logging and streaming
-    println!("🧠 Starting AI summarization process with streaming...");
-    match stream_summarization_response(&webpage_content, url, &config, &mut response_msg, ctx).await {
-        Ok(stats) => {
-            println!("✅ Summary streaming completed successfully");
-            println!("📊 Final stats - Total characters: {}, Messages: {}", stats.total_characters, stats.message_count);
-        }
+    // Stream the summary
+    info!("🧠 Starting AI summarization process with streaming...");
+    let processing_start = std::time::Instant::now();
+    match stream_summary(&content, url, &config, &mut response_msg, ctx, is_youtube).await {
+        Ok(_) => {
+            let processing_time = processing_start.elapsed();
+            info!("✅ Summary streaming completed successfully in {:.2}s", processing_time.as_secs_f64());
+        },
         Err(e) => {
-            println!("❌ Summary generation failed: {}", e);
+            error!("❌ Summary generation failed: {}", e);
             response_msg.edit(ctx, |m| {
-                m.content(&format!("❌ Failed to generate summary: {}\n\n**Possible issues:**\n• Reasoning model not responding\n• Content too large for model\n• API configuration issues\n• Network connectivity to AI server", e))
+                m.content(format!("❌ Failed to generate summary: {}", e))
             }).await?;
         }
     }
+    
+    let total_time = start_time.elapsed();
+    info!("⏱️ Sum command completed in {:.2}s for user {} ({})", 
+          total_time.as_secs_f64(), msg.author.name, msg.author.id);
     
     Ok(())
 }
 
-// Function to fetch webpage content with enhanced error handling and logging
-async fn fetch_webpage_content(url: &str) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    println!("🌐 Starting webpage fetch for URL: {}", url);
+// Load summarization system prompt with multi-path fallback (like lm command)
+async fn load_summarization_prompt() -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let prompt_paths = [
+        "summarization_prompt.txt",
+        "../summarization_prompt.txt",
+        "../../summarization_prompt.txt",
+        "src/summarization_prompt.txt",
+        "example_summarization_prompt.txt",
+        "../example_summarization_prompt.txt",
+        "../../example_summarization_prompt.txt",
+        "src/example_summarization_prompt.txt",
+    ];
     
-    // Create client with enhanced headers to avoid 403 errors
+    for path in &prompt_paths {
+        match fs::read_to_string(path) {
+            Ok(content) => {
+                // Remove BOM if present
+                let content = content.strip_prefix('\u{feff}').unwrap_or(&content);
+                debug!("📄 Summarization prompt loaded from: {}", path);
+                return Ok(content.trim().to_string());
+            }
+            Err(_) => continue,
+        }
+    }
+    
+    // Fallback prompt if no file found
+    debug!("📄 Using built-in fallback summarization prompt");
+    Ok("You are an expert content summarizer. Create a comprehensive, well-structured summary of the provided content. Use clear formatting and highlight key points. Keep the summary informative but concise.".to_string())
+}
+
+// Load YouTube summarization system prompt with multi-path fallback  
+async fn load_youtube_summarization_prompt() -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let prompt_paths = [
+        "youtube_summarization_prompt.txt",
+        "../youtube_summarization_prompt.txt",
+        "../../youtube_summarization_prompt.txt",
+        "src/youtube_summarization_prompt.txt",
+        "example_youtube_summarization_prompt.txt",
+        "../example_youtube_summarization_prompt.txt",
+        "../../example_youtube_summarization_prompt.txt",
+        "src/example_youtube_summarization_prompt.txt",
+    ];
+    
+    for path in &prompt_paths {
+        match fs::read_to_string(path) {
+            Ok(content) => {
+                // Remove BOM if present
+                let content = content.strip_prefix('\u{feff}').unwrap_or(&content);
+                debug!("📺 YouTube summarization prompt loaded from: {}", path);
+                return Ok(content.trim().to_string());
+            }
+            Err(_) => continue,
+        }
+    }
+    
+    // Fallback prompt if no file found
+    debug!("📺 Using built-in fallback YouTube summarization prompt");
+    Ok("You are an expert at summarizing YouTube video content. Focus on key points, main themes, and important takeaways. Structure your summary with clear sections and highlight the most valuable information for viewers.".to_string())
+}
+
+// Simplified YouTube transcript fetcher
+async fn fetch_youtube_transcript(url: &str) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let temp_file = format!("yt_transcript_{}", Uuid::new_v4());
+    debug!("🎥 Attempting to fetch YouTube transcript using yt-dlp...");
+    debug!("📍 URL: {}", url);
+    debug!("📁 Temp file base: {}", temp_file);
+    
+    // Check if yt-dlp is available and get version
+    debug!("🔍 Checking yt-dlp version...");
+    let version_output = Command::new("yt-dlp")
+        .arg("--version")
+        .output()
+        .map_err(|e| {
+            error!("❌ yt-dlp is not installed or not in PATH: {}", e);
+            "yt-dlp is not installed. Please install yt-dlp to use YouTube summarization."
+        })?;
+    
+    if !version_output.status.success() {
+        error!("❌ yt-dlp version check failed");
+        return Err("yt-dlp is not working properly".into());
+    }
+    
+    let version_str = String::from_utf8_lossy(&version_output.stdout);
+    debug!("✅ yt-dlp version: {}", version_str.trim());
+    
+    // Try to download automatic subtitles
+    debug!("🔄 Running yt-dlp command for automatic subtitles...");
+    let mut command = Command::new("yt-dlp");
+    command
+        .arg("--write-auto-sub")
+        .arg("--sub-langs").arg("en")
+        .arg("--sub-format").arg("vtt")
+        .arg("--skip-download")
+        .arg("--no-warnings")
+        .arg("--no-playlist")
+        .arg("--extract-audio")
+        .arg("--audio-format").arg("mp3")
+        .arg("--output").arg(&temp_file)
+        .arg(url);
+    
+    let output = command.output()?;
+    
+    debug!("yt-dlp command exit status: {}", output.status);
+    
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        error!("❌ yt-dlp failed - stdout: {}", stdout);
+        error!("❌ yt-dlp failed - stderr: {}", stderr);
+        
+        // Check for common error patterns and provide helpful messages
+        if stderr.contains("Did not get any data blocks") {
+            return Err("YouTube subtitles extraction failed: 'Did not get any data blocks'. This is usually caused by YouTube's anti-bot measures or an outdated yt-dlp version. Try updating yt-dlp with: yt-dlp -U".into());
+        }
+        
+        if stderr.contains("Sign in to confirm you're not a bot") {
+            return Err("YouTube is blocking requests: 'Sign in to confirm you're not a bot'. This is a temporary YouTube restriction. Try again later or use a different video.".into());
+        }
+        
+        if stderr.contains("Private video") || stderr.contains("Video unavailable") {
+            return Err("Video is private or unavailable. Please check the URL and try again.".into());
+        }
+        
+        if stderr.contains("No subtitles") || stderr.contains("no automatic captions") {
+            return Err("This video has no automatic captions or subtitles available.".into());
+        }
+        
+        return Err(format!("yt-dlp failed to extract subtitles: {}", stderr).into());
+    }
+    
+    // Look for the subtitle file
+    let vtt_file = format!("{}.en.vtt", temp_file);
+    debug!("📄 Looking for subtitle file: {}", vtt_file);
+    
+    if !std::path::Path::new(&vtt_file).exists() {
+        error!("❌ Subtitle file not found: {}", vtt_file);
+        return Err("Subtitle file was not created by yt-dlp. The video may not have automatic captions available.".into());
+    }
+    
+    let content = fs::read_to_string(&vtt_file)?;
+    debug!("📖 Read subtitle file: {} characters", content.len());
+    
+    // Clean up the file
+    match fs::remove_file(&vtt_file) {
+        Ok(_) => debug!("🗑️ Cleaned up temp file: {}", vtt_file),
+        Err(e) => warn!("⚠️ Failed to clean up temp file {}: {}", vtt_file, e),
+    }
+    
+    // Check if content is valid
+    if content.trim().is_empty() {
+        return Err("Downloaded subtitle file is empty".into());
+    }
+    
+    if !content.contains("WEBVTT") {
+        return Err("Downloaded file is not a valid VTT subtitle file".into());
+    }
+    
+    // Clean VTT content
+    let cleaned = clean_vtt_content(&content);
+    debug!("✅ VTT content cleaned: {} characters", cleaned.len());
+    
+    if cleaned.trim().is_empty() {
+        return Err("No readable text found in subtitle file after cleaning".into());
+    }
+    
+    Ok(cleaned)
+}
+
+// Simple VTT cleaner
+fn clean_vtt_content(vtt: &str) -> String {
+    debug!("🧹 Cleaning VTT content...");    
+    let mut lines = Vec::new();
+    
+    for line in vtt.lines() {
+        let line = line.trim();
+        
+        // Skip headers, timestamps, and empty lines
+        if line.is_empty() || 
+           line.starts_with("WEBVTT") ||
+           line.contains("-->") ||
+           line.chars().all(|c| c.is_numeric() || c == ':' || c == '.') {
+            continue;
+        }
+        
+        // Clean tags
+        let cleaned = line
+            .replace("<c>", "")
+            .replace("</c>", "")
+            .trim()
+            .to_string();
+            
+        if !cleaned.is_empty() {
+            lines.push(cleaned);
+        }
+    }
+    
+    let result = lines.join(" ");
+    debug!("🧹 VTT cleaning complete: {} lines -> {} characters", lines.len(), result.len());
+    result
+}
+
+// Simple webpage fetcher
+async fn fetch_webpage_content(url: &str) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    debug!("🌐 Starting webpage fetch for URL: {}", url);
+    
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
-        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-        .default_headers({
-            let mut headers = reqwest::header::HeaderMap::new();
-            headers.insert("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8".parse().unwrap());
-            headers.insert("Accept-Language", "en-US,en;q=0.5".parse().unwrap());
-            headers.insert("Accept-Encoding", "gzip, deflate".parse().unwrap());
-            headers.insert("DNT", "1".parse().unwrap());
-            headers.insert("Connection", "keep-alive".parse().unwrap());
-            headers.insert("Upgrade-Insecure-Requests", "1".parse().unwrap());
-            headers.insert("Sec-Fetch-Dest", "document".parse().unwrap());
-            headers.insert("Sec-Fetch-Mode", "navigate".parse().unwrap());
-            headers.insert("Sec-Fetch-Site", "none".parse().unwrap());
-            headers.insert("Cache-Control", "max-age=0".parse().unwrap());
-            headers
-        })
+        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
         .build()?;
     
-    println!("🔄 Sending HTTP request to: {}", url);
-    
+    debug!("📡 Sending HTTP request...");
     let response = client.get(url).send().await?;
     let status = response.status();
+    debug!("📡 HTTP Response Status: {}", status);
     
-    println!("📊 HTTP Response Status: {}", status);
-    
-    if !status.is_success() {
-        let error_msg = format!("HTTP error: {} - {}", status.as_u16(), status.canonical_reason().unwrap_or("Unknown"));
-        println!("❌ HTTP Error: {}", error_msg);
-        
-        // Provide specific guidance for common errors
-        let guidance = match status.as_u16() {
-            403 => "This website is blocking automated requests. The site may have anti-bot protection.",
-            404 => "The webpage was not found. Please check the URL.",
-            429 => "Rate limited. The website is receiving too many requests.",
-            500..=599 => "Server error on the website. Try again later.",
-            _ => "Unknown HTTP error occurred."
-        };
-        
-        return Err(format!("{}\n\nGuidance: {}", error_msg, guidance).into());
+    if !response.status().is_success() {
+        error!("❌ HTTP error: {}", status);
+        return Err(format!("HTTP error: {}", response.status()).into());
     }
     
-    println!("✅ Successfully received response from server");
+    let html = response.text().await?;
+    debug!("📄 Downloaded HTML content: {} characters", html.len());
     
-    let html_content = response.text().await?;
-    println!("📄 Downloaded HTML content: {} characters", html_content.len());
+    // Basic HTML cleaning
+    let cleaned = clean_html(&html);
+    debug!("🧹 HTML content cleaned: {} characters", cleaned.len());
     
-    // Basic HTML cleanup - remove script tags, style tags, and HTML tags
-    let cleaned_content = clean_html_content(&html_content);
-    println!("🧹 Cleaned content: {} characters", cleaned_content.len());
-    
-    // Limit content length to prevent overwhelming the model
-    if cleaned_content.len() > 15000 {
-        println!("✂️ Content truncated from {} to 15000 characters", cleaned_content.len());
-        let truncated = safe_truncate_unicode(&cleaned_content, 15000);
-        Ok(format!("{}...\n\n[Content truncated due to length - original was {} characters]", truncated, cleaned_content.len()))
-    } else {
-        println!("✅ Content ready for processing: {} characters", cleaned_content.len());
-        Ok(cleaned_content)
-    }
+    Ok(cleaned)
 }
 
-// Function to safely truncate Unicode strings at character boundaries
-fn safe_truncate_unicode(s: &str, max_bytes: usize) -> &str {
-    if s.len() <= max_bytes {
-        return s;
-    }
+// Simple HTML cleaner
+fn clean_html(html: &str) -> String {
+    debug!("🧹 Cleaning HTML content...");
     
-    // Find the last character boundary before max_bytes
-    let mut boundary = max_bytes;
-    while boundary > 0 && !s.is_char_boundary(boundary) {
-        boundary -= 1;
-    }
-    
-    &s[..boundary]
-}
-
-// Function to clean HTML content
-fn clean_html_content(html: &str) -> String {
+    // Remove script and style tags
     let mut result = html.to_string();
     
-    // Remove script tags and their content
+    // Remove script tags
     while let Some(start) = result.find("<script") {
         if let Some(end) = result[start..].find("</script>") {
             result.replace_range(start..start + end + 9, "");
@@ -233,7 +392,7 @@ fn clean_html_content(html: &str) -> String {
         }
     }
     
-    // Remove style tags and their content
+    // Remove style tags
     while let Some(start) = result.find("<style") {
         if let Some(end) = result[start..].find("</style>") {
             result.replace_range(start..start + end + 8, "");
@@ -242,356 +401,212 @@ fn clean_html_content(html: &str) -> String {
         }
     }
     
-    // Remove HTML tags
-    let mut cleaned = String::new();
-    let mut inside_tag = false;
+    // Remove all HTML tags
+    let tag_regex = regex::Regex::new(r"<[^>]+>").unwrap();
+    let cleaned = tag_regex.replace_all(&result, " ");
     
-    for ch in result.chars() {
-        match ch {
-            '<' => inside_tag = true,
-            '>' => inside_tag = false,
-            _ if !inside_tag => cleaned.push(ch),
-            _ => {}
-        }
-    }
-    
-    // Clean up whitespace
-    let cleaned = cleaned
-        .lines()
-        .map(|line| line.trim())
-        .filter(|line| !line.is_empty())
+    // Clean whitespace
+    let final_result: String = cleaned
+        .split_whitespace()
         .collect::<Vec<_>>()
-        .join("\n");
+        .join(" ")
+        .chars()
+        .take(15000)
+        .collect();
     
-    // Remove multiple consecutive newlines
-    let mut result = String::new();
-    let mut newline_count = 0;
-    
-    for ch in cleaned.chars() {
-        if ch == '\n' {
-            newline_count += 1;
-            if newline_count <= 2 {
-                result.push(ch);
-            }
-        } else {
-            newline_count = 0;
-            result.push(ch);
-        }
-    }
-    
-    result.trim().to_string()
+    debug!("🧹 HTML cleaning complete: {} -> {} characters", html.len(), final_result.len());
+    final_result
 }
 
-// Multi-path text file loading function with robust error handling
-async fn load_text_file_multi_path(
-    filename: &str,
-    fallback_filename: &str,
-    description: &str,
-) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    let paths = [
-        filename.to_string(),
-        format!("../{}", filename),
-        format!("../../{}", filename),
-        format!("src/{}", filename),
-        fallback_filename.to_string(),
-        format!("../{}", fallback_filename),
-        format!("../../{}", fallback_filename),
-        format!("src/{}", fallback_filename),
-    ];
-    
-    for path in &paths {
-        match fs::read_to_string(path) {
-            Ok(content) => {
-                // Remove BOM if present
-                let content = content.strip_prefix('\u{feff}').unwrap_or(&content);
-                println!("✅ {} loaded from: {}", description, path);
-                return Ok(content.trim().to_string());
-            }
-            Err(_) => continue,
-        }
-    }
-    
-    println!("⚠️ {} not found, using built-in default", description);
-    
-    // Return default summarization prompt if no file found
-    let default_prompt = "You are an expert content summarizer. Your task is to analyze the provided webpage content and create a comprehensive, well-structured summary.\n\n\
-        Instructions:\n\
-        1. **Identify the main topic** and key points from the content\n\
-        2. **Summarize the key information** in a clear, logical structure\n\
-        3. **Highlight important facts, findings, or conclusions**\n\
-        4. **Use Discord formatting** with **bold** for headings and key terms\n\
-        5. **Keep the summary comprehensive but concise** (aim for 800-1500 characters)\n\
-        6. **Focus on the most valuable information** for the reader\n\
-        7. **Organize content logically** with clear structure\n\n\
-        Provide a summary that gives readers a clear understanding of the content without needing to read the full webpage.";
-    
-    Ok(default_prompt.to_string())
-}
-
-// Function to load summarization system prompt with multi-path fallback
-async fn load_summarization_prompt() -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    load_text_file_multi_path(
-        "summarization_prompt.txt",
-        "example_summarization_prompt.txt",
-        "Summarization system prompt"
-    ).await
-}
-
-// Function to stream summarization response using reasoning model with enhanced RAG
-async fn stream_summarization_response(
+// Stream summary using SSE (like lm command approach)
+async fn stream_summary(
     content: &str,
     url: &str,
     config: &LMConfig,
-    initial_msg: &mut Message,
+    msg: &mut Message,
     ctx: &Context,
-) -> Result<StreamingStats, Box<dyn std::error::Error + Send + Sync>> {
-    println!("🤖 Loading summarization prompt...");
+    is_youtube: bool,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     
-    // Load system prompt from file with fallback
-    let system_prompt = load_summarization_prompt().await?;
+    debug!("🤖 Preparing AI request...");    
     
-    println!("🔄 Preparing content for RAG processing...");
+    // Load appropriate system prompt from files
+    let system_prompt = if is_youtube {
+        load_youtube_summarization_prompt().await?
+    } else {
+        load_summarization_prompt().await?
+    };
     
-    // Enhanced RAG processing - chunk content if too large
-    let processed_content = if content.len() > 10000 {
-        println!("📄 Large content detected, applying RAG chunking...");
-        
-        // Extract key sections for better summarization
-        let chunks = chunk_content_for_rag(content, 5000);
-        println!("✂️ Content divided into {} chunks for RAG processing", chunks.len());
-        
-        // Process chunks and combine most relevant parts
-        let mut combined_content = String::new();
-        for (i, chunk) in chunks.iter().enumerate() {
-            combined_content.push_str(&format!("--- Section {} ---\n{}\n\n", i + 1, chunk));
-        }
-        combined_content
+    // Truncate content to prevent context overflow
+    let max_content_length = 20000;
+    let truncated_content = if content.len() > max_content_length {
+        format!("{} [Content truncated due to length]", &content[0..max_content_length])
     } else {
         content.to_string()
     };
     
-    println!("📝 Creating user prompt for summarization...");
-    
     let user_prompt = format!(
-        "Please summarize this webpage content from {}:\n\n---\n\n{}",
-        url, processed_content
+        "Please summarize this {} from {}:\n\n{}",
+        if is_youtube { "YouTube video transcript" } else { "webpage content" },
+        url,
+        truncated_content
     );
     
-    let messages = vec![
-        ChatMessage {
-            role: "system".to_string(),
-            content: system_prompt,
-        },
-        ChatMessage {
-            role: "user".to_string(),
-            content: user_prompt,
-        },
-    ];
+    debug!("📝 System prompt length: {} characters", system_prompt.len());
+    debug!("📝 User prompt length: {} characters", user_prompt.len());
     
-    // Use reasoning model for summarization
-    let model = &config.default_reason_model;
-    println!("🧠 Using reasoning model: {}", model);
+    let chunk_size = 8000;
+    let mut chunk_summaries = Vec::new();
+    let request_payload;
     
-    let request = ChatRequest {
-        model: model.clone(),
-        messages,
-        temperature: 0.3, // Lower temperature for more focused summaries
-        max_tokens: 1000,  // Limit tokens for Discord compatibility
-        stream: true,      // Enable streaming
-    };
+    if truncated_content.len() > chunk_size {
+        debug!("📄 Content too long ({} chars), using map-reduce RAG summarization", truncated_content.len());
+        let chunks: Vec<&str> = truncated_content.as_bytes().chunks(chunk_size).map(|c| std::str::from_utf8(c).unwrap()).collect();
+        for (i, chunk) in chunks.iter().enumerate() {
+            debug!("🤖 Summarizing chunk {} of {}", i+1, chunks.len());
+            let chunk_prompt = format!("Briefly summarize this content chunk:\n\n{}", chunk);
+            let chunk_messages = vec![
+                ChatMessage { role: "system".to_string(), content: "You are a concise summarizer.".to_string() },
+                ChatMessage { role: "user".to_string(), content: chunk_prompt }
+            ];
+            let chunk_summary = chat_completion(chunk_messages, &config.default_reason_model, config, Some(500)).await?;
+            chunk_summaries.push(chunk_summary);
+        }
+        // Combine chunk summaries for final prompt
+        let combined = chunk_summaries.join("\n\n");
+        let final_user_prompt = format!("Generate a comprehensive summary from these chunk summaries of the {} from {}:\n\n{}", if is_youtube { "YouTube video" } else { "webpage" }, url, combined);
+        let final_messages = vec![
+            ChatMessage { role: "system".to_string(), content: system_prompt.clone() },
+            ChatMessage { role: "user".to_string(), content: final_user_prompt }
+        ];
+        request_payload = serde_json::json!(
+            {
+                "model": config.default_reason_model,
+                "messages": final_messages,
+                "temperature": config.default_temperature,
+                "max_tokens": config.default_max_tokens,
+                "stream": true
+            }
+        );
+    } else {
+        let messages = vec![
+            ChatMessage {
+                role: "system".to_string(),
+                content: system_prompt,
+            },
+            ChatMessage {
+                role: "user".to_string(),
+                content: user_prompt,
+            },
+        ];
+        request_payload = serde_json::json!(
+            {
+                "model": config.default_reason_model,
+                "messages": messages,
+                "temperature": config.default_temperature,
+                "max_tokens": config.default_max_tokens,
+                "stream": true
+            }
+        );
+    }
     
-    println!("📡 Sending streaming request to reasoning model...");
-    
-    // Make streaming API request
+    // Create reqwest client
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(config.timeout))
+        .timeout(std::time::Duration::from_secs(60))
         .build()?;
     
-    let response = client
+    // Send streaming request
+    let mut response = client
         .post(&format!("{}/v1/chat/completions", config.base_url))
-        .json(&request)
+        .json(&request_payload)
         .send()
         .await?;
     
-    let status = response.status();
-    println!("📊 AI API Response Status: {}", status);
-    
-    if !status.is_success() {
-        let error_msg = format!("AI API request failed: {}", status);
-        println!("❌ {}", error_msg);
-        return Err(error_msg.into());
+    if !response.status().is_success() {
+        return Err(format!("API returned error: {}", response.status()).into());
     }
     
-    println!("✅ Starting to stream response from reasoning model");
+    let mut accumulated = String::new();
+    let start_time = Instant::now();
+    let mut last_update = Instant::now();
     
-    // Initialize message state
-    let mut state = MessageState {
-        current_content: format!("📄 **Webpage Summary**\n\n*Generating summary...*\n\n*Source: <{}>*", url),
-        current_message: initial_msg.clone(),
-        message_index: 1,
-        char_limit: config.max_discord_message_length - config.response_format_padding,
-    };
-    
-    // Process streaming response
-    let mut stats = StreamingStats {
-        total_characters: 0,
-        message_count: 1,
-    };
-    
-    let mut accumulated_content = String::new();
-    let mut last_update = std::time::Instant::now();
-    
-    // Update initial message
-    state.current_message.edit(ctx, |m| {
-        m.content(&state.current_content)
-    }).await?;
-    
-    let mut stream = response.bytes_stream();
-    let mut buffer = String::new();
-    
-    while let Some(item) = futures_util::stream::StreamExt::next(&mut stream).await {
-        match item {
-            Ok(chunk) => {
-                if let Ok(text) = String::from_utf8(chunk.to_vec()) {
-                    buffer.push_str(&text);
-                    
-                    // Process complete lines
-                    while let Some(line_end) = buffer.find('\n') {
-                        let line = buffer[..line_end].trim().to_string();
-                        buffer.drain(..line_end + 1);
-                        
-                        if line.starts_with("data: ") {
-                            let json_str = &line[6..];
-                            
-                            if json_str == "[DONE]" {
-                                println!("🏁 Streaming completed");
-                                break;
-                            }
-                            
-                            if let Ok(response) = serde_json::from_str::<ChatResponse>(json_str) {
-                                if let Some(choice) = response.choices.first() {
-                                    if let Some(delta) = &choice.delta {
-                                        if let Some(content) = &delta.content {
-                                            accumulated_content.push_str(content);
-                                            stats.total_characters += content.len();
-                                            
-                                            // Update Discord message periodically (every 0.8 seconds)
-                                            if last_update.elapsed() >= Duration::from_millis(800) {
-                                                update_summary_message(&mut state, &accumulated_content, ctx, config, url).await?;
-                                                last_update = std::time::Instant::now();
-                                            }
-                                        }
-                                    }
-                                    
-                                    if choice.finish_reason.is_some() {
-                                        println!("🏁 Streaming finished with reason: {:?}", choice.finish_reason);
-                                        break;
-                                    }
-                                }
-                            }
-                        }
+    while let Some(chunk) = response.chunk().await? {
+        let chunk_str = String::from_utf8_lossy(&chunk);
+        for line in chunk_str.lines() {
+            if line.starts_with("data: ") {
+                let data = &line[6..];
+                if data == "[DONE]" {
+                    break;
+                }
+                let stream_resp: StreamResponse = serde_json::from_str(data)?;
+                if let Some(choice) = stream_resp.choices.get(0) {
+                    if let Some(content) = &choice.delta.content {
+                        accumulated.push_str(content);
+                    }
+                    if choice.finish_reason.is_some() {
+                        break;
                     }
                 }
             }
-            Err(e) => {
-                println!("❌ Error reading stream: {}", e);
-                break;
+        }
+        // Periodic update to Discord every 5 seconds
+        if last_update.elapsed() > Duration::from_secs(5) {
+            msg.edit(ctx, |m| m.content(format!("🤖 Generating summary... ({}s)", start_time.elapsed().as_secs()))).await?;
+            last_update = Instant::now();
+        }
+    }
+    
+    // Strip <think> sections from full accumulated response
+    let re = Regex::new(r"(?s)<think>.*?</think>").unwrap();
+    let stripped = re.replace_all(&accumulated, "").to_string();
+    
+    debug!("📊 Final accumulated content: {} characters", stripped.len());
+    
+    // Final update
+    let final_message = format!(
+        "**{} Summary**\n\n{}\n\n*Source: <{}>*",
+        if is_youtube { "YouTube Video" } else { "Webpage" },
+        stripped.trim(),
+        url
+    );
+    
+    // Split if too long
+    if final_message.len() > config.max_discord_message_length - config.response_format_padding {
+        debug!("📄 Message too long, splitting into chunks...");        let chunks = split_message(&final_message, config.max_discord_message_length - config.response_format_padding);
+        debug!("📄 Split into {} chunks", chunks.len());
+        
+        for (i, chunk) in chunks.iter().enumerate() {
+            if i == 0 {
+                msg.edit(ctx, |m| m.content(chunk)).await?;
+            } else {
+                msg.channel_id.say(ctx, chunk).await?;
             }
         }
-    }
-    
-    // Final message update
-    finalize_summary_message(&mut state, &accumulated_content, ctx, config, url).await?;
-    
-    println!("📊 Streaming completed - Total characters: {}, Messages: {}", stats.total_characters, stats.message_count);
-    
-    Ok(stats)
-}
-
-// Function to update Discord message during streaming
-async fn update_summary_message(
-    state: &mut MessageState,
-    new_content: &str,
-    ctx: &Context,
-    _config: &LMConfig,
-    url: &str,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let formatted_content = format!("📄 **Webpage Summary**\n\n{}\n\n*Source: <{}>*", new_content, url);
-    
-    // Check if we need to create a new message
-    if formatted_content.len() > state.char_limit {
-        // Current message is getting too long, create a new one
-        let max_content_length = std::cmp::min(new_content.len(), state.char_limit - 100);
-        let summary_part = safe_truncate_unicode(new_content, max_content_length);
-        let final_content = format!("📄 **Webpage Summary (Part {})**\n\n{}\n\n*Source: <{}>*", state.message_index, summary_part, url);
-        
-        state.current_message.edit(ctx, |m| {
-            m.content(&final_content)
-        }).await?;
-        
-        // Create new message for remaining content
-        state.message_index += 1;
-        let remaining_content = &new_content[summary_part.len()..];
-        if !remaining_content.is_empty() {
-            let new_msg_content = format!("📄 **Webpage Summary (Part {})**\n\n{}", state.message_index, remaining_content);
-            let new_msg = state.current_message.channel_id.say(ctx, &new_msg_content).await?;
-            state.current_message = new_msg;
-            state.current_content = new_msg_content;
-        }
     } else {
-        // Update current message
-        state.current_content = formatted_content.clone();
-        state.current_message.edit(ctx, |m| {
-            m.content(&formatted_content)
-        }).await?;
+        msg.edit(ctx, |m| m.content(&final_message)).await?;
     }
     
     Ok(())
 }
 
-// Function to finalize the message after streaming is complete
-async fn finalize_summary_message(
-    state: &mut MessageState,
-    final_content: &str,
-    ctx: &Context,
-    _config: &LMConfig,
-    url: &str,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let formatted_content = if state.message_index > 1 {
-        format!("📄 **Webpage Summary (Part {})**\n\n{}\n\n*Source: <{}>*", state.message_index, final_content, url)
-    } else {
-        format!("📄 **Webpage Summary**\n\n{}\n\n*Source: <{}>*", final_content, url)
-    };
-    
-    // Final update to current message
-    state.current_message.edit(ctx, |m| {
-        m.content(&formatted_content)
-    }).await?;
-    
-    println!("✅ Summary finalized in {} message(s)", state.message_index);
-    
-    Ok(())
-}
-
-// Function to chunk content for RAG processing
-fn chunk_content_for_rag(content: &str, chunk_size: usize) -> Vec<String> {
+// Split long messages
+fn split_message(content: &str, max_len: usize) -> Vec<String> {
     let mut chunks = Vec::new();
-    let mut current_chunk = String::new();
+    let mut current = String::new();
     
-    for paragraph in content.split('\n') {
-        if current_chunk.len() + paragraph.len() > chunk_size && !current_chunk.is_empty() {
-            chunks.push(current_chunk.clone());
-            current_chunk = String::new();
+    for line in content.lines() {
+        if current.len() + line.len() + 1 > max_len && !current.is_empty() {
+            chunks.push(current.trim().to_string());
+            current = String::new();
         }
-        
-        if !current_chunk.is_empty() {
-            current_chunk.push('\n');
+        if !current.is_empty() {
+            current.push('\n');
         }
-        current_chunk.push_str(paragraph);
+        current.push_str(line);
     }
     
-    if !current_chunk.is_empty() {
-        chunks.push(current_chunk);
+    if !current.is_empty() {
+        chunks.push(current.trim().to_string());
     }
     
     chunks
@@ -602,59 +617,23 @@ mod tests {
     use super::*;
     
     #[test]
-    fn test_clean_html_content() {
-        let html = r#"<html><head><title>Test</title><script>alert('test');</script></head><body><h1>Hello</h1><p>World</p></body></html>"#;
-        let cleaned = clean_html_content(html);
-        assert!(cleaned.contains("Test"));
-        assert!(cleaned.contains("Hello"));
-        assert!(cleaned.contains("World"));
-        assert!(!cleaned.contains("script"));
-        assert!(!cleaned.contains("alert"));
-    }
-    
-    #[test]
-    fn test_html_tag_removal() {
-        let html = "<p>This is <strong>bold</strong> text</p>";
-        let cleaned = clean_html_content(html);
-        assert_eq!(cleaned, "This is bold text");
-    }
-    
-    #[test]
-    fn test_chunk_content_for_rag() {
-        let content = "Line 1\nLine 2\nLine 3\nLine 4\nLine 5\nLine 6";
-        let chunks = chunk_content_for_rag(content, 15);
-        assert!(chunks.len() > 1);
-        assert!(chunks.iter().all(|chunk| chunk.len() <= 20)); // Allow some flexibility
-    }
-    
-    #[test]
-    fn test_script_and_style_removal() {
-        let html = r#"<html><head><script>alert('test');</script><style>body{color:red;}</style></head><body>Content</body></html>"#;
-        let cleaned = clean_html_content(html);
-        assert!(cleaned.contains("Content"));
-        assert!(!cleaned.contains("alert"));
-        assert!(!cleaned.contains("color:red"));
-    }
-    
-    #[test]
-    fn test_safe_truncate_unicode() {
-        // Test with ASCII text
-        let ascii_text = "Hello, world!";
-        assert_eq!(safe_truncate_unicode(ascii_text, 5), "Hello");
-        assert_eq!(safe_truncate_unicode(ascii_text, 50), ascii_text);
+    fn test_clean_vtt() {
+        let vtt = r#"WEBVTT
+
+00:00:00.000 --> 00:00:03.000
+Hello world
+
+00:00:03.000 --> 00:00:06.000
+This is a test"#;
         
-        // Test with Unicode text (emojis and accented characters)
-        let unicode_text = "Hello 👋 café 🌟";
-        let truncated = safe_truncate_unicode(unicode_text, 10);
-        assert!(truncated.len() <= 10);
-        assert!(unicode_text.starts_with(truncated));
-        
-        // Test edge case: truncation point in middle of multi-byte character
-        let emoji_text = "🌟🌟🌟🌟🌟"; // Each emoji is 4 bytes
-        let truncated = safe_truncate_unicode(emoji_text, 6); // Should stop at 4 bytes (1 emoji)
-        assert_eq!(truncated, "🌟");
-        
-        // Test empty string
-        assert_eq!(safe_truncate_unicode("", 10), "");
+        let cleaned = clean_vtt_content(vtt);
+        assert_eq!(cleaned, "Hello world This is a test");
+    }
+    
+    #[test]
+    fn test_clean_html() {
+        let html = "<p>Hello <b>world</b></p><script>alert('test');</script>";
+        let cleaned = clean_html(html);
+        assert_eq!(cleaned, "Hello world");
     }
 } 

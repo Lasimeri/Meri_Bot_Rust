@@ -370,7 +370,7 @@ pub async fn load_summarize_search_prompt() -> Result<String, Box<dyn std::error
 }
 
 /// Non-streaming chat completion for AI query refinement and summarization
-async fn chat_completion(
+pub async fn chat_completion(
     messages: Vec<ChatMessage>,
     model: &str,
     config: &LMConfig,
@@ -381,7 +381,7 @@ async fn chat_completion(
     println!("🔗 Timeout: {} seconds", config.timeout);
     
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(config.timeout))
+        .timeout(std::time::Duration::from_secs(60))
         .build()?;
         
     let chat_request = ChatRequest {
