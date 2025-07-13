@@ -12,7 +12,7 @@ mod vis;
 use serenity::{
     async_trait,
     client::{Client, Context, EventHandler},
-    framework::standard::{StandardFramework, macros::group},
+    framework::standard::{StandardFramework, macros::group, Args, Delimiter},
     model::gateway::Ready,
     prelude::GatewayIntents,
     prelude::TypeMapKey,
@@ -161,69 +161,15 @@ impl EventHandler for Handler {
                 println!("[MAIN] User ID mention used in reply to {}", referenced.author.name);
                 println!("[MAIN] Prompt: '{}'", prompt);
                 
-                // Check for -v flag - use same attachment handling as lm -v command
+                // Check for -v flag - directly invoke lm command for proper handling
                 if prompt.starts_with("-v") || prompt.starts_with("--vision") {
-                    let vision_prompt = if prompt.starts_with("-v") {
-                        let after_flag = if prompt.starts_with("-v ") {
-                            &prompt[3..] // "-v "
-                        } else {
-                            &prompt[2..] // "-v"
-                        };
-                        after_flag.trim().to_string()
-                    } else {
-                        let after_flag = if prompt.starts_with("--vision ") {
-                            &prompt[9..] // "--vision "
-                        } else {
-                            &prompt[8..] // "--vision"
-                        };
-                        after_flag.trim().to_string()
-                    };
-                    
                     println!("[MAIN] Detected vision request in user ID mention");
                     println!("[MAIN] User {} requesting vision analysis", msg.author.name);
-                    println!("[MAIN] Vision prompt: '{}'", vision_prompt);
-                    println!("[MAIN] Current message attachments: {}", msg.attachments.len());
-                    println!("[MAIN] Referenced message attachments: {}", referenced.attachments.len());
+                    println!("[MAIN] Invoking lm command directly for proper reply and attachment handling");
                     
-                    // Check for empty prompt (same as lm -v)
-                    if vision_prompt.is_empty() {
-                        println!("[MAIN] Vision prompt is empty, returning error");
-                        let _ = msg.reply(&ctx, "Please provide a prompt for vision analysis! Usage: `^lm -v <prompt>` with image attached.").await;
-                        return;
-                    }
-                    
-                    // Check for attachments in current message first, then referenced message (same as lm -v)
-                    let attachment_to_process = if !msg.attachments.is_empty() {
-                        println!("[MAIN] Found {} attachments in current message", msg.attachments.len());
-                        Some(&msg.attachments[0])
-                    } else if !referenced.attachments.is_empty() {
-                        println!("[MAIN] No local attachments, found {} attachments in referenced message", referenced.attachments.len());
-                        Some(&referenced.attachments[0])
-                    } else {
-                        println!("[MAIN] No attachments found in current or referenced message");
-                        None
-                    };
-
-                    let attachment = match attachment_to_process {
-                        Some(att) => att,
-                        None => {
-                            println!("[MAIN] No image attachments found in current or referenced message");
-                            let _ = msg.reply(&ctx, "Please attach an image for vision analysis, or reply to a message with an image attachment.").await;
-                            return;
-                        }
-                    };
-
-                    let content_type = attachment.content_type.as_deref().unwrap_or("");
-                    println!("[MAIN] Found attachment: {} (content_type: {})", attachment.filename, content_type);
-
-                    if !content_type.starts_with("image/") {
-                        println!("[MAIN] Attachment is not an image, returning error");
-                        let _ = msg.reply(&ctx, "Attached file is not an image. Please attach a valid image file.").await;
-                        return;
-                    }
-
-                    println!("[MAIN] Calling vis::handle_vision_request...");
-                    if let Err(e) = crate::vis::handle_vision_request(&ctx, &msg, &vision_prompt, attachment).await {
+                    // Create Args from the prompt and call lm command directly
+                    let args = Args::new(&prompt, &[Delimiter::Single(' ')]);
+                    if let Err(e) = lm::lm(&ctx, &msg, args).await {
                         println!("[MAIN] Vision request failed with error: {}", e);
                         let _ = msg.reply(&ctx, format!("Vision analysis error: {}", e)).await;
                     } else {
@@ -267,74 +213,15 @@ impl EventHandler for Handler {
                     return;
                 }
                 
-                // Check for -v flag in direct mentions - use same attachment handling as lm -v command
+                // Check for -v flag in direct mentions - directly invoke lm command for proper handling
                 if prompt.starts_with("-v") || prompt.starts_with("--vision") {
-                    let vision_prompt = if prompt.starts_with("-v") {
-                        let after_flag = if prompt.starts_with("-v ") {
-                            &prompt[3..] // "-v "
-                        } else {
-                            &prompt[2..] // "-v"
-                        };
-                        after_flag.trim().to_string()
-                    } else {
-                        let after_flag = if prompt.starts_with("--vision ") {
-                            &prompt[9..] // "--vision "
-                        } else {
-                            &prompt[8..] // "--vision"
-                        };
-                        after_flag.trim().to_string()
-                    };
-                    
                     println!("[MAIN] Detected vision request in direct user ID mention");
                     println!("[MAIN] User {} requesting vision analysis", msg.author.name);
-                    println!("[MAIN] Vision prompt: '{}'", vision_prompt);
-                    println!("[MAIN] Current message attachments: {}", msg.attachments.len());
+                    println!("[MAIN] Invoking lm command directly for proper attachment handling");
                     
-                    // Check for empty prompt (same as lm -v)
-                    if vision_prompt.is_empty() {
-                        println!("[MAIN] Vision prompt is empty, returning error");
-                        let _ = msg.reply(&ctx, "Please provide a prompt for vision analysis! Usage: `^lm -v <prompt>` with image attached.").await;
-                        return;
-                    }
-                    
-                    // Check for attachments in current message first, then referenced message (same as lm -v)
-                    let attachment_to_process = if !msg.attachments.is_empty() {
-                        println!("[MAIN] Found {} attachments in current message", msg.attachments.len());
-                        Some(&msg.attachments[0])
-                    } else if let Some(referenced_msg) = &msg.referenced_message {
-                        println!("[MAIN] No local attachments, checking referenced message...");
-                        if !referenced_msg.attachments.is_empty() {
-                            println!("[MAIN] Found {} attachments in referenced message", referenced_msg.attachments.len());
-                            Some(&referenced_msg.attachments[0])
-                        } else {
-                            println!("[MAIN] No attachments found in referenced message");
-                            None
-                        }
-                    } else {
-                        println!("[MAIN] No attachments found and no referenced message");
-                        None
-                    };
-
-                    let attachment = match attachment_to_process {
-                        Some(att) => att,
-                        None => {
-                            println!("[MAIN] No image attachments found in current or referenced message");
-                            let _ = msg.reply(&ctx, "Please attach an image for vision analysis, or reply to a message with an image attachment.").await;
-                            return;
-                        }
-                    };
-
-                    let content_type = attachment.content_type.as_deref().unwrap_or("");
-                    println!("[MAIN] Found attachment: {} (content_type: {})", attachment.filename, content_type);
-
-                    if !content_type.starts_with("image/") {
-                        println!("[MAIN] Attachment is not an image, returning error");
-                        let _ = msg.reply(&ctx, "Attached file is not an image. Please attach a valid image file.").await;
-                        return;
-                    }
-
-                    println!("[MAIN] Calling vis::handle_vision_request...");
-                    if let Err(e) = crate::vis::handle_vision_request(&ctx, &msg, &vision_prompt, attachment).await {
+                    // Create Args from the prompt and call lm command directly
+                    let args = Args::new(&prompt, &[Delimiter::Single(' ')]);
+                    if let Err(e) = lm::lm(&ctx, &msg, args).await {
                         println!("[MAIN] Vision request failed with error: {}", e);
                         let _ = msg.reply(&ctx, format!("Vision analysis error: {}", e)).await;
                     } else {
