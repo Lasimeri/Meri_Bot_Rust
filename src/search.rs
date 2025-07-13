@@ -80,6 +80,7 @@ pub struct LMConfig {
     pub timeout: u64,
     pub default_model: String,
     pub default_reason_model: String,
+    pub default_vision_model: String,
     pub default_temperature: f32,
     pub default_max_tokens: i32,
     pub max_discord_message_length: usize,
@@ -87,7 +88,7 @@ pub struct LMConfig {
 }
 
 /// Chat message structure for AI API
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ChatMessage {
     pub role: String,
     pub content: String,
@@ -263,6 +264,7 @@ pub async fn load_lm_config() -> Result<LMConfig, Box<dyn std::error::Error + Se
         "LM_STUDIO_TIMEOUT", 
         "DEFAULT_MODEL",
         "DEFAULT_REASON_MODEL",
+        "DEFAULT_VISION_MODEL",
         "DEFAULT_TEMPERATURE",
         "DEFAULT_MAX_TOKENS",
         "MAX_DISCORD_MESSAGE_LENGTH",
@@ -287,6 +289,8 @@ pub async fn load_lm_config() -> Result<LMConfig, Box<dyn std::error::Error + Se
             .ok_or("DEFAULT_MODEL not found")?.clone(),
         default_reason_model: config_map.get("DEFAULT_REASON_MODEL")
             .ok_or("DEFAULT_REASON_MODEL not found")?.clone(),
+        default_vision_model: config_map.get("DEFAULT_VISION_MODEL")
+            .ok_or("DEFAULT_VISION_MODEL not found")?.clone(),
         default_temperature: config_map.get("DEFAULT_TEMPERATURE")
             .ok_or("DEFAULT_TEMPERATURE not found")?
             .parse()
@@ -306,6 +310,10 @@ pub async fn load_lm_config() -> Result<LMConfig, Box<dyn std::error::Error + Se
     };
 
     println!("🔍 Search module: Configuration loaded successfully from {}", config_source);
+    println!("🔍 Search module: Models configured:");
+    println!("🔍   - Default Model: {}", config.default_model);
+    println!("🔍   - Reason Model: {}", config.default_reason_model);
+    println!("🔍   - Vision Model: {}", config.default_vision_model);
     Ok(config)
 }
 

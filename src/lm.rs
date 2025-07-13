@@ -2,54 +2,88 @@ use serenity::{
     client::Context,
     framework::standard::{macros::command, Args, CommandResult},
     model::channel::Message,
+    model::channel::Attachment,
 };
 use serde::{Deserialize, Serialize};
 use std::fs;
+use std::path::Path;
 use futures_util::StreamExt;
 use crate::search::{
     load_lm_config, perform_ai_enhanced_search, LMConfig, ChatMessage
 };
 use crate::LmContextMap; // TypeMap key defined in main.rs
+use mime_guess::MimeGuess;
+use std::io::Write;
+use uuid::Uuid;
+use serenity::model::id::UserId;
 
 // Structure to track streaming statistics
 #[derive(Debug)]
-struct StreamingStats {
-    total_characters: usize,
-    message_count: usize,
+pub struct StreamingStats {
+    pub total_characters: usize,
+    pub message_count: usize,
 }
 
 // Structure to track current message state during streaming
-struct MessageState {
-    current_content: String,
-    current_message: Message,
-    message_index: usize,
-    char_limit: usize,
+pub struct MessageState {
+    pub current_content: String,
+    pub current_message: Message,
+    pub message_index: usize,
+    pub char_limit: usize,
+}
+
+// Enhanced ChatMessage structure for multimodal content
+#[derive(Serialize, Deserialize, Clone)]
+pub struct MultimodalChatMessage {
+    pub role: String,
+    pub content: Vec<MessageContent>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(untagged)]
+pub enum MessageContent {
+    Text { #[serde(rename = "type")] content_type: String, text: String },
+    Image { #[serde(rename = "type")] content_type: String, image_url: ImageUrl },
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct ImageUrl {
+    pub url: String,
+}
+
+// Document processing result
+#[derive(Debug)]
+struct ProcessedDocument {
+    pub filename: String,
+    pub content: String,
+    pub content_type: String,
+    pub size: usize,
 }
 
 // API Request/Response structures for streaming
 #[derive(Serialize)]
-struct ChatRequest {
-    model: String,
-    messages: Vec<ChatMessage>,
-    temperature: f32,
-    max_tokens: i32,
-    stream: bool,
+pub struct ChatRequest {
+    pub model: String,
+    pub messages: Vec<MultimodalChatMessage>,
+    pub temperature: f32,
+    pub max_tokens: i32,
+    pub stream: bool,
 }
 
 #[derive(Deserialize)]
-struct ChatResponse {
-    choices: Vec<Choice>,
+pub struct ChatResponse {
+    pub choices: Vec<Choice>,
 }
 
 #[derive(Deserialize)]
-struct Choice {
-    delta: Option<Delta>,
-    finish_reason: Option<String>,
+pub struct Choice {
+    pub delta: Option<Delta>,
+    pub finish_reason: Option<String>,
 }
 
 #[derive(Deserialize)]
-struct Delta {
-    content: Option<String>,
+pub struct Delta {
+    pub content: Option<String>,
 }
 
 #[command]
@@ -60,18 +94,28 @@ pub async fn lm(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
     // Start typing indicator
     let _typing = ctx.http.start_typing(msg.channel_id.0)?;
     
+    // IMPORTANT: Check for vision flag BEFORE processing reply logic
+    // This ensures we detect -v flag even in replies
+    let is_vision_request = input.starts_with("-v") || input.starts_with("--vision");
+    let original_input = input.clone(); // Store original input for vision processing
+    
     // Check if this is a reply and handle it appropriately
     if let Some(referenced_message) = &msg.referenced_message {
         println!("LM command: Detected reply to message from {}", referenced_message.author.name);
         
-        // If the reply has no content, use the referenced message content as the prompt
-        if input.is_empty() {
-            input = referenced_message.content.clone();
-            println!("LM command: Using referenced message content as prompt: {}", input);
+        // Only modify input for non-vision requests
+        if !is_vision_request {
+            // If the reply has no content, use the referenced message content as the prompt
+            if input.is_empty() {
+                input = referenced_message.content.clone();
+                println!("LM command: Using referenced message content as prompt: {}", input);
+            } else {
+                // If the reply has content, combine it with the referenced message
+                input = format!("Original message: {}\n\nYour response: {}", referenced_message.content, input);
+                println!("LM command: Combined referenced message with reply content");
+            }
         } else {
-            // If the reply has content, combine it with the referenced message
-            input = format!("Original message: {}\n\nYour response: {}", referenced_message.content, input);
-            println!("LM command: Combined referenced message with reply content");
+            println!("LM command: Vision request detected in reply - keeping original input: '{}'", original_input);
         }
     }
     
@@ -192,15 +236,123 @@ pub async fn lm(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
         return Ok(());
     }
 
+    // Handle vision flag - use original input to preserve the flag
+    if is_vision_request {
+        println!("[LM] Vision flag detected in original input: '{}'", original_input);
+        
+        let vision_prompt = if original_input.starts_with("-v") {
+            let after_flag = if original_input.starts_with("-v ") {
+                &original_input[3..] // "-v "
+            } else {
+                &original_input[2..] // "-v"
+            };
+            after_flag.trim().to_string()
+        } else {
+            let after_flag = if original_input.starts_with("--vision ") {
+                &original_input[9..] // "--vision "
+            } else {
+                &original_input[8..] // "--vision"
+            };
+            after_flag.trim().to_string()
+        };
+        
+        println!("[LM] Extracted vision prompt: '{}'", vision_prompt);
+
+        if vision_prompt.is_empty() {
+            println!("[LM] Vision prompt is empty, returning error");
+            msg.reply(ctx, "Please provide a prompt for vision analysis! Usage: `^lm -v <prompt>` with image attached.").await?;
+            return Ok(());
+        }
+
+        // Check for attachments in current message first
+        let attachment_to_process = if !msg.attachments.is_empty() {
+            println!("[LM] Found {} attachments in current message", msg.attachments.len());
+            Some(&msg.attachments[0])
+        } else if let Some(referenced_msg) = &msg.referenced_message {
+            println!("[LM] No local attachments, checking referenced message...");
+            if !referenced_msg.attachments.is_empty() {
+                println!("[LM] Found {} attachments in referenced message", referenced_msg.attachments.len());
+                Some(&referenced_msg.attachments[0])
+            } else {
+                println!("[LM] No attachments found in referenced message");
+                None
+            }
+        } else {
+            println!("[LM] No attachments found and no referenced message");
+            None
+        };
+
+        let attachment = match attachment_to_process {
+            Some(att) => att,
+            None => {
+                println!("[LM] No image attachments found in current or referenced message");
+                msg.reply(ctx, "Please attach an image for vision analysis, or reply to a message with an image attachment.").await?;
+                return Ok(());
+            }
+        };
+
+        let content_type = attachment.content_type.as_deref().unwrap_or("");
+        println!("[LM] Found attachment: {} (content_type: {})", attachment.filename, content_type);
+
+        if !content_type.starts_with("image/") {
+            println!("[LM] Attachment is not an image, returning error");
+            msg.reply(ctx, "Attached file is not an image. Please attach a valid image file.").await?;
+            return Ok(());
+        }
+
+        println!("[LM] Calling vis::handle_vision_request...");
+        if let Err(e) = crate::vis::handle_vision_request(ctx, msg, &vision_prompt, attachment).await {
+            println!("[LM] Vision request failed with error: {}", e);
+            msg.reply(ctx, format!("Vision analysis error: {}", e)).await?;
+        } else {
+            println!("[LM] Vision request completed successfully");
+        }
+
+        return Ok(());
+    }
+
     // Regular AI chat functionality
     let prompt = input;
+    
+    // Process attachments for RAG if any
+    let mut processed_documents = Vec::new();
+    if !msg.attachments.is_empty() {
+        println!("[RAG] Found {} attachments, processing for document analysis", msg.attachments.len());
+        
+        match process_attachments(&msg.attachments, ctx).await {
+            Ok(docs) => {
+                processed_documents = docs;
+                println!("[RAG] Successfully processed {} documents", processed_documents.len());
+            }
+            Err(e) => {
+                eprintln!("[RAG] Failed to process attachments: {}", e);
+                msg.reply(ctx, &format!("⚠️ Failed to process some attachments: {}\n\nContinuing with text-only analysis.", e)).await?;
+            }
+        }
+    }
+    
+    // Create RAG-enhanced prompt if documents were processed
+    let final_prompt = if !processed_documents.is_empty() {
+        create_rag_prompt(&prompt, &processed_documents)
+    } else {
+        prompt.clone()
+    };
 
-    // Record user prompt in per-user context history
+    // Record user prompt in per-user context history (store original prompt, not RAG-enhanced)
     {
         let mut data_map = ctx.data.write().await;
-        let lm_map = data_map.get_mut::<LmContextMap>().expect("LM context map not initialized");
-        let history = lm_map.entry(msg.author.id).or_insert_with(Vec::new);
-        history.push(ChatMessage { role: "user".to_string(), content: prompt.to_string() });
+        
+        // Scoped for lm_map
+        {
+            let lm_map = data_map.get_mut::<LmContextMap>().expect("LM context map not initialized");
+            let history = lm_map.entry(msg.author.id).or_insert_with(Vec::new);
+            history.push(ChatMessage { role: "user".to_string(), content: prompt.to_string() });
+            
+            // Limit history
+            if history.len() > 50 {
+                history.drain(0..history.len()-50);
+            }
+        }
     }
 
     // Load LM Studio configuration
@@ -214,7 +366,7 @@ pub async fn lm(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
     };
 
     // Load system prompt
-    let system_prompt = match load_system_prompt().await {
+    let base_system_prompt = match load_system_prompt().await {
         Ok(prompt) => prompt,
         Err(e) => {
             eprintln!("Failed to load system prompt: {}", e);
@@ -225,47 +377,65 @@ pub async fn lm(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
 
     // Build message list including system prompt and per-user history
     let mut messages = Vec::new();
-    messages.push(ChatMessage { role: "system".to_string(), content: system_prompt });
+    messages.push(ChatMessage { role: "system".to_string(), content: base_system_prompt });
     {
         let data_map = ctx.data.read().await;
-        let lm_map = data_map.get::<LmContextMap>().expect("LM context map not initialized");
-        if let Some(history) = lm_map.get(&msg.author.id) {
-            println!("LM command: Including {} context messages for user {}", history.len(), msg.author.name);
-            for entry in history.iter() {
-                messages.push(entry.clone());
+        if let Some(lm_map) = data_map.get::<LmContextMap>() {
+            if let Some(history) = lm_map.get(&msg.author.id) {
+                for entry in history.iter() {
+                    messages.push(entry.clone());
+                }
             }
-        } else {
-            println!("LM command: No context history found for user {}", msg.author.name);
         }
     }
+    
+    // Add the current user message with RAG-enhanced content
+    messages.push(ChatMessage { role: "user".to_string(), content: final_prompt });
+
+    // Convert to multimodal format
+    let multimodal_messages = convert_to_multimodal(messages);
 
     // Log which model is being used for LM command
     println!("LM command: Using model '{}' for chat", config.default_model);
+    if !processed_documents.is_empty() {
+        println!("[RAG] Using document-enhanced prompt with {} documents", processed_documents.len());
+    }
 
     // Stream the response with real-time Discord post editing
     let mut current_msg = msg.channel_id.send_message(&ctx.http, |m| {
-        m.content("**AI Response (Part 1):**\n```\n\n```")
+        let content = if !processed_documents.is_empty() {
+            format!("**AI Response (Document Analysis - Part 1):**\n```\n\n```")
+        } else {
+            "**AI Response (Part 1):**\n```\n\n```".to_string()
+        };
+        m.content(content)
     }).await?;
 
     // Ensure current_msg is in scope for this match
-    match stream_chat_response(messages, &config.default_model, &config, ctx, &mut current_msg).await {
+    match stream_chat_response(multimodal_messages, &config.default_model, &config, ctx, &mut current_msg).await {
         Ok(final_stats) => {
             println!("LM command: Streaming complete - {} total characters across {} messages", 
                 final_stats.total_characters, final_stats.message_count);
             
             // Record AI response in per-user context history
             let response_content = current_msg.content.clone();
-            let mut data_map = ctx.data.write().await;
-            let lm_map = data_map.get_mut::<LmContextMap>().expect("LM context map not initialized");
-            if let Some(history) = lm_map.get_mut(&msg.author.id) {
-                history.push(ChatMessage { 
-                    role: "assistant".to_string(), 
-                    content: response_content 
-                });
+            {
+                let mut data_map = ctx.data.write().await;
                 
-                // Limit history to last 10 messages to prevent token overflow
-                if history.len() > 10 {
-                    history.drain(0..history.len()-10);
+                // Scoped for lm_map
+                {
+                    let lm_map = data_map.get_mut::<LmContextMap>().expect("LM context map not initialized");
+                    if let Some(history) = lm_map.get_mut(&msg.author.id) {
+                        history.push(ChatMessage { 
+                            role: "assistant".to_string(), 
+                            content: response_content.clone()
+                        });
+                        
+                        // Limit history
+                        if history.len() > 50 {
+                            history.drain(0..history.len()-50);
+                        }
+                    }
                 }
             }
         }
@@ -280,9 +450,198 @@ pub async fn lm(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
     Ok(())
 }
 
+#[command]
+#[aliases("clearlm", "resetlm")]
+pub async fn clearcontext(ctx: &Context, msg: &Message, _args: Args) -> CommandResult {
+    // Clear the user's LM chat context robustly
+    let mut data_map = ctx.data.write().await;
+    let lm_map = data_map.get_mut::<LmContextMap>().expect("LM context map not initialized");
+    
+    let user_id = msg.author.id;
+    let had_context = lm_map.remove(&user_id).is_some();
+    // Defensive: also try as string key if ever used (shouldn't be, but for robustness)
+    // (Uncomment if you ever use string keys)
+    // let _ = lm_map.remove(&user_id.to_string());
+    
+    println!("[clearcontext] Cleared context for user {} (had_context={})", user_id, had_context);
+    
+    if had_context {
+        msg.reply(ctx, "**LM Chat Context Cleared** ✅\nYour conversation history with the AI has been fully reset. The next message you send will start a brand new context.").await?;
+    } else {
+        msg.reply(ctx, "**No Context Found** ℹ️\nYou don't have any active conversation history to clear. Start a conversation with `^lm <your message>`.\n\nIf you believe context is still being used, please report this as a bug.").await?;
+    }
+    
+    Ok(())
+}
+
+// Process Discord attachments for RAG
+async fn process_attachments(
+    attachments: &[Attachment],
+    ctx: &Context,
+) -> Result<Vec<ProcessedDocument>, Box<dyn std::error::Error + Send + Sync>> {
+    let mut processed_docs = Vec::new();
+    
+    for attachment in attachments {
+        let content_type = attachment.content_type.as_deref().unwrap_or("unknown");
+        let size = attachment.size as usize;
+        
+        println!("[RAG] Processing attachment: {} ({} bytes, MIME: {})", 
+            attachment.filename, size, content_type);
+        
+        // Check if the attachment is a supported format
+        if !is_supported_format(content_type, &attachment.filename) {
+            println!("[RAG] Skipping unsupported format: {}", content_type);
+            continue;
+        }
+        
+        // Download the attachment
+        let temp_file = format!("temp_{}_{}", Uuid::new_v4(), attachment.filename);
+        let temp_path = Path::new(&temp_file);
+        
+        println!("[RAG] Downloading attachment to: {}", temp_file);
+        
+        // Download the file
+        let response = reqwest::get(&attachment.url).await?;
+        let bytes = response.bytes().await?;
+        
+        // Write to temporary file
+        let mut file = std::fs::File::create(temp_path)?;
+        file.write_all(&bytes)?;
+        drop(file); // Close the file
+        
+        // Process the document based on its type
+        let content = match extract_document_content(temp_path, content_type).await {
+            Ok(content) => content,
+            Err(e) => {
+                println!("[RAG] Failed to extract content from {}: {}", attachment.filename, e);
+                // Clean up temp file
+                let _ = std::fs::remove_file(temp_path);
+                continue;
+            }
+        };
+        
+        // Clean up temp file
+        let _ = std::fs::remove_file(temp_path);
+        
+        if !content.trim().is_empty() {
+            processed_docs.push(ProcessedDocument {
+                filename: attachment.filename.clone(),
+                content: content.clone(),
+                content_type: content_type.to_string(),
+                size: size as usize,
+            });
+            println!("[RAG] Successfully processed {}: {} characters", 
+                attachment.filename, content.len());
+        }
+    }
+    
+    Ok(processed_docs)
+}
+
+// Check if a file format is supported for processing
+fn is_supported_format(content_type: &str, filename: &str) -> bool {
+    let supported_types = [
+        "text/plain", "text/markdown", "text/csv", "text/html",
+        "application/pdf", "application/json", "application/xml",
+        "image/jpeg", "image/png", "image/gif", "image/webp"
+    ];
+    
+    let supported_extensions = [
+        ".txt", ".md", ".csv", ".html", ".htm", ".json", ".xml",
+        ".pdf", ".jpg", ".jpeg", ".png", ".gif", ".webp"
+    ];
+    
+    // Check MIME type
+    if supported_types.iter().any(|&t| content_type.starts_with(t)) {
+        return true;
+    }
+    
+    // Check file extension as fallback
+    let lower_filename = filename.to_lowercase();
+    supported_extensions.iter().any(|ext| lower_filename.ends_with(ext))
+}
+
+// Extract content from different document types
+async fn extract_document_content(
+    file_path: &Path,
+    content_type: &str,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    match content_type {
+        "text/plain" | "text/markdown" | "text/csv" | "text/html" | "application/json" | "application/xml" => {
+            // Text-based files
+            let content = std::fs::read_to_string(file_path)?;
+            Ok(content)
+        },
+        "application/pdf" => {
+            // PDF files
+            extract_pdf_content(file_path).await
+        },
+        content_type if content_type.starts_with("image/") => {
+            // Image files - for now, just return a placeholder
+            // In a full implementation, you'd use OCR or image analysis
+            Ok(format!("[Image file: {} - Content analysis not yet implemented]", 
+                file_path.file_name().unwrap_or_default().to_string_lossy()))
+        },
+        _ => {
+            // Try to read as text anyway
+            match std::fs::read_to_string(file_path) {
+                Ok(content) => Ok(content),
+                Err(_) => Err("Unsupported file format".into())
+            }
+        }
+    }
+}
+
+// Extract text content from PDF files
+async fn extract_pdf_content(file_path: &Path) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    use pdf_extract::extract_text;
+    
+    let content = extract_text(file_path)?;
+    Ok(content)
+}
+
+// Convert regular ChatMessage to MultimodalChatMessage
+fn convert_to_multimodal(messages: Vec<ChatMessage>) -> Vec<MultimodalChatMessage> {
+    messages.into_iter().map(|msg| MultimodalChatMessage {
+        role: msg.role,
+        content: vec![MessageContent::Text {
+            content_type: "text".to_string(),
+            text: msg.content,
+        }],
+    }).collect()
+}
+
+// Create RAG-enhanced prompt with document context
+fn create_rag_prompt(user_prompt: &str, documents: &[ProcessedDocument]) -> String {
+    if documents.is_empty() {
+        return user_prompt.to_string();
+    }
+    
+    let mut context = String::new();
+    context.push_str("**Document Context:**\n\n");
+    
+    for (i, doc) in documents.iter().enumerate() {
+        context.push_str(&format!("**Document {}: {}**\n", i + 1, doc.filename));
+        context.push_str(&format!("Type: {}\n", doc.content_type));
+        context.push_str(&format!("Size: {} characters\n\n", doc.content.len()));
+        
+        // Truncate very long documents to prevent token overflow
+        let content = if doc.content.len() > 8000 {
+            format!("{}... [Content truncated due to length]", &doc.content[..8000])
+        } else {
+            doc.content.clone()
+        };
+        
+        context.push_str(&format!("Content:\n{}\n\n", content));
+    }
+    
+    format!("{}\n\n**User Question:** {}\n\nPlease analyze the provided documents and answer the user's question based on the content.", 
+        context, user_prompt)
+}
+
 // Main streaming function that handles real-time response with Discord message editing for chat
-async fn stream_chat_response(
-    messages: Vec<ChatMessage>,
+pub async fn stream_chat_response(
+    messages: Vec<MultimodalChatMessage>,
     model: &str,
     config: &LMConfig,
     ctx: &Context,
@@ -459,7 +818,7 @@ async fn stream_chat_response(
 
 // Helper function to update Discord message with new content for chat
 #[allow(unused_variables)]
-async fn update_chat_message(
+pub async fn update_chat_message(
     state: &mut MessageState,
     new_content: &str,
     ctx: &Context,
@@ -507,7 +866,7 @@ async fn update_chat_message(
 
 // Helper function to finalize message content at the end of streaming for chat
 #[allow(unused_variables)]
-async fn finalize_chat_message(
+pub async fn finalize_chat_message(
     state: &mut MessageState,
     remaining_content: &str,
     ctx: &Context,
@@ -596,5 +955,134 @@ mod tests {
             }
         }
     }
+}
+
+pub async fn handle_lm_request(
+    ctx: &Context,
+    msg: &Message,
+    input: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    println!("[HANDLE_LM] Processing input: '{}'", input);
+    
+    // Check if this is a vision request
+    if input.starts_with("-v") || input.starts_with("--vision") {
+        println!("[HANDLE_LM] Detected vision request, delegating to vision handling");
+        
+        let vision_prompt = if input.starts_with("-v") {
+            let after_flag = if input.starts_with("-v ") {
+                &input[3..] // "-v "
+            } else {
+                &input[2..] // "-v"
+            };
+            after_flag.trim().to_string()
+        } else {
+            let after_flag = if input.starts_with("--vision ") {
+                &input[9..] // "--vision "
+            } else {
+                &input[8..] // "--vision"
+            };
+            after_flag.trim().to_string()
+        };
+        
+        println!("[HANDLE_LM] Extracted vision prompt: '{}'", vision_prompt);
+        
+        if vision_prompt.is_empty() {
+            println!("[HANDLE_LM] Vision prompt is empty, returning error");
+            msg.reply(ctx, "Please provide a prompt for vision analysis! Usage: `^lm -v <prompt>` with image attached.").await?;
+            return Ok(());
+        }
+
+        // Enhanced attachment detection with more debugging
+        println!("[HANDLE_LM] Checking for attachments...");
+        println!("[HANDLE_LM] Current message attachments: {}", msg.attachments.len());
+        
+        let attachment_to_process = if !msg.attachments.is_empty() {
+            println!("[HANDLE_LM] Found {} attachments in current message", msg.attachments.len());
+            for (i, att) in msg.attachments.iter().enumerate() {
+                println!("[HANDLE_LM] Attachment {}: {} ({})", i, att.filename, att.content_type.as_deref().unwrap_or("unknown"));
+            }
+            Some(&msg.attachments[0])
+        } else {
+            println!("[HANDLE_LM] No attachments in current message");
+            if let Some(referenced_msg) = &msg.referenced_message {
+                println!("[HANDLE_LM] Checking referenced message from user: {}", referenced_msg.author.name);
+                println!("[HANDLE_LM] Referenced message attachments: {}", referenced_msg.attachments.len());
+                
+                if !referenced_msg.attachments.is_empty() {
+                    println!("[HANDLE_LM] Found {} attachments in referenced message", referenced_msg.attachments.len());
+                    for (i, att) in referenced_msg.attachments.iter().enumerate() {
+                        println!("[HANDLE_LM] Referenced attachment {}: {} ({})", i, att.filename, att.content_type.as_deref().unwrap_or("unknown"));
+                    }
+                    Some(&referenced_msg.attachments[0])
+                } else {
+                    println!("[HANDLE_LM] No attachments found in referenced message");
+                    None
+                }
+            } else {
+                println!("[HANDLE_LM] No referenced message found");
+                None
+            }
+        };
+
+        let attachment = match attachment_to_process {
+            Some(att) => {
+                println!("[HANDLE_LM] Using attachment: {} ({})", att.filename, att.content_type.as_deref().unwrap_or("unknown"));
+                att
+            },
+            None => {
+                println!("[HANDLE_LM] No image attachments found in current or referenced message");
+                msg.reply(ctx, "Please attach an image for vision analysis, or reply to a message with an image attachment.").await?;
+                return Ok(());
+            }
+        };
+
+        let content_type = attachment.content_type.as_deref().unwrap_or("");
+        println!("[HANDLE_LM] Checking content type: '{}'", content_type);
+        
+        if !content_type.starts_with("image/") {
+            println!("[HANDLE_LM] Attachment is not an image, returning error");
+            msg.reply(ctx, "Attached file is not an image. Please attach a valid image file.").await?;
+            return Ok(());
+        }
+
+        println!("[HANDLE_LM] Calling vision handler for attachment: {}", attachment.filename);
+        return crate::vis::handle_vision_request(ctx, msg, &vision_prompt, attachment).await;
+    }
+    
+    // Regular LM handling
+    println!("[HANDLE_LM] Processing as regular LM request");
+    let config = load_lm_config().await?;
+    let base_system_prompt = load_system_prompt().await?;
+    let mut messages = Vec::new();
+    messages.push(ChatMessage { role: "system".to_string(), content: base_system_prompt });
+    {
+        let data_map = ctx.data.read().await;
+        if let Some(lm_map) = data_map.get::<LmContextMap>() {
+            if let Some(history) = lm_map.get(&msg.author.id) {
+                for entry in history.iter() {
+                    messages.push(entry.clone());
+                }
+            }
+        }
+    }
+    messages.push(ChatMessage { role: "user".to_string(), content: input.to_string() });
+    let multimodal_messages = convert_to_multimodal(messages);
+    let mut initial_msg = msg.channel_id.send_message(&ctx.http, |m| {
+        m.content("**AI Response (Part 1):**\n```\n\n```")
+    }).await?;
+    let _stats = stream_chat_response(multimodal_messages, &config.default_model, &config, ctx, &mut initial_msg).await?;
+    // Record response in history (similar to lm)
+    let response_content = initial_msg.content.clone();
+    {
+        let mut data_map = ctx.data.write().await;
+        let lm_map = data_map.get_mut::<LmContextMap>().expect("LM context map not initialized");
+        if let Some(history) = lm_map.get_mut(&msg.author.id) {
+            history.push(ChatMessage { role: "assistant".to_string(), content: response_content });
+            if history.len() > 50 {
+                history.drain(0..history.len()-50);
+            }
+        }
+    }
+    Ok(())
 }
 

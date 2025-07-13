@@ -2,6 +2,7 @@
 /target/
 **/*.rs.bk
 *.pdb
+Cargo.lock
 
 # Bot configuration files containing sensitive information
 botconfig.txt
@@ -15,6 +16,8 @@ reasoning_search_analysis_prompt.txt
 refine_search_prompt.txt
 summarize_search_prompt.txt
 summarization_prompt.txt
+youtube_prompt_generation_prompt.txt
+youtube_summarization_prompt.txt
 lmapiconf.txt
 !example_lmapiconf.txt
 !example_system_prompt.txt
@@ -23,6 +26,8 @@ lmapiconf.txt
 !example_refine_search_prompt.txt
 !example_summarize_search_prompt.txt
 !example_summarization_prompt.txt
+!example_youtube_prompt_generation_prompt.txt
+!example_youtube_summarization_prompt.txt
 
 # Environment files
 .env
@@ -30,11 +35,24 @@ lmapiconf.txt
 *.env
 !.env.example
 
+# Temporary files and caches
+temp_*
+*.tmp
+*.temp
+/tmp/
+temp_image_*
+temp_video_*
+.cache/
+cache/
+
 # Log files and debugging output
 *.log
 logs/
 debug/
 crash-*.txt
+error.log
+discord.log
+bot.log
 
 # OS generated files
 .DS_Store
@@ -54,7 +72,55 @@ $RECYCLE.BIN/
 *.swo
 *~
 .vimrc
-.vim/
+.nvimrc
+
+# Package manager files
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+package-lock.json
+yarn.lock
+
+# Python (for yt-dlp and dependencies)
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Backup files
+*.bak
+*.backup
+*.old
+*.orig
+*.save
+
+# Test files
+test_*
+tests/
+testing/
+*.test
+coverage/
+
+# Documentation generated files
+docs/_build/
+site/
 
 # Development and testing files
 *.orig
@@ -62,32 +128,38 @@ $RECYCLE.BIN/
 *.patch
 .coverage
 .nyc_output
-node_modules/
 test_config.rs
 test_config.exe
-*.test
-
-# Temporary files
-*.tmp
-*.temp
-*.bak
-*.backup
-*~
-\#*\#
-.\#*
 
 # YouTube transcript and yt-dlp temporary files
 yt_transcript_*
 test_transcript*
-.vtt
+*.vtt
 *.srt
 *.ass
 *.ssa
-vtt
 *.mp3
 *.m4a
 *.webm
 *.mp4
+
+# Video/Audio files
+*.avi
+*.mov
+*.flv
+*.wmv
+*.wav
+*.flac
+*.ogg
+
+# Archive files
+*.zip
+*.tar
+*.gz
+*.bz2
+*.xz
+*.7z
+*.rar
 
 # Profiling and debugging
 *.prof

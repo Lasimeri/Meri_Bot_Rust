@@ -9,6 +9,13 @@ use serde::{Deserialize, Serialize};
 use futures_util::StreamExt;
 use crate::search::{LMConfig, ChatMessage};
 use crate::ReasonContextMap; // TypeMap key defined in main.rs
+use regex::Regex;
+use once_cell::sync::Lazy;
+
+// Compile regex once for better performance
+static THINKING_TAG_REGEX: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"<think>.*?</think>").unwrap()
+});
 
 // Structures for streaming API responses
 #[derive(Deserialize)]
@@ -287,7 +294,8 @@ async fn load_reasoning_config() -> Result<LMConfig, Box<dyn std::error::Error +
         "DEFAULT_TEMPERATURE",
         "DEFAULT_MAX_TOKENS",
         "MAX_DISCORD_MESSAGE_LENGTH",
-        "RESPONSE_FORMAT_PADDING"
+        "RESPONSE_FORMAT_PADDING",
+        "DEFAULT_VISION_MODEL",
     ];
     
     for key in &required_keys {
@@ -324,6 +332,8 @@ async fn load_reasoning_config() -> Result<LMConfig, Box<dyn std::error::Error +
             .ok_or("RESPONSE_FORMAT_PADDING not found")?
             .parse()
             .map_err(|_| "Invalid RESPONSE_FORMAT_PADDING value")?,
+        default_vision_model: config_map.get("DEFAULT_VISION_MODEL")
+            .ok_or("DEFAULT_VISION_MODEL not found")?.clone(),
     };
 
     println!("Reasoning command: Successfully loaded config from {} with reasoning model: '{}'", config_source, config.default_reason_model);
@@ -360,35 +370,13 @@ async fn load_reasoning_system_prompt() -> Result<String, Box<dyn std::error::Er
 }
 
 // Helper function to filter out <think>...</think> tags and their content
+// Optimized thinking tag filter using regex for better performance
 fn filter_thinking_tags(content: &str) -> String {
-    let mut result = String::new();
-    let mut remaining = content;
-    
-    loop {
-        // Find the start of a thinking block
-        if let Some(think_start) = remaining.find("<think>") {
-            // Add everything before the thinking block
-            result.push_str(&remaining[..think_start]);
-            
-            // Look for the end of the thinking block
-            let after_start_tag = &remaining[think_start + 7..]; // Skip "<think>"
-            
-            if let Some(think_end) = after_start_tag.find("</think>") {
-                // Found matching closing tag, skip everything between tags
-                remaining = &after_start_tag[think_end + 8..]; // Skip "</think>"
-            } else {
-                // No closing tag found, discard everything after the opening tag
-                break;
-            }
-        } else {
-            // No more thinking blocks, add the rest of the content
-            result.push_str(remaining);
-            break;
-        }
-    }
+    // Use pre-compiled regex for better performance
+    let filtered = THINKING_TAG_REGEX.replace_all(content, "");
     
     // Clean up the result - remove extra whitespace and normalize spacing
-    let cleaned = result
+    let cleaned = filtered
         .lines()
         .map(|line| line.trim())
         .filter(|line| !line.is_empty())
@@ -438,6 +426,7 @@ async fn stream_reasoning_response(
 ) -> Result<StreamingStats, Box<dyn std::error::Error + Send + Sync>> {
     let client = reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(config.timeout * 3))
+        .timeout(std::time::Duration::from_secs(60)) // Add 60-second timeout
         .build()?;
         
     let chat_request = ChatRequest {
@@ -469,10 +458,11 @@ async fn stream_reasoning_response(
     let mut raw_response = String::new();
     let mut content_buffer = String::new();
     let mut last_update = std::time::Instant::now();
-    let update_interval = std::time::Duration::from_millis(800);
+    let update_interval = std::time::Duration::from_millis(1500); // Increased from 800ms to reduce API calls
     let mut line_buffer = String::new();
+    let mut accumulated_filtered = String::new();
 
-    println!("Starting real-time streaming for reasoning response...");
+    println!("Starting optimized real-time streaming for reasoning response...");
 
     while let Some(chunk) = stream.next().await {
         match chunk {
@@ -485,12 +475,18 @@ async fn stream_reasoning_response(
                     
                     if let Some(json_str) = line.strip_prefix("data: ") {
                         if json_str.trim() == "[DONE]" {
+                            // Process any remaining content
                             if !content_buffer.is_empty() {
                                 let final_filtered_content = filter_thinking_tags(&content_buffer);
                                 if !final_filtered_content.is_empty() {
-                                    if let Err(e) = finalize_message_content(&mut message_state, &final_filtered_content, ctx, config).await {
-                                        eprintln!("Failed to finalize message: {}", e);
-                                    }
+                                    accumulated_filtered.push_str(&final_filtered_content);
+                                }
+                            }
+                            
+                            // Final update with all accumulated content
+                            if !accumulated_filtered.is_empty() {
+                                if let Err(e) = finalize_message_content(&mut message_state, &accumulated_filtered, ctx, config).await {
+                                    eprintln!("Failed to finalize message: {}", e);
                                 }
                             } else if message_state.current_content.trim().is_empty() {
                                 let _ = message_state.current_message.edit(&ctx.http, |m| {
@@ -501,7 +497,7 @@ async fn stream_reasoning_response(
                             let stats = StreamingStats {
                                 total_characters: raw_response.len(),
                                 message_count: message_state.message_index,
-                                filtered_characters: raw_response.len() - message_state.current_content.len(),
+                                filtered_characters: raw_response.len() - accumulated_filtered.len(),
                             };
                             return Ok(stats);
                         }
@@ -510,12 +506,18 @@ async fn stream_reasoning_response(
                             for choice in response_chunk.choices {
                                 if let Some(finish_reason) = choice.finish_reason {
                                     if finish_reason == "stop" {
+                                        // Process any remaining content
                                         if !content_buffer.is_empty() {
                                             let final_filtered_content = filter_thinking_tags(&content_buffer);
                                             if !final_filtered_content.is_empty() {
-                                                if let Err(e) = finalize_message_content(&mut message_state, &final_filtered_content, ctx, config).await {
-                                                    eprintln!("Failed to finalize message: {}", e);
-                                                }
+                                                accumulated_filtered.push_str(&final_filtered_content);
+                                            }
+                                        }
+                                        
+                                        // Final update with all accumulated content
+                                        if !accumulated_filtered.is_empty() {
+                                            if let Err(e) = finalize_message_content(&mut message_state, &accumulated_filtered, ctx, config).await {
+                                                eprintln!("Failed to finalize message: {}", e);
                                             }
                                         } else if message_state.current_content.trim().is_empty() {
                                             let _ = message_state.current_message.edit(&ctx.http, |m| {
@@ -526,7 +528,7 @@ async fn stream_reasoning_response(
                                         let stats = StreamingStats {
                                             total_characters: raw_response.len(),
                                             message_count: message_state.message_index,
-                                            filtered_characters: raw_response.len() - message_state.current_content.len(),
+                                            filtered_characters: raw_response.len() - accumulated_filtered.len(),
                                         };
                                         return Ok(stats);
                                     }
@@ -537,15 +539,23 @@ async fn stream_reasoning_response(
                                         raw_response.push_str(&content);
                                         content_buffer.push_str(&content);
                                         
-                                        if last_update.elapsed() >= update_interval && !content_buffer.is_empty() {
+                                        // Only update Discord when we have significant new content or time has passed
+                                        if (last_update.elapsed() >= update_interval && !content_buffer.is_empty()) || 
+                                           content_buffer.len() > 200 { // Update when buffer gets large
                                             let filtered_chunk = filter_thinking_tags(&content_buffer);
                                             if !filtered_chunk.is_empty() {
-                                                if let Err(e) = update_discord_message(&mut message_state, &filtered_chunk, ctx, config).await {
-                                                    eprintln!("Failed to update Discord message: {}", e);
-                                                    return Err(e);
+                                                accumulated_filtered.push_str(&filtered_chunk);
+                                                
+                                                // Only update Discord if we have enough new content
+                                                if accumulated_filtered.len() > 100 {
+                                                    if let Err(e) = update_discord_message(&mut message_state, &accumulated_filtered, ctx, config).await {
+                                                        eprintln!("Failed to update Discord message: {}", e);
+                                                        return Err(e);
+                                                    }
+                                                    accumulated_filtered.clear();
                                                 }
-                                                content_buffer.clear();
                                             }
+                                            content_buffer.clear();
                                             last_update = std::time::Instant::now();
                                         }
                                     }
@@ -560,7 +570,8 @@ async fn stream_reasoning_response(
                 if !content_buffer.is_empty() {
                     let final_filtered_content = filter_thinking_tags(&content_buffer);
                     if !final_filtered_content.is_empty() {
-                        let _ = finalize_message_content(&mut message_state, &final_filtered_content, ctx, config).await;
+                        accumulated_filtered.push_str(&final_filtered_content);
+                        let _ = finalize_message_content(&mut message_state, &accumulated_filtered, ctx, config).await;
                     }
                 }
                 return Err(e.into());
@@ -598,6 +609,11 @@ async fn update_discord_message(
     ctx: &Context,
     config: &LMConfig,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Only update if we have new content
+    if new_content.is_empty() {
+        return Ok(());
+    }
+    
     state.current_content.push_str(new_content);
 
     let potential_content = format!("**Reasoning Response (Part {}):**\n```\n{}\n```", 
@@ -608,6 +624,8 @@ async fn update_discord_message(
         // Find a good split point for the content that is over the limit
         let mut split_at = state.current_content.len() - new_content.len();
         if let Some(pos) = state.current_content[..split_at].rfind('\n') {
+            split_at = pos;
+        } else if let Some(pos) = state.current_content[..split_at].rfind(' ') {
             split_at = pos;
         }
 
@@ -769,7 +787,7 @@ async fn analyze_search_results_with_reasoning(
     let current_content = &analysis_msg.content;
     let potential_content = format!("{}{}", current_content, final_msg);
     
-    if potential_content.len() <= 2000 {
+    if potential_content.len() <= 2000 { // Adjusted limit for better performance
         // Can fit in current message
         analysis_msg.edit(&ctx.http, |m| {
             m.content(&potential_content)
@@ -1006,7 +1024,7 @@ async fn chat_completion_reasoning(
     max_tokens: Option<i32>,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(config.timeout))
+        .timeout(std::time::Duration::from_secs(60)) // Use 60-second timeout for consistency
         .build()?;
         
     let chat_request = ChatRequest {

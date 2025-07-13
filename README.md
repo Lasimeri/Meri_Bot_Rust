@@ -2,6 +2,15 @@
 
 A powerful Discord bot written in Rust using the Serenity framework, featuring real-time AI chat streaming, advanced reasoning capabilities, and comprehensive user interaction features.
 
+## ⚠️ IMPORTANT: Bot Interaction Method
+
+**This bot ONLY responds to direct user ID mentions!**
+
+- **Primary Method**: `<@Meri_> <your prompt>` 
+- **Vision Analysis**: `<@Meri_> -v <prompt>` (with image attached)
+- **Reply Support**: Reply to any message with `<@Meri_> <question>` to ask about that specific message
+- **Legacy Commands**: Traditional prefix commands (^lm, ^reason, ^sum) are still available for backward compatibility
+
 ## ⚠️ Security Notice
 
 **NEVER commit sensitive configuration to version control!**
@@ -17,20 +26,66 @@ A powerful Discord bot written in Rust using the Serenity framework, featuring r
 
 ## Features
 
-### 📋 Basic Commands
+### 🆕 Primary AI Chat (User ID Mention Only)
+- `<@Meri_> <prompt>` - AI chat with real-time streaming and **per-user conversation memory**
+  - **Features**: **Real-time streaming responses**, smart message chunking, extended output length (8K tokens), live progress indicators, multi-part message support, robust buffered streaming for improved reliability, **60-second timeout**
+- `<@Meri_> <prompt>` + **attachments** - RAG-enhanced analysis of documents (PDF, TXT, images, etc.)
+  - **Supported file types**: PDF, TXT, MD, CSV, HTML, JSON, XML, JPG, PNG, GIF, WebP
+  - **RAG Features**: Document content extraction, context-aware analysis, multimodal support
+- `<@Meri_> -v <prompt>` + **image** - Vision analysis with AI (analyze images with custom prompts)
+  - **Features**: Advanced image analysis, GIF support (first frame extraction), context-aware prompts
+- **Reply Support**: Reply to any message with `<@Meri_> <question>` to ask about that specific message
+  - **Features**: RAG-enhanced context, author identification, smart conversation threading
+- **Vision in Replies**: Reply to messages with images using `<@Meri_> -v <prompt>` to analyze the image
+  - **Features**: Cross-message image analysis, contextual understanding, attachment detection
+
+## Quick Start Examples
+
+### Basic AI Chat
+```
+<@Meri_> Hello! How are you?
+<@Meri_> Explain quantum computing
+<@Meri_> Write a Python function to reverse a string
+```
+
+### Vision Analysis
+```
+<@Meri_> -v What's in this image?
+<@Meri_> -v Analyze this diagram and explain the workflow
+<@Meri_> -v What text do you see in this screenshot?
+```
+
+### Document Analysis (with file attachments)
+```
+<@Meri_> Summarize this PDF document
+<@Meri_> What are the key points in this text file?
+<@Meri_> Analyze this CSV data
+```
+
+### Reply-Based Context
+```
+# Reply to any message with:
+<@Meri_> What does this mean?
+<@Meri_> Can you explain this further?
+<@Meri_> -v What's happening in this image?
+```
+
+### 📋 Basic Commands (Legacy)
 - `^ping` - Test bot response with typing indicator
 - `^echo <text>` - Repeat your message
 - `^help` - Show comprehensive command list with categories
 
-### 🖼️ Profile Picture Commands  
+### 🖼️ Profile Picture Commands (Legacy)
 - `^ppfp @user` - Show user's profile picture in a rich embed
   - **Aliases**: `^avatar`, `^pfp`, `^profilepic`
   - **Features**: High-quality embeds, clickable links, memory-efficient processing
 
-### 🤖 AI Chat Commands
+### 🤖 Legacy AI Chat Commands
 - `^lm <prompt>` - Chat with AI via LM Studio/Ollama
   - **Aliases**: `^llm`, `^ai`, `^chat` 
   - **Features**: **Real-time streaming responses**, smart message chunking, extended output length (8K tokens), live progress indicators, multi-part message support, robust buffered streaming for improved reliability, **60-second timeout**
+- `^lm -v <prompt>` + **image** - Vision analysis (analyze attached images)
+  - **Features**: Advanced image analysis, GIF support, attachment detection in replies
 - `^lm -s <search query>` - AI-enhanced web search with intelligent query optimization and result summarization
   - **Aliases**: `^lm --search <query>`
   - **Features**: **AI query refinement**, **intelligent summarization with embedded links**, real-time progress updates, fallback to basic search, **60-second timeout**
@@ -41,7 +96,7 @@ A powerful Discord bot written in Rust using the Serenity framework, featuring r
   - **Aliases**: `^reasoning -s`, `^reasoning --search`
   - **Features**: **Analytical research synthesis**, reasoning-focused query optimization, embedded source links, specialized reasoning model analysis (Qwen3 4B), **buffered chunking** (posts content in 2000-character chunks), **60-second timeout**
 
-### 📺 Content Summarization Commands
+### 📺 Content Summarization Commands (Legacy)
 - `^sum <url>` - Summarize webpage content or YouTube videos using AI reasoning model
   - **Aliases**: `^summarize`, `^webpage`
   - **Features**: 
