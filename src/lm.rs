@@ -231,8 +231,20 @@ pub async fn lm(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
     if input.starts_with("--clear") || input == "-c" {
         let mut data_map = ctx.data.write().await;
         let lm_map = data_map.get_mut::<LmContextMap>().expect("LM context map not initialized");
-        lm_map.remove(&msg.author.id);
-        msg.reply(ctx, "**LM Chat Context Cleared**\nYour conversation history has been reset.").await?;
+        
+        let had_context = if let Some(context) = lm_map.get_mut(&msg.author.id) {
+            let message_count = context.total_messages();
+            context.clear();
+            message_count > 0
+        } else {
+            false
+        };
+        
+        if had_context {
+            msg.reply(ctx, "**LM Chat Context Cleared** ✅\nYour conversation history has been reset (50 user messages + 50 assistant messages).").await?;
+        } else {
+            msg.reply(ctx, "**No LM Context Found** ℹ️\nYou don't have any active conversation history to clear.").await?;
+        }
         return Ok(());
     }
 
@@ -345,13 +357,11 @@ pub async fn lm(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
         // Scoped for lm_map
         {
             let lm_map = data_map.get_mut::<LmContextMap>().expect("LM context map not initialized");
-            let history = lm_map.entry(msg.author.id).or_insert_with(Vec::new);
-            history.push(ChatMessage { role: "user".to_string(), content: prompt.to_string() });
+            let context = lm_map.entry(msg.author.id).or_insert_with(crate::UserContext::new);
+            context.add_user_message(ChatMessage { role: "user".to_string(), content: prompt.to_string() });
             
-            // Limit history
-            if history.len() > 50 {
-                history.drain(0..history.len()-50);
-            }
+            println!("[LM] User context updated: {} user messages, {} assistant messages", 
+                context.user_messages.len(), context.assistant_messages.len());
         }
     }
 
@@ -381,10 +391,13 @@ pub async fn lm(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
     {
         let data_map = ctx.data.read().await;
         if let Some(lm_map) = data_map.get::<LmContextMap>() {
-            if let Some(history) = lm_map.get(&msg.author.id) {
-                for entry in history.iter() {
+            if let Some(context) = lm_map.get(&msg.author.id) {
+                let conversation_messages = context.get_conversation_messages();
+                for entry in conversation_messages.iter() {
                     messages.push(entry.clone());
                 }
+                println!("[LM] Loaded {} context messages for user {}", 
+                    conversation_messages.len(), msg.author.name);
             }
         }
     }
@@ -425,16 +438,14 @@ pub async fn lm(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
                 // Scoped for lm_map
                 {
                     let lm_map = data_map.get_mut::<LmContextMap>().expect("LM context map not initialized");
-                    if let Some(history) = lm_map.get_mut(&msg.author.id) {
-                        history.push(ChatMessage { 
+                    if let Some(context) = lm_map.get_mut(&msg.author.id) {
+                        context.add_assistant_message(ChatMessage { 
                             role: "assistant".to_string(), 
                             content: response_content.clone()
                         });
                         
-                        // Limit history
-                        if history.len() > 50 {
-                            history.drain(0..history.len()-50);
-                        }
+                        println!("[LM] AI response recorded: {} total messages in context", 
+                            context.total_messages());
                     }
                 }
             }
@@ -458,15 +469,18 @@ pub async fn clearcontext(ctx: &Context, msg: &Message, _args: Args) -> CommandR
     let lm_map = data_map.get_mut::<LmContextMap>().expect("LM context map not initialized");
     
     let user_id = msg.author.id;
-    let had_context = lm_map.remove(&user_id).is_some();
-    // Defensive: also try as string key if ever used (shouldn't be, but for robustness)
-    // (Uncomment if you ever use string keys)
-    // let _ = lm_map.remove(&user_id.to_string());
+    let had_context = if let Some(context) = lm_map.get_mut(&user_id) {
+        let message_count = context.total_messages();
+        context.clear();
+        message_count > 0
+    } else {
+        false
+    };
     
     println!("[clearcontext] Cleared context for user {} (had_context={})", user_id, had_context);
     
     if had_context {
-        msg.reply(ctx, "**LM Chat Context Cleared** ✅\nYour conversation history with the AI has been fully reset. The next message you send will start a brand new context.").await?;
+        msg.reply(ctx, "**LM Chat Context Cleared** ✅\nYour conversation history with the AI has been fully reset (50 user messages + 50 assistant messages). The next message you send will start a brand new context.").await?;
     } else {
         msg.reply(ctx, "**No Context Found** ℹ️\nYou don't have any active conversation history to clear. Start a conversation with `^lm <your message>`.\n\nIf you believe context is still being used, please report this as a bug.").await?;
     }
@@ -668,7 +682,7 @@ pub async fn stream_chat_response(
     println!("[STREAMING] Request payload: model={}, max_tokens={}, temperature={}, stream=true", 
         chat_request.model, chat_request.max_tokens, chat_request.temperature);
 
-    // First, test basic connectivity to the server
+    // First, test basic connectivity to the server with enhanced error handling
     println!("[STREAMING] Testing basic connectivity to {}...", config.base_url);
     match client.get(&config.base_url).send().await {
         Ok(response) => {
@@ -676,7 +690,41 @@ pub async fn stream_chat_response(
         }
         Err(e) => {
             println!("[STREAMING] Basic connectivity test failed: {}", e);
-            return Err(format!("Cannot reach remote server {}: {}", config.base_url, e).into());
+            
+            // Check if this is a Windows permission error
+            let error_msg = format!("{}", e);
+            if error_msg.contains("os error 10013") || error_msg.contains("access permissions") {
+                return Err(format!(
+                    "Windows Network Permission Error (10013): Cannot connect to {}.\n\n**Common Solutions:**\n\
+                    1. **Windows Firewall:** Allow the application through Windows Defender Firewall\n\
+                    2. **Network Access:** Ensure the AI server at {} is running and accessible\n\
+                    3. **Port Access:** Check if port 11434 is blocked by antivirus or firewall\n\
+                    4. **Local Network:** Try using localhost (127.0.0.1) instead of {} if running locally\n\
+                    5. **Administrator:** Try running as administrator if needed\n\n\
+                    **Original error:** {}", 
+                    config.base_url, config.base_url, config.base_url.replace("http://", ""), e
+                ).into());
+            } else if error_msg.contains("timeout") || error_msg.contains("timed out") {
+                return Err(format!(
+                    "Connection Timeout: Cannot reach AI server at {}.\n\n**Check:**\n\
+                    1. AI server is running and accessible\n\
+                    2. Network connection is stable\n\
+                    3. Server is not overloaded\n\n\
+                    **Original error:** {}", 
+                    config.base_url, e
+                ).into());
+            } else if error_msg.contains("refused") || error_msg.contains("connection refused") {
+                return Err(format!(
+                    "Connection Refused: AI server at {} is not accepting connections.\n\n**Check:**\n\
+                    1. AI server (LM Studio/Ollama) is running\n\
+                    2. Server is listening on the correct port\n\
+                    3. No other application is using the port\n\n\
+                    **Original error:** {}", 
+                    config.base_url, e
+                ).into());
+            } else {
+                return Err(format!("Cannot reach remote server {}: {}", config.base_url, e).into());
+            }
         }
     }
 
@@ -694,7 +742,23 @@ pub async fn stream_chat_response(
         }
         Err(e) => {
             println!("[STREAMING] API request failed: {}", e);
-            return Err(format!("Streaming API request to {} failed: {}", api_url, e).into());
+            
+            // Enhanced error handling for API requests
+            let error_msg = format!("{}", e);
+            if error_msg.contains("os error 10013") || error_msg.contains("access permissions") {
+                return Err(format!(
+                    "Windows Network Permission Error (10013): Cannot connect to AI API at {}.\n\n**Solutions:**\n\
+                    1. **Windows Firewall:** Add firewall exception for this application\n\
+                    2. **Run as Administrator:** Try running the bot as administrator\n\
+                    3. **Check AI Server:** Ensure LM Studio/Ollama is running at {}\n\
+                    4. **Port Access:** Verify port 11434 isn't blocked\n\
+                    5. **Network Config:** Try localhost (127.0.0.1) if running locally\n\n\
+                    **Original error:** {}", 
+                    api_url, config.base_url, e
+                ).into());
+            } else {
+                return Err(format!("Streaming API request to {} failed: {}", api_url, e).into());
+            }
         }
     };
 
@@ -1058,8 +1122,9 @@ pub async fn handle_lm_request(
     {
         let data_map = ctx.data.read().await;
         if let Some(lm_map) = data_map.get::<LmContextMap>() {
-            if let Some(history) = lm_map.get(&msg.author.id) {
-                for entry in history.iter() {
+            if let Some(context) = lm_map.get(&msg.author.id) {
+                let conversation_messages = context.get_conversation_messages();
+                for entry in conversation_messages.iter() {
                     messages.push(entry.clone());
                 }
             }
@@ -1076,11 +1141,8 @@ pub async fn handle_lm_request(
     {
         let mut data_map = ctx.data.write().await;
         let lm_map = data_map.get_mut::<LmContextMap>().expect("LM context map not initialized");
-        if let Some(history) = lm_map.get_mut(&msg.author.id) {
-            history.push(ChatMessage { role: "assistant".to_string(), content: response_content });
-            if history.len() > 50 {
-                history.drain(0..history.len()-50);
-            }
+        if let Some(context) = lm_map.get_mut(&msg.author.id) {
+            context.add_assistant_message(ChatMessage { role: "assistant".to_string(), content: response_content });
         }
     }
     Ok(())

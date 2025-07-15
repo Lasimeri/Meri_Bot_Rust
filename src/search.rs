@@ -405,7 +405,7 @@ pub async fn chat_completion(
     println!("🔗 Request payload: model={}, max_tokens={}, temperature={}", 
         chat_request.model, chat_request.max_tokens, chat_request.temperature);
 
-    // First, test basic connectivity to the server
+    // First, test basic connectivity to the server with enhanced error handling
     println!("🔗 Testing basic connectivity to {}...", config.base_url);
     match client.get(&config.base_url).send().await {
         Ok(response) => {
@@ -413,7 +413,41 @@ pub async fn chat_completion(
         }
         Err(e) => {
             println!("❌ Basic connectivity test failed: {}", e);
-            return Err(format!("Cannot reach remote server {}: {}", config.base_url, e).into());
+            
+            // Check if this is a Windows permission error
+            let error_msg = format!("{}", e);
+            if error_msg.contains("os error 10013") || error_msg.contains("access permissions") {
+                return Err(format!(
+                    "Windows Network Permission Error (10013): Cannot connect to {}.\n\n**Common Solutions:**\n\
+                    1. **Windows Firewall:** Allow the application through Windows Defender Firewall\n\
+                    2. **Network Access:** Ensure the AI server at {} is running and accessible\n\
+                    3. **Port Access:** Check if port 11434 is blocked by antivirus or firewall\n\
+                    4. **Local Network:** Try using localhost (127.0.0.1) instead of {} if running locally\n\
+                    5. **Administrator:** Try running as administrator if needed\n\n\
+                    **Original error:** {}", 
+                    config.base_url, config.base_url, config.base_url.replace("http://", ""), e
+                ).into());
+            } else if error_msg.contains("timeout") || error_msg.contains("timed out") {
+                return Err(format!(
+                    "Connection Timeout: Cannot reach AI server at {}.\n\n**Check:**\n\
+                    1. AI server is running and accessible\n\
+                    2. Network connection is stable\n\
+                    3. Server is not overloaded\n\n\
+                    **Original error:** {}", 
+                    config.base_url, e
+                ).into());
+            } else if error_msg.contains("refused") || error_msg.contains("connection refused") {
+                return Err(format!(
+                    "Connection Refused: AI server at {} is not accepting connections.\n\n**Check:**\n\
+                    1. AI server (LM Studio/Ollama) is running\n\
+                    2. Server is listening on the correct port\n\
+                    3. No other application is using the port\n\n\
+                    **Original error:** {}", 
+                    config.base_url, e
+                ).into());
+            } else {
+                return Err(format!("Cannot reach remote server {}: {}", config.base_url, e).into());
+            }
         }
     }
 
@@ -431,7 +465,23 @@ pub async fn chat_completion(
         }
         Err(e) => {
             println!("❌ API request failed: {}", e);
-            return Err(format!("API request to {} failed: {}", api_url, e).into());
+            
+            // Enhanced error handling for API requests
+            let error_msg = format!("{}", e);
+            if error_msg.contains("os error 10013") || error_msg.contains("access permissions") {
+                return Err(format!(
+                    "Windows Network Permission Error (10013): Cannot connect to AI API at {}.\n\n**Solutions:**\n\
+                    1. **Windows Firewall:** Add firewall exception for this application\n\
+                    2. **Run as Administrator:** Try running the bot as administrator\n\
+                    3. **Check AI Server:** Ensure LM Studio/Ollama is running at {}\n\
+                    4. **Port Access:** Verify port 11434 isn't blocked\n\
+                    5. **Network Config:** Try localhost (127.0.0.1) if running locally\n\n\
+                    **Original error:** {}", 
+                    api_url, config.base_url, e
+                ).into());
+            } else {
+                return Err(format!("API request to {} failed: {}", api_url, e).into());
+            }
         }
     };
 

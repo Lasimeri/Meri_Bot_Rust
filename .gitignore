@@ -45,6 +45,10 @@ temp_video_*
 .cache/
 cache/
 
+# Persistent context files
+/contexts/
+contexts/
+
 # Log files and debugging output
 *.log
 logs/

@@ -6,7 +6,7 @@ mod help;
 mod ping;
 mod echo;
 mod sum;
-mod context;
+
 mod vis;
 
 use serenity::{
@@ -21,78 +21,166 @@ use std::env;
 use std::fs;
 use std::collections::HashMap;
 use tokio::signal;
+use tokio::sync::mpsc;
+use tokio::io::{self, AsyncBufReadExt, BufReader};
 use serenity::model::id::UserId;
 use crate::search::ChatMessage;
 use serde::{Serialize, Deserialize};
-use std::collections::HashSet;
+use std::path::Path;
+use std::io::Write;
 use chrono::{DateTime, Utc};
+
 use serenity::model::channel::Message;
 
-// User profile for cross-context awareness
+// Enhanced context structure with 50/50 balance and persistence
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UserProfile {
-    pub user_id: UserId,
-    pub username: String,
-    pub display_name: Option<String>,
-    pub context_summary: String,
-    pub interests: Vec<String>,
-    pub conversation_style: String,
-    pub last_interaction: DateTime<Utc>,
-    pub total_messages: u32,
-    pub preferred_topics: Vec<String>,
+pub struct UserContext {
+    pub user_messages: Vec<ChatMessage>,
+    pub assistant_messages: Vec<ChatMessage>,
+    pub last_updated: DateTime<Utc>,
+    pub total_interactions: usize,
 }
 
-// Shared conversation thread
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SharedConversation {
-    pub thread_id: String,
-    pub participants: HashSet<UserId>,
-    pub messages: Vec<ChatMessage>,
-    pub topic: String,
-    pub created_at: DateTime<Utc>,
-    pub last_activity: DateTime<Utc>,
-    pub is_active: bool,
+impl UserContext {
+    pub fn new() -> Self {
+        Self {
+            user_messages: Vec::new(),
+            assistant_messages: Vec::new(),
+            last_updated: Utc::now(),
+            total_interactions: 0,
+        }
+    }
+
+    pub fn add_user_message(&mut self, message: ChatMessage) {
+        self.user_messages.push(message);
+        self.maintain_balance();
+        self.last_updated = Utc::now();
+        self.total_interactions += 1;
+    }
+
+    pub fn add_assistant_message(&mut self, message: ChatMessage) {
+        self.assistant_messages.push(message);
+        self.maintain_balance();
+        self.last_updated = Utc::now();
+    }
+
+    pub fn get_conversation_messages(&self) -> Vec<ChatMessage> {
+        let mut messages = Vec::new();
+        let user_len = self.user_messages.len();
+        let assistant_len = self.assistant_messages.len();
+        let max_len = std::cmp::max(user_len, assistant_len);
+
+        for i in 0..max_len {
+            if i < user_len {
+                messages.push(self.user_messages[i].clone());
+            }
+            if i < assistant_len {
+                messages.push(self.assistant_messages[i].clone());
+            }
+        }
+
+        messages
+    }
+
+    fn maintain_balance(&mut self) {
+        // Keep only the last 50 messages of each type
+        if self.user_messages.len() > 50 {
+            self.user_messages.drain(0..self.user_messages.len() - 50);
+        }
+        if self.assistant_messages.len() > 50 {
+            self.assistant_messages.drain(0..self.assistant_messages.len() - 50);
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.user_messages.clear();
+        self.assistant_messages.clear();
+        self.last_updated = Utc::now();
+    }
+
+    pub fn total_messages(&self) -> usize {
+        self.user_messages.len() + self.assistant_messages.len()
+    }
 }
 
-// User relationships and references
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UserRelationships {
-    pub user_id: UserId,
-    pub mentioned_users: HashSet<UserId>,
-    pub conversation_partners: HashSet<UserId>,
-    pub shared_topics: Vec<String>,
-    pub relationship_notes: HashMap<UserId, String>,
+// Persistence functions for contexts
+pub async fn save_contexts_to_disk(
+    lm_contexts: &HashMap<UserId, UserContext>,
+    reason_contexts: &HashMap<UserId, UserContext>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Create contexts directory if it doesn't exist
+    let contexts_dir = Path::new("contexts");
+    if !contexts_dir.exists() {
+        std::fs::create_dir_all(contexts_dir)?;
+    }
+
+    // Save LM contexts
+    let lm_file = contexts_dir.join("lm_contexts.json");
+    let lm_json = serde_json::to_string_pretty(lm_contexts)?;
+    let mut lm_file_handle = std::fs::File::create(&lm_file)?;
+    lm_file_handle.write_all(lm_json.as_bytes())?;
+
+    // Save Reason contexts
+    let reason_file = contexts_dir.join("reason_contexts.json");
+    let reason_json = serde_json::to_string_pretty(reason_contexts)?;
+    let mut reason_file_handle = std::fs::File::create(&reason_file)?;
+    reason_file_handle.write_all(reason_json.as_bytes())?;
+
+    println!("💾 Saved {} LM contexts and {} Reason contexts to disk", 
+        lm_contexts.len(), reason_contexts.len());
+    Ok(())
 }
+
+pub async fn load_contexts_from_disk() -> Result<(HashMap<UserId, UserContext>, HashMap<UserId, UserContext>), Box<dyn std::error::Error + Send + Sync>> {
+    let contexts_dir = Path::new("contexts");
+    
+    // Load LM contexts
+    let lm_file = contexts_dir.join("lm_contexts.json");
+    let lm_contexts = if lm_file.exists() {
+        let lm_content = std::fs::read_to_string(&lm_file)?;
+        serde_json::from_str::<HashMap<UserId, UserContext>>(&lm_content)?
+    } else {
+        HashMap::new()
+    };
+
+    // Load Reason contexts
+    let reason_file = contexts_dir.join("reason_contexts.json");
+    let reason_contexts = if reason_file.exists() {
+        let reason_content = std::fs::read_to_string(&reason_file)?;
+        serde_json::from_str::<HashMap<UserId, UserContext>>(&reason_content)?
+    } else {
+        HashMap::new()
+    };
+
+    println!("📂 Loaded {} LM contexts and {} Reason contexts from disk", 
+        lm_contexts.len(), reason_contexts.len());
+    
+    Ok((lm_contexts, reason_contexts))
+}
+
+
+
+
+
+
 
 // TypeMap key for LM chat context
 pub struct LmContextMap;
 impl TypeMapKey for LmContextMap {
-    type Value = HashMap<UserId, Vec<ChatMessage>>;
+    type Value = HashMap<UserId, UserContext>;
 }
 
 // TypeMap key for Reason chat context
 pub struct ReasonContextMap;
 impl TypeMapKey for ReasonContextMap {
-    type Value = HashMap<UserId, Vec<ChatMessage>>;
+    type Value = HashMap<UserId, UserContext>;
 }
 
-// TypeMap key for user profiles and cross-user context
-pub struct UserProfileMap;
-impl TypeMapKey for UserProfileMap {
-    type Value = HashMap<UserId, UserProfile>;
-}
 
-// TypeMap key for shared conversation threads
-pub struct SharedConversationMap;
-impl TypeMapKey for SharedConversationMap {
-    type Value = HashMap<String, SharedConversation>;
-}
 
-// TypeMap key for user relationships and references
-pub struct UserRelationshipMap;
-impl TypeMapKey for UserRelationshipMap {
-    type Value = HashMap<UserId, UserRelationships>;
-}
+
+
+
 
 // TypeMap key for storing user conversation histories to enable context-aware queries about other users' conversations
 pub struct UserConversationHistoryMap;
@@ -108,6 +196,7 @@ use crate::profilepfp::PPFP_COMMAND;
 use crate::lm::{LM_COMMAND, CLEARCONTEXT_COMMAND};
 use crate::reason::REASON_COMMAND;
 use crate::sum::SUM_COMMAND;
+
 
 // Command group declaration - includes all available commands
 #[group]
@@ -250,6 +339,86 @@ impl EventHandler for Handler {
 }
 
 // Function to read configuration from botconfig.txt with multi-path fallback
+async fn handle_command_line(shutdown_tx: mpsc::Sender<String>) {
+    use tokio::io::AsyncWriteExt;
+    use tokio::time::{sleep, Duration};
+    
+    println!("📝 Command line interface active. Type 'help' for available commands.");
+    
+    // Wait for bot to connect and show connection messages before showing prompt
+    sleep(Duration::from_millis(1500)).await;
+    
+    let stdin = io::stdin();
+    let mut reader = BufReader::new(stdin).lines();
+    let mut stdout = io::stdout();
+    
+    // Show initial prompt after bot startup messages
+    if let Err(_) = stdout.write_all(b"\n> ").await {
+        eprintln!("❌ Failed to write initial prompt");
+        return;
+    }
+    if let Err(_) = stdout.flush().await {
+        eprintln!("❌ Failed to flush initial prompt");
+        return;
+    }
+    
+    loop {
+        // Read command
+        match reader.next_line().await {
+            Ok(Some(line)) => {
+                let command = line.trim().to_lowercase();
+                
+                match command.as_str() {
+                    "quit" | "q" | "exit" => {
+                        println!("⏹️  Shutting down bot...");
+                        if let Err(_) = shutdown_tx.send("quit".to_string()).await {
+                            eprintln!("❌ Failed to send shutdown signal");
+                        }
+                        break;
+                    }
+                    "help" | "h" => {
+                        println!("🤖 Available commands:");
+                        println!("  quit, q, exit  - Stop the bot gracefully");
+                        println!("  help, h        - Show this help message");
+                        println!("  status         - Show bot status");
+                    }
+                    "status" => {
+                        println!("🤖 Bot Status: Running");
+                        println!("📡 Discord connection: Active");
+                        println!("💬 Command interface: Active");
+                    }
+                    "" => {
+                        // Empty line, do nothing
+                    }
+                    _ => {
+                        println!("❓ Unknown command: '{}'. Type 'help' for available commands.", command);
+                    }
+                }
+                
+                // Display prompt for next command (unless quitting)
+                if !matches!(command.as_str(), "quit" | "q" | "exit") {
+                    if let Err(_) = stdout.write_all(b"> ").await {
+                        eprintln!("❌ Failed to write prompt");
+                        break;
+                    }
+                    if let Err(_) = stdout.flush().await {
+                        eprintln!("❌ Failed to flush prompt");
+                        break;
+                    }
+                }
+            }
+            Ok(None) => {
+                // EOF reached
+                break;
+            }
+            Err(e) => {
+                eprintln!("❌ Error reading command line: {}", e);
+                break;
+            }
+        }
+    }
+}
+
 fn load_bot_config() -> Result<HashMap<String, String>, String> {
     let config_paths = [
         "botconfig.txt",
@@ -404,22 +573,47 @@ async fn main() {
     {
         // log::debug!("🔧 Initializing context maps...");
         let mut data = client.data.write().await;
-        data.insert::<LmContextMap>(HashMap::new());
-        data.insert::<ReasonContextMap>(HashMap::new());
-        data.insert::<UserProfileMap>(HashMap::new());
-        data.insert::<SharedConversationMap>(HashMap::new());
-        data.insert::<UserRelationshipMap>(HashMap::new());
+        
+        // Load existing contexts from disk
+        match load_contexts_from_disk().await {
+            Ok((lm_contexts, reason_contexts)) => {
+                data.insert::<LmContextMap>(lm_contexts);
+                data.insert::<ReasonContextMap>(reason_contexts);
+                println!("✅ Context maps initialized with persistent data");
+            }
+            Err(e) => {
+                println!("⚠️  Failed to load contexts from disk: {}", e);
+                println!("🔧 Initializing with empty context maps");
+                data.insert::<LmContextMap>(HashMap::new());
+                data.insert::<ReasonContextMap>(HashMap::new());
+            }
+        }
+        
         data.insert::<UserConversationHistoryMap>(HashMap::new());
         // log::debug!("✅ Context maps initialized");
     }
 
-    // Set up graceful shutdown on CTRL+C
-    // log::info!("🚀 Bot is running... Press Ctrl+C to stop");
-    println!("🚀 Bot is running... Press Ctrl+C to stop");
+    // Set up command line interface for graceful shutdown
+    let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<String>(1);
+    
+    // Start command line handler
+    let cmd_shutdown_tx = shutdown_tx.clone();
+    let cmd_task = tokio::spawn(async move {
+        handle_command_line(cmd_shutdown_tx).await;
+    });
+    
+    // Set up graceful shutdown on CTRL+C or command line
+    println!("🚀 Bot is running...");
+    println!("💡 Use 'quit' command to stop gracefully, or press Ctrl+C");
     tokio::select! {
         _ = signal::ctrl_c() => {
             // log::info!("📡 Received SIGINT, stopping bot gracefully...");
             println!("\n⏹️ Stopping bot gracefully...");
+        }
+        shutdown_signal = shutdown_rx.recv() => {
+            if let Some(signal) = shutdown_signal {
+                println!("📡 Received '{}' command, stopping bot gracefully...", signal);
+            }
         }
         result = client.start() => {
             if let Err(why) = result {
@@ -428,6 +622,20 @@ async fn main() {
             }
         }
     }
+    
+    // Save contexts to disk before shutting down
+    {
+        let data = client.data.read().await;
+        let lm_contexts = data.get::<LmContextMap>().cloned().unwrap_or_default();
+        let reason_contexts = data.get::<ReasonContextMap>().cloned().unwrap_or_default();
+        
+        if let Err(e) = save_contexts_to_disk(&lm_contexts, &reason_contexts).await {
+            eprintln!("⚠️  Failed to save contexts to disk: {}", e);
+        }
+    }
+    
+    // Stop the command line task
+    cmd_task.abort();
     
     // log::info!("👋 Bot shutdown complete");
     

@@ -130,8 +130,20 @@ pub async fn reason(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
     if input.starts_with("--clear") || input == "-c" {
         let mut data_map = ctx.data.write().await;
         let reason_map = data_map.get_mut::<ReasonContextMap>().expect("Reason context map not initialized");
-        reason_map.remove(&msg.author.id);
-        msg.reply(ctx, "**Reasoning Context Cleared**\nYour reasoning conversation history has been reset.").await?;
+        
+        let had_context = if let Some(context) = reason_map.get_mut(&msg.author.id) {
+            let message_count = context.total_messages();
+            context.clear();
+            message_count > 0
+        } else {
+            false
+        };
+        
+        if had_context {
+            msg.reply(ctx, "**Reasoning Context Cleared** ✅\nYour reasoning conversation history has been reset (50 user messages + 50 assistant messages).").await?;
+        } else {
+            msg.reply(ctx, "**No Reasoning Context Found** ℹ️\nYou don't have any active reasoning conversation history to clear.").await?;
+        }
         return Ok(());
     }
 
@@ -142,8 +154,11 @@ pub async fn reason(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
     {
         let mut data_map = ctx.data.write().await;
         let reason_map = data_map.get_mut::<ReasonContextMap>().expect("Reason context map not initialized");
-        let history = reason_map.entry(msg.author.id).or_insert_with(Vec::new);
-        history.push(ChatMessage { role: "user".to_string(), content: question.to_string() });
+        let context = reason_map.entry(msg.author.id).or_insert_with(crate::UserContext::new);
+        context.add_user_message(ChatMessage { role: "user".to_string(), content: question.to_string() });
+        
+        println!("[REASON] User context updated: {} user messages, {} assistant messages", 
+            context.user_messages.len(), context.assistant_messages.len());
     }
 
     // Load LM Studio configuration
@@ -173,9 +188,10 @@ pub async fn reason(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
     {
         let data_map = ctx.data.read().await;
         let reason_map = data_map.get::<ReasonContextMap>().expect("Reason context map not initialized");
-        if let Some(history) = reason_map.get(&msg.author.id) {
-            println!("Reasoning command: Including {} context messages for user {}", history.len(), msg.author.name);
-            for entry in history.iter() {
+        if let Some(context) = reason_map.get(&msg.author.id) {
+            let conversation_messages = context.get_conversation_messages();
+            println!("Reasoning command: Including {} context messages for user {}", conversation_messages.len(), msg.author.name);
+            for entry in conversation_messages.iter() {
                 messages.push(entry.clone());
             }
         } else {
@@ -208,16 +224,14 @@ pub async fn reason(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
             let response_content = current_msg.content.clone();
             let mut data_map = ctx.data.write().await;
             let reason_map = data_map.get_mut::<ReasonContextMap>().expect("Reason context map not initialized");
-            if let Some(history) = reason_map.get_mut(&msg.author.id) {
-                history.push(ChatMessage { 
+            if let Some(context) = reason_map.get_mut(&msg.author.id) {
+                context.add_assistant_message(ChatMessage { 
                     role: "assistant".to_string(), 
                     content: response_content 
                 });
                 
-                // Limit history to last 10 messages to prevent token overflow
-                if history.len() > 10 {
-                    history.drain(0..history.len()-10);
-                }
+                println!("[REASON] AI response recorded: {} total messages in context", 
+                    context.total_messages());
             }
         }
         Err(e) => {
