@@ -1,17 +1,31 @@
+// vis.rs - Vision Analysis and Image/GIF Processing Module
+// This module implements vision analysis for the bot, supporting image and GIF attachments for AI models.
+// It handles image downloading, GIF frame extraction, base64 encoding, and streaming vision responses.
+//
+// Key Features:
+// - Processes image and GIF attachments for vision models
+// - Converts GIFs to PNG (first frame) for compatibility
+// - Encodes images as base64 data URIs for multimodal AI
+// - Streams vision model responses to Discord
+// - Handles errors and provides user feedback
+//
+// Used by: lm.rs (vision command), main.rs (user ID mention vision)
+
 use serenity::{client::Context, model::channel::Message};
-use crate::lm::{ChatRequest, MultimodalChatMessage, MessageContent, ImageUrl, ChatResponse, Choice, Delta, StreamingStats, MessageState, update_chat_message, finalize_chat_message};
-use crate::search::LMConfig;
+use crate::commands::lm::{MultimodalChatMessage, MessageContent, ImageUrl, StreamingStats, MessageState, update_chat_message, finalize_chat_message};
+use crate::commands::search::LMConfig;
 use reqwest;
 use std::path::Path;
 use std::io::{Write, Cursor};
 use base64::{Engine as _, engine::general_purpose};
 use uuid::Uuid;
 use futures_util::StreamExt;
-use mime_guess::{from_path, mime};
-use image::{ImageFormat, DynamicImage, ImageError};
+
+use image::{ImageFormat, ImageError};
 
 /// Enhanced image processing with GIF support
-/// Download image attachment and convert to base64, with special handling for GIF files
+/// Downloads image attachment, processes GIFs (extracts first frame), and encodes as base64
+/// Returns (base64_image, content_type) tuple for multimodal AI
 pub async fn process_image_attachment(attachment: &serenity::model::channel::Attachment) -> Result<(String, String), Box<dyn std::error::Error + Send + Sync>> {
     let temp_file = format!("temp_image_{}", Uuid::new_v4());
     let temp_path = Path::new(&temp_file);
@@ -67,7 +81,7 @@ pub async fn process_image_attachment(attachment: &serenity::model::channel::Att
 }
 
 /// Process GIF files for vision model compatibility
-/// Extracts first frame from animated GIFs and converts to PNG
+/// Extracts first frame from animated GIFs and converts to PNG (base64)
 async fn process_gif_file(file_path: &Path) -> Result<(Vec<u8>, String), Box<dyn std::error::Error + Send + Sync>> {
     println!("[GIF_VISION] Loading GIF file for processing...");
     
@@ -112,7 +126,8 @@ async fn process_gif_file(file_path: &Path) -> Result<(Vec<u8>, String), Box<dyn
     }
 }
 
-/// Decode the first frame from an animated GIF
+/// Decode the first frame from an animated GIF (fallback method)
+/// Returns PNG bytes and content type
 async fn decode_gif_first_frame(gif_bytes: &[u8]) -> Result<(Vec<u8>, String), Box<dyn std::error::Error + Send + Sync>> {
     println!("[GIF_VISION] Attempting to decode first frame from animated GIF...");
     
@@ -147,7 +162,8 @@ async fn decode_gif_first_frame(gif_bytes: &[u8]) -> Result<(Vec<u8>, String), B
     result
 }
 
-/// Prepare multimodal message with image (now with enhanced GIF support)
+/// Prepare multimodal message with image (for vision model)
+/// Builds a multimodal message with text prompt and base64-encoded image
 pub fn create_vision_message(prompt: &str, base64_image: &str, content_type: &str) -> Vec<MultimodalChatMessage> {
     println!("[GIF_VISION] Creating vision message with content type: {}", content_type);
     
@@ -178,6 +194,7 @@ pub fn create_vision_message(prompt: &str, base64_image: &str, content_type: &st
 }
 
 /// Stream vision response (adapted from stream_chat_response)
+/// Streams the AI's vision response, chunking and updating Discord messages as needed
 pub async fn stream_vision_response(
     messages: Vec<MultimodalChatMessage>,
     config: &LMConfig,
@@ -190,7 +207,7 @@ pub async fn stream_vision_response(
     
     let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(60)).build()?;
     
-    let chat_request = crate::lm::ChatRequest {
+    let chat_request = crate::commands::lm::ChatRequest {
         model: config.default_vision_model.clone(),
         messages,
         temperature: config.default_temperature,
@@ -260,7 +277,7 @@ pub async fn stream_vision_response(
                             return Ok(StreamingStats { total_characters: raw_response.len(), message_count: message_state.message_index });
                         }
 
-                        if let Ok(response_chunk) = serde_json::from_str::<crate::lm::ChatResponse>(json_str) {
+                        if let Ok(response_chunk) = serde_json::from_str::<crate::commands::lm::ChatResponse>(json_str) {
                             for choice in response_chunk.choices {
                                                                  if let Some(finish_reason) = choice.finish_reason {
                                      if finish_reason == "stop" {
@@ -310,6 +327,8 @@ pub async fn stream_vision_response(
     Ok(StreamingStats { total_characters: raw_response.len(), message_count: message_state.message_index })
 } 
 
+/// Main entry point for vision analysis requests
+/// Handles downloading, processing, and streaming vision model responses for image/GIF attachments
 pub async fn handle_vision_request(
     ctx: &Context,
     msg: &Message,
@@ -350,7 +369,7 @@ pub async fn handle_vision_request(
     println!("[VISION] Created {} multimodal messages", messages.len());
     
     println!("[VISION] Loading LM config from lmapiconf.txt...");
-    let config = crate::search::load_lm_config().await?;
+    let config = crate::commands::search::load_lm_config().await?;
     println!("[VISION] Config loaded successfully:");
     println!("[VISION]   - Base URL: {}", config.base_url);
     println!("[VISION]   - Default Model: {}", config.default_model);

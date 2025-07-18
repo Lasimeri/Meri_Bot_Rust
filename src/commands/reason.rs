@@ -1,3 +1,17 @@
+// reason.rs - Advanced Reasoning and Analytical AI Command Module
+// This module implements the ^reason command, providing deep reasoning, step-by-step analysis, and analytical web search.
+// It supports real-time streaming, thinking tag filtering, context persistence, and reasoning-enhanced search.
+//
+// Key Features:
+// - Dedicated reasoning model
+// - Real-time streaming with <think> tag filtering (removes internal thoughts)
+// - Buffered chunking for long responses (reason -s)
+// - Analytical web search with embedded source links
+// - Multi-path config and prompt loading
+// - Robust error handling and context management
+//
+// Used by: main.rs (command registration), search.rs (for web search)
+
 use serenity::{
     client::Context,
     framework::standard::{macros::command, Args, CommandResult},
@@ -7,17 +21,19 @@ use std::fs;
 use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use futures_util::StreamExt;
-use crate::search::{LMConfig, ChatMessage};
+use crate::commands::search::{LMConfig, ChatMessage};
 use crate::ReasonContextMap; // TypeMap key defined in main.rs
 use regex::Regex;
 use once_cell::sync::Lazy;
 
-// Compile regex once for better performance
+// Compile regex once for better performance - matches <think> tags
+// Used to filter out internal AI thoughts from streaming output
 static THINKING_TAG_REGEX: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"<think>.*?</think>").unwrap()
+    Regex::new(r"(?s)<think>.*?</think>").unwrap()
 });
 
 // Structures for streaming API responses
+// Used to parse streaming JSON chunks from the AI API
 #[derive(Deserialize)]
 struct ChatResponse {
     choices: Vec<Choice>,
@@ -34,34 +50,40 @@ struct Delta {
     content: Option<String>,
 }
 
-// API Request structure
+// API Request structure for reasoning model
 #[derive(Serialize)]
 struct ChatRequest {
-    model: String,
-    messages: Vec<ChatMessage>,
-    temperature: f32,
-    max_tokens: i32,
-    stream: bool,
+    model: String,              // Model name
+    messages: Vec<ChatMessage>, // Conversation history
+    temperature: f32,           // Sampling temperature
+    max_tokens: i32,            // Max tokens to generate
+    stream: bool,               // Whether to stream output
 }
 
-// Structure to track streaming statistics
+// Structure to track streaming statistics for reasoning
 #[derive(Debug)]
 struct StreamingStats {
-    total_characters: usize,
-    message_count: usize,
-    filtered_characters: usize,
+    total_characters: usize,    // Total characters streamed
+    message_count: usize,       // Number of Discord messages sent
+    filtered_characters: usize, // Characters filtered by <think> tag removal
 }
 
 // Structure to track current message state during streaming
 struct MessageState {
-    current_content: String,
-    current_message: Message,
-    message_index: usize,
-    char_limit: usize,
+    current_content: String,    // Accumulated content for current Discord message
+    current_message: Message,   // Current Discord message object
+    message_index: usize,       // Part number (for chunked output)
+    char_limit: usize,          // Discord message length limit
 }
 
 #[command]
 #[aliases("reasoning")]
+/// Main ^reason command handler
+/// Handles user questions, reasoning-enhanced search, and context management
+/// Supports:
+///   - ^reason <question> (step-by-step reasoning)
+///   - ^reason -s <query> (analytical web search)
+///   - ^reason --clear (clear context)
 pub async fn reason(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
     let input = args.message().trim();
     
@@ -246,6 +268,8 @@ pub async fn reason(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
 }
 
 // Helper function to load LM Studio configuration specifically for reasoning command
+// Loads all required settings from lmapiconf.txt using multi-path fallback
+// Returns LMConfig or error
 async fn load_reasoning_config() -> Result<LMConfig, Box<dyn std::error::Error + Send + Sync>> {
     let config_paths = [
         "lmapiconf.txt",
@@ -355,6 +379,8 @@ async fn load_reasoning_config() -> Result<LMConfig, Box<dyn std::error::Error +
 }
 
 // Helper function to load reasoning-specific system prompt from file
+// Tries reasoning_prompt.txt, falls back to system_prompt.txt
+// Returns prompt string or error
 async fn load_reasoning_system_prompt() -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     // Try to load reasoning-specific prompt first, fall back to general system prompt
     let reasoning_prompt_paths = [
@@ -383,27 +409,41 @@ async fn load_reasoning_system_prompt() -> Result<String, Box<dyn std::error::Er
     Err("No reasoning prompt file found in any expected location".into())
 }
 
-// Helper function to filter out <think>...</think> tags and their content
-// Optimized thinking tag filter using regex for better performance
+// Simple and reliable thinking tag filter
+// Removes all <think>...</think> blocks from the content
 fn filter_thinking_tags(content: &str) -> String {
-    // Use pre-compiled regex for better performance
+    // Use pre-compiled regex to remove thinking tags and their content
     let filtered = THINKING_TAG_REGEX.replace_all(content, "");
     
-    // Clean up the result - remove extra whitespace and normalize spacing
-    let cleaned = filtered
+    // Clean up whitespace and empty lines
+    let lines: Vec<&str> = filtered
         .lines()
         .map(|line| line.trim())
         .filter(|line| !line.is_empty())
-        .collect::<Vec<&str>>()
-        .join("\n");
+        .collect();
     
-    cleaned.trim().to_string()
+    lines.join("\n").trim().to_string()
+}
+
+// Simple processing function that just filters thinking tags
+// Returns filtered content or a message if only thinking content remains
+fn process_reasoning_content(content: &str) -> String {
+    let filtered = filter_thinking_tags(content);
+    
+    // If we have filtered content, return it
+    if !filtered.trim().is_empty() {
+        return filtered;
+    }
+    
+    // If no content after filtering, return a message
+    "The AI response appears to contain only thinking content.".to_string()
 }
 
 // Test function for the thinking tag filter (for debugging)
+// Can be run to verify <think> tag removal logic
 #[allow(dead_code)]
 fn test_filter_thinking_tags() {
-    // Test basic filtering
+    // Test basic filtering with <think> tags
     let test1 = "Before <think>This is thinking</think> After";
     let result1 = filter_thinking_tags(test1);
     println!("Test 1: '{}' -> '{}'", test1, result1);
@@ -431,6 +471,8 @@ fn test_filter_thinking_tags() {
 }
 
 // Main streaming function that handles real-time response with Discord message editing
+// Streams the AI's reasoning response, filtering <think> tags in real time
+// Handles chunking, message updates, and finalization
 async fn stream_reasoning_response(
     messages: Vec<ChatMessage>,
     model: &str,
@@ -470,11 +512,11 @@ async fn stream_reasoning_response(
     };
     
     let mut raw_response = String::new();
-    let mut content_buffer = String::new();
+    let mut last_filtered = String::new();
+    let mut accumulated_filtered = String::new();
     let mut last_update = std::time::Instant::now();
     let update_interval = std::time::Duration::from_millis(1500); // Increased from 800ms to reduce API calls
     let mut line_buffer = String::new();
-    let mut accumulated_filtered = String::new();
 
     println!("Starting optimized real-time streaming for reasoning response...");
 
@@ -489,20 +531,13 @@ async fn stream_reasoning_response(
                     
                     if let Some(json_str) = line.strip_prefix("data: ") {
                         if json_str.trim() == "[DONE]" {
-                            // Process any remaining content
-                            if !content_buffer.is_empty() {
-                                let final_filtered_content = filter_thinking_tags(&content_buffer);
-                                if !final_filtered_content.is_empty() {
-                                    accumulated_filtered.push_str(&final_filtered_content);
-                                }
-                            }
-                            
-                            // Final update with all accumulated content
-                            if !accumulated_filtered.is_empty() {
-                                if let Err(e) = finalize_message_content(&mut message_state, &accumulated_filtered, ctx, config).await {
+                            // Process final content
+                            let final_content = process_reasoning_content(&raw_response);
+                            if !final_content.is_empty() {
+                                if let Err(e) = finalize_message_content(&mut message_state, &final_content, ctx, config).await {
                                     eprintln!("Failed to finalize message: {}", e);
                                 }
-                            } else if message_state.current_content.trim().is_empty() {
+                            } else {
                                 let _ = message_state.current_message.edit(&ctx.http, |m| {
                                     m.content("**Reasoning Complete**\n\nThe AI completed its reasoning process, but the response appears to contain only thinking content.")
                                 }).await;
@@ -520,20 +555,13 @@ async fn stream_reasoning_response(
                             for choice in response_chunk.choices {
                                 if let Some(finish_reason) = choice.finish_reason {
                                     if finish_reason == "stop" {
-                                        // Process any remaining content
-                                        if !content_buffer.is_empty() {
-                                            let final_filtered_content = filter_thinking_tags(&content_buffer);
-                                            if !final_filtered_content.is_empty() {
-                                                accumulated_filtered.push_str(&final_filtered_content);
-                                            }
-                                        }
-                                        
-                                        // Final update with all accumulated content
-                                        if !accumulated_filtered.is_empty() {
-                                            if let Err(e) = finalize_message_content(&mut message_state, &accumulated_filtered, ctx, config).await {
+                                        // Process final content
+                                        let final_content = process_reasoning_content(&raw_response);
+                                        if !final_content.is_empty() {
+                                            if let Err(e) = finalize_message_content(&mut message_state, &final_content, ctx, config).await {
                                                 eprintln!("Failed to finalize message: {}", e);
                                             }
-                                        } else if message_state.current_content.trim().is_empty() {
+                                        } else {
                                             let _ = message_state.current_message.edit(&ctx.http, |m| {
                                                 m.content("**Reasoning Complete**\n\nThe AI completed its reasoning process, but the response appears to contain only thinking content.")
                                             }).await;
@@ -544,6 +572,7 @@ async fn stream_reasoning_response(
                                             message_count: message_state.message_index,
                                             filtered_characters: raw_response.len() - accumulated_filtered.len(),
                                         };
+                                        
                                         return Ok(stats);
                                     }
                                 }
@@ -551,25 +580,33 @@ async fn stream_reasoning_response(
                                 if let Some(delta) = choice.delta {
                                     if let Some(content) = delta.content {
                                         raw_response.push_str(&content);
-                                        content_buffer.push_str(&content);
                                         
                                         // Only update Discord when we have significant new content or time has passed
-                                        if (last_update.elapsed() >= update_interval && !content_buffer.is_empty()) || 
-                                           content_buffer.len() > 200 { // Update when buffer gets large
-                                            let filtered_chunk = filter_thinking_tags(&content_buffer);
-                                            if !filtered_chunk.is_empty() {
-                                                accumulated_filtered.push_str(&filtered_chunk);
-                                                
-                                                // Only update Discord if we have enough new content
-                                                if accumulated_filtered.len() > 100 {
-                                                    if let Err(e) = update_discord_message(&mut message_state, &accumulated_filtered, ctx, config).await {
-                                                        eprintln!("Failed to update Discord message: {}", e);
-                                                        return Err(e);
+                                        if (last_update.elapsed() >= update_interval) || 
+                                           raw_response.len() - last_filtered.len() > 200 { // Update when enough new raw content
+                                            let current_filtered = filter_thinking_tags(&raw_response);
+                                            
+                                            // Safe slicing: only get new content if current_filtered is longer than last_filtered
+                                            if current_filtered.len() > last_filtered.len() {
+                                                let new_content = &current_filtered[last_filtered.len()..];
+                                                if !new_content.is_empty() {
+                                                    accumulated_filtered.push_str(new_content);
+                                                    last_filtered = current_filtered;
+                                                    
+                                                    // Only update Discord if we have enough new content
+                                                    if accumulated_filtered.len() > 100 {
+                                                        if let Err(e) = update_discord_message(&mut message_state, &accumulated_filtered, ctx, config).await {
+                                                            eprintln!("Failed to update Discord message: {}", e);
+                                                            return Err(e);
+                                                        }
+                                                        accumulated_filtered.clear();
                                                     }
-                                                    accumulated_filtered.clear();
                                                 }
+                                            } else if current_filtered != last_filtered {
+                                                // Content changed but didn't grow - replace last_filtered
+                                                last_filtered = current_filtered;
                                             }
-                                            content_buffer.clear();
+                                            
                                             last_update = std::time::Instant::now();
                                         }
                                     }
@@ -581,41 +618,49 @@ async fn stream_reasoning_response(
             }
             Err(e) => {
                 eprintln!("Stream error: {}", e);
-                if !content_buffer.is_empty() {
-                    let final_filtered_content = filter_thinking_tags(&content_buffer);
-                    if !final_filtered_content.is_empty() {
-                        accumulated_filtered.push_str(&final_filtered_content);
-                        let _ = finalize_message_content(&mut message_state, &accumulated_filtered, ctx, config).await;
-                    }
+                // Process any remaining content using full raw
+                let final_content = process_reasoning_content(&raw_response);
+                if !final_content.is_empty() {
+                    let _ = finalize_message_content(&mut message_state, &final_content, ctx, config).await;
+                } else if !last_filtered.is_empty() {
+                    let _ = finalize_message_content(&mut message_state, &last_filtered, ctx, config).await;
                 }
                 return Err(e.into());
             }
         }
     }
 
-    if !content_buffer.is_empty() {
-        let final_filtered_content = filter_thinking_tags(&content_buffer);
-        if !final_filtered_content.is_empty() {
-            if let Err(e) = finalize_message_content(&mut message_state, &final_filtered_content, ctx, config).await {
-                eprintln!("Failed to finalize remaining content: {}", e);
-            }
+    // Final cleanup using full raw
+    let final_content = process_reasoning_content(&raw_response);
+    let final_filtered_len = if !final_content.is_empty() {
+        if let Err(e) = finalize_message_content(&mut message_state, &final_content, ctx, config).await {
+            eprintln!("Failed to finalize remaining content: {}", e);
         }
-    } else if message_state.current_content.trim().is_empty() {
+        final_content.len()
+    } else if !last_filtered.is_empty() {
+        let filtered_len = last_filtered.len();
+        if let Err(e) = finalize_message_content(&mut message_state, &last_filtered, ctx, config).await {
+            eprintln!("Failed to finalize remaining content: {}", e);
+        }
+        filtered_len
+    } else {
         let _ = message_state.current_message.edit(&ctx.http, |m| {
             m.content("**Reasoning Complete**\n\nThe AI completed its reasoning process, but the response appears to contain only thinking content.")
         }).await;
-    }
+        0
+    };
 
     let stats = StreamingStats {
         total_characters: raw_response.len(),
         message_count: message_state.message_index,
-        filtered_characters: raw_response.len() - message_state.current_content.len(),
+        filtered_characters: raw_response.len() - final_filtered_len,
     };
 
     Ok(stats)
 }
 
 // Helper function to update Discord message with new content
+// Handles chunking and message creation if content exceeds Discord's limit
 #[allow(unused_variables)]
 async fn update_discord_message(
     state: &mut MessageState,
@@ -674,6 +719,7 @@ async fn update_discord_message(
 }
 
 // Helper function to finalize message content at the end of streaming
+// Ensures all remaining content is posted and marks the message as complete
 #[allow(unused_variables)]
 async fn finalize_message_content(
     state: &mut MessageState,
@@ -704,6 +750,11 @@ async fn finalize_message_content(
 }
 
 /// Perform reasoning-enhanced search with direct user query and analytical summarization
+/// Steps:
+///   1. Use user's query for web search
+///   2. Perform web search (SerpAPI)
+///   3. Analyze results with reasoning model (streamed)
+///   4. Post summary to Discord
 async fn perform_reasoning_enhanced_search(
     user_query: &str,
     config: &LMConfig,
@@ -719,7 +770,7 @@ async fn perform_reasoning_enhanced_search(
     }).await.map_err(|e| format!("Failed to update message: {}", e))?;
 
     // Step 2: Perform the web search with user's exact query
-    let results = crate::search::multi_search(user_query).await
+    let results = crate::commands::search::multi_search(user_query).await
         .map_err(|e| format!("Search failed: {}", e))?;
     
     // Update message to show reasoning analysis progress
@@ -735,8 +786,9 @@ async fn perform_reasoning_enhanced_search(
 }
 
 /// Analyze search results using reasoning model with embedded links, streaming the response
+/// Formats search results, builds prompt, and streams analytical summary to Discord
 async fn analyze_search_results_with_reasoning(
-    results: &[crate::search::SearchResult],
+    results: &[crate::commands::search::SearchResult],
     _search_query: &str,
     user_query: &str,
     config: &LMConfig,
@@ -817,6 +869,7 @@ async fn analyze_search_results_with_reasoning(
 }
 
 // Dedicated streaming function for reason -s with proper message chunking
+// Buffers content and posts in 2000-character chunks for Discord
 async fn stream_reasoning_search_response(
     messages: Vec<ChatMessage>,
     model: &str,
@@ -940,6 +993,14 @@ async fn stream_reasoning_search_response(
         if let Err(e) = post_chunked_message(&filtered_buffer, &mut current_message, &mut message_count, ctx, char_limit).await {
             eprintln!("Failed to post final chunk: {}", e);
         }
+    } else if !raw_response.trim().is_empty() {
+        // Process the raw response
+        let processed_content = process_reasoning_content(&raw_response);
+        if !processed_content.is_empty() {
+            if let Err(e) = post_chunked_message(&processed_content, &mut current_message, &mut message_count, ctx, char_limit).await {
+                eprintln!("Failed to post processed content chunk: {}", e);
+            }
+        }
     }
 
     let stats = StreamingStats {
@@ -952,6 +1013,7 @@ async fn stream_reasoning_search_response(
 }
 
 // Helper function to post content in chunks with proper message creation
+// Used for buffered chunking in reason -s
 async fn post_chunked_message(
     content: &str,
     current_message: &mut Message,
@@ -997,6 +1059,7 @@ async fn post_chunked_message(
 }
 
 /// Load reasoning-specific search analysis prompt
+/// Loads prompt for analytical search summarization (multi-path fallback)
 async fn load_reasoning_search_analysis_prompt() -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     // Try to load reasoning-specific search analysis prompt first, fall back to general prompts
     let prompt_paths = [
@@ -1031,6 +1094,7 @@ async fn load_reasoning_search_analysis_prompt() -> Result<String, Box<dyn std::
 }
 
 /// Non-streaming chat completion specifically for reasoning tasks
+/// Used for short, non-streamed completions (e.g., query refinement)
 async fn chat_completion_reasoning(
     messages: Vec<ChatMessage>,
     model: &str,
@@ -1076,3 +1140,5 @@ async fn chat_completion_reasoning(
     
     Err("Failed to extract content from reasoning API response".into())
 } 
+
+ 

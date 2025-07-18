@@ -16,8 +16,8 @@ DEFAULT_MODEL=your-chat-model-name
 
 # Reasoning model configuration (for ^reason command)
 # Use a model specifically designed for reasoning tasks
-# Examples: qwen2.5:14b, deepseek-r1:8b, llama3.1:8b-reasoning
-DEFAULT_REASON_MODEL=deepseek/deepseek-r1-0528-qwen3-8b
+# Examples: qwen2.5:4b, qwen2.5:7b, llama3.1:8b-reasoning
+DEFAULT_REASON_MODEL=qwen/qwen3-4b
 
 # Chat completion parameters
 DEFAULT_TEMPERATURE=0.8

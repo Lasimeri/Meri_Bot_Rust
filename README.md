@@ -1,6 +1,6 @@
 # Meri Bot Rust
 
-A powerful Discord bot written in Rust using the Serenity framework, featuring real-time AI chat streaming, advanced reasoning capabilities, and comprehensive user interaction features.
+A powerful Discord bot written in Rust using the Serenity framework, featuring real-time AI chat streaming, advanced reasoning capabilities, comprehensive content summarization, and enhanced logging for complete visibility into bot operations.
 
 ## ⚠️ IMPORTANT: Bot Interaction Method
 
@@ -23,6 +23,18 @@ A powerful Discord bot written in Rust using the Serenity framework, featuring r
   - `system_prompt.txt` and `reasoning_prompt.txt` (may contain custom prompts)
 - Use the example files as templates and customize your actual configuration files
 - If you accidentally commit sensitive data, regenerate tokens and review what was exposed
+
+## 🆕 Enhanced Logging System
+
+**Complete visibility into bot operations with comprehensive logging:**
+
+- **📊 Detailed Logging**: Every command execution is logged with unique UUIDs for tracking
+- **🔍 Phase-Based Logging**: Each step of command processing is logged with clear phase indicators
+- **📈 Performance Metrics**: Character counts, processing times, and success rates are tracked
+- **🛠️ Error Diagnosis**: Detailed error logging with context and recovery suggestions
+- **📝 User Experience Tracking**: Logs user interactions, command usage patterns, and response quality
+- **🔄 Real-Time Monitoring**: Live logging during streaming operations with progress updates
+- **📁 Log File**: All logs are saved to `log.txt` for persistent debugging and analysis
 
 ## Features
 
@@ -91,7 +103,7 @@ A powerful Discord bot written in Rust using the Serenity framework, featuring r
   - **Features**: **AI query refinement**, **intelligent summarization with embedded links**, real-time progress updates, fallback to basic search, **60-second timeout**
 - `^reason <question>` - Deep reasoning with specialized AI model
   - **Aliases**: `^reasoning`
-  - **Features**: **Real-time streaming with thinking tag filtering**, step-by-step reasoning, dedicated reasoning model (DeepSeek R1), automatic `<think>` content removal, logical explanations, robust buffered streaming for improved reliability, **60-second timeout**
+  - **Features**: **Real-time streaming with thinking tag filtering**, step-by-step reasoning, dedicated reasoning model (Qwen3 4B), automatic `<think>` content removal, logical explanations, robust buffered streaming for improved reliability, **60-second timeout**
 - `^reason -s <search query>` - Reasoning-enhanced web search with analytical insights
   - **Aliases**: `^reasoning -s`, `^reasoning --search`
   - **Features**: **Analytical research synthesis**, reasoning-focused query optimization, embedded source links, specialized reasoning model analysis (Qwen3 4B), **buffered chunking** (posts content in 2000-character chunks), **60-second timeout**
@@ -107,6 +119,7 @@ A powerful Discord bot written in Rust using the Serenity framework, featuring r
     - **60-second timeout** for reliable processing
     - **Streaming responses** with progress updates
     - **Smart message chunking** for long summaries
+    - **Enhanced logging** with detailed step-by-step tracking and error diagnosis
   - **Examples**: `^sum https://youtube.com/watch?v=...`, `^sum https://example.com`
   - **Requirements**: yt-dlp installed for YouTube support
 
@@ -167,7 +180,7 @@ A powerful Discord bot written in Rust using the Serenity framework, featuring r
    ```
    DISCORD_TOKEN=your_actual_discord_token_here
    PREFIX=^
-   RUST_LOG=info
+   RUST_LOG=trace
    ```
    
    **Note:** The PREFIX can be customized to any character(s) you prefer
@@ -187,7 +200,7 @@ A powerful Discord bot written in Rust using the Serenity framework, featuring r
    LM_STUDIO_BASE_URL=http://127.0.0.1:11434  # Ollama default
    LM_STUDIO_TIMEOUT=30
    DEFAULT_MODEL=your-chat-model-name
-   DEFAULT_REASON_MODEL=deepseek/deepseek-r1-0528-qwen3-8b  # DeepSeek R1 reasoning model
+   DEFAULT_REASON_MODEL=qwen2.5:4b  # Qwen3 4B reasoning model
    DEFAULT_TEMPERATURE=0.8
    DEFAULT_MAX_TOKENS=8192                    # Extended for longer responses
    MAX_DISCORD_MESSAGE_LENGTH=2000           # Discord's limit
@@ -197,7 +210,7 @@ A powerful Discord bot written in Rust using the Serenity framework, featuring r
    **Important:** 
    - All settings are mandatory - no defaults provided. See `example_lmapiconf.txt` for guidance.
    - Replace `your-chat-model-name` and `your-reasoning-model-name` with your actual model names.
-   - For reasoning tasks, consider using models optimized for logical analysis (e.g., qwen, deepseek-r1, etc.).
+   - For reasoning tasks, consider using models optimized for logical analysis (e.g., qwen3:4b, qwen3:8b, etc.).
    - The `system_prompt.txt` configures the AI's behavior and personality for chat interactions.
 
 5. **Build and run**
@@ -284,39 +297,52 @@ cargo run
 ```
 meri_bot_rust/
 ├── src/
-│   ├── main.rs                # Entry point and command group setup (simplified!)
-│   ├── help.rs               # Help command implementation
-│   ├── ping.rs               # Ping command with response time
-│   ├── echo.rs               # Echo command implementation
-│   ├── profilepfp.rs         # Profile picture command
-│   ├── lm.rs                 # LM Studio AI chat and search commands
-│   ├── reason.rs             # AI reasoning command  
-│   └── search.rs             # DuckDuckGo web search functionality
-├── target/                   # Rust build artifacts
-├── Cargo.toml                # Dependencies
-├── botconfig.txt            # Bot configuration (create this)
-├── example_botconfig.txt    # Example bot configuration file
-├── lmapiconf.txt            # LM Studio/Ollama API configuration (required for AI commands)
-├── example_lmapiconf.txt    # Example LM API configuration template
-├── system_prompt.txt        # AI system prompt (required for AI commands)
-├── reasoning_prompt.txt     # Optional: Specialized prompt for reasoning command
+│   ├── main.rs                # Entry point and command group setup
+│   ├── commands/
+│   │   ├── mod.rs             # Command module declarations
+│   │   ├── ping.rs            # Ping command with response time
+│   │   ├── echo.rs            # Echo command implementation
+│   │   ├── lm.rs              # LM Studio AI chat and search commands
+│   │   ├── reason.rs          # AI reasoning command  
+│   │   ├── sum.rs             # Content summarization command
+│   │   └── search.rs          # DuckDuckGo web search functionality
+│   ├── terminal.rs            # External command execution and system management
+│   └── terminal_manager.rs    # Terminal output management and prompt handling
+├── contexts/                  # Persistent conversation history storage
+├── subtitles/                 # YouTube subtitle cache directory
+├── target/                    # Rust build artifacts
+├── Cargo.toml                 # Dependencies
+├── botconfig.txt             # Bot configuration (create this)
+├── example_botconfig.txt     # Example bot configuration file
+├── lmapiconf.txt             # LM Studio/Ollama API configuration (required for AI commands)
+├── example_lmapiconf.txt     # Example LM API configuration template
+├── system_prompt.txt         # AI system prompt (required for AI commands)
+├── reasoning_prompt.txt      # Optional: Specialized prompt for reasoning command
 ├── reasoning_search_analysis_prompt.txt # Optional: Reasoning-focused search analysis prompt
 ├── refine_search_prompt.txt     # Optional: AI search query refinement prompt
 ├── summarize_search_prompt.txt  # Optional: AI search result summarization prompt
+├── youtube_prompt_generation_prompt.txt # Optional: YouTube prompt generation
+├── youtube_summarization_prompt.txt # Optional: YouTube-specific summarization prompt
 ├── example_system_prompt.txt     # Example system prompt template
 ├── example_reasoning_prompt.txt  # Example reasoning prompt template
 ├── example_reasoning_search_analysis_prompt.txt # Example reasoning search analysis template
 ├── example_refine_search_prompt.txt    # Example search refinement prompt template
 ├── example_summarize_search_prompt.txt # Example search summarization prompt template
+├── example_youtube_prompt_generation_prompt.txt # Example YouTube prompt generation template
+├── example_youtube_summarization_prompt.txt # Example YouTube summarization template
 ├── run_bot.ps1              # Helper script to run the bot
+├── log.txt                  # Comprehensive logging output
+├── LOGGING.md               # Detailed logging documentation
+├── PLANNING.md              # Development planning and roadmap
 └── README.md                # This file
 ```
 
 ## Configuration
 
 The bot uses the following configuration:
-- Command prefix: Configurable via `PREFIX` environment variable (default: "!")
+- Command prefix: Configurable via `PREFIX` environment variable (default: "^")
 - Case insensitive commands
+- Comprehensive logging to `log.txt` with trace-level detail
 
 ## Usage
 
@@ -333,6 +359,7 @@ The bot responds to commands with the configured prefix (default: `^`):
 5. `^lm Hello!` - Test AI chat (requires configuration)
 6. `^reason Why did the sky turn red at sunset?` - Test AI reasoning (requires configuration)
 7. `^reason -s quantum computing applications` - Test reasoning-enhanced analytical search
+8. `^sum https://youtube.com/watch?v=...` - Test YouTube video summarization
 
 ### Profile Picture Command
 
@@ -379,7 +406,7 @@ The `^reason` command provides advanced AI reasoning capabilities with real-time
 - **Usage**: `^reason <your reasoning question>` 
 - **Aliases**: `^reasoning <question>`
 - **Core Features**:
-  - **🧠 Dedicated reasoning model** - DeepSeek R1 model optimized for logical analysis and step-by-step thinking
+  - **🧠 Dedicated reasoning model** - Qwen3 4B model optimized for logical analysis and step-by-step thinking
   - **🔄 Real-time streaming** - Watch reasoning unfold live as the AI processes your question
   - **🎯 Thinking tag filtering** - Automatically removes `<think>...</think>` content in real-time during streaming
   - **📋 Step-by-step explanations** - Detailed logical breakdowns and reasoning processes
@@ -403,7 +430,48 @@ The `^reason` command provides advanced AI reasoning capabilities with real-time
   - Same as LM chat command plus `DEFAULT_REASON_MODEL` configuration
   - Optional: `reasoning_prompt.txt` file for specialized reasoning instructions
   - Falls back to `system_prompt.txt` if reasoning prompt not found
-  - **Current Model**: `deepseek/deepseek-r1-0528-qwen3-8b` (supports thinking tags and advanced reasoning)
+  - **Current Model**: `qwen2.5:4b` (supports thinking tags and advanced reasoning)
+
+### Content Summarization Command
+
+The `^sum` command provides comprehensive content summarization with enhanced logging and error handling:
+
+- **Usage**: `^sum <url>` 
+- **Aliases**: `^summarize <url>`, `^webpage <url>`
+- **Core Features**:
+  - **📺 YouTube Support** - Automatic transcript extraction using yt-dlp
+  - **🌐 Webpage Support** - HTML content extraction and intelligent cleaning
+  - **🧠 AI Summarization** - Uses reasoning model for intelligent content analysis
+  - **📝 RAG Processing** - Map-reduce summarization for long content (>8K characters)
+  - **🔄 Real-time streaming** - Live progress updates during processing
+  - **📊 Smart chunking** - Automatically splits long summaries across multiple messages
+  - **🎯 Thinking tag filtering** - Removes `<think>` sections from responses
+  - **⏱️ 60-second timeout** - Reliable processing with timeout protection
+- **Enhanced Logging Features**:
+  - **🔍 Step-by-step tracking** - Every phase of processing is logged with unique UUIDs
+  - **📊 Performance metrics** - Character counts, processing times, and success rates
+  - **🛠️ Error diagnosis** - Detailed error logging with context and recovery suggestions
+  - **📈 Progress monitoring** - Live updates during YouTube transcript extraction and content processing
+  - **🔧 Configuration validation** - Logs configuration loading and validation steps
+- **YouTube Processing**:
+  - **📥 Automatic subtitle download** - Uses yt-dlp for reliable transcript extraction
+  - **🧹 VTT cleaning** - Intelligent cleaning of subtitle timestamps and formatting
+  - **🔄 Retry logic** - Automatic retry with rate limiting for failed downloads
+  - **📁 File management** - Efficient subtitle file handling and cleanup
+- **Webpage Processing**:
+  - **🌐 HTTP requests** - Robust web content fetching with error handling
+  - **🧹 HTML cleaning** - Intelligent removal of scripts, styles, and formatting
+  - **📝 Content validation** - Ensures extracted content is meaningful and complete
+- **Examples**:
+  ```
+  ^sum https://youtube.com/watch?v=dQw4w9WgXcQ
+  ^sum https://example.com/article
+  ^summarize https://github.com/rust-lang/rust
+  ```
+- **Requirements**:
+  - yt-dlp installed for YouTube support (optional but recommended)
+  - Internet connection for web content fetching
+  - LM Studio/Ollama configuration for AI summarization
 
 ### Reasoning-Enhanced Web Search Command
 
@@ -426,7 +494,7 @@ The `^reason -s` command provides analytical web search capabilities using the r
   ^reasoning --search artificial intelligence ethics
   ```
 - **Key Features**:
-  - **🧠 Analytical Focus** - Uses DeepSeek R1 reasoning model for deeper analysis beyond simple summarization
+  - **🧠 Analytical Focus** - Uses Qwen3 4B reasoning model for deeper analysis beyond simple summarization
 - **📝 Research-Oriented** - Optimizes queries for academic and analytical content
 - **🔗 Embedded Links** - Source links naturally integrated in analytical responses
 - **⚡ Real-time Progress** - Live updates during the analysis process
@@ -434,31 +502,6 @@ The `^reason -s` command provides analytical web search capabilities using the r
 - **🛡️ Robust Fallback** - Falls back to basic search when reasoning enhancement fails
 - **🎯 Specialized Prompts** - Uses reasoning-specific prompts for analytical synthesis
 - **🧹 Thinking Tag Filtering** - Automatically removes `<think>` content during processing
-
-### Setup for Reasoning-Enhanced Search
-
-To enable reasoning-enhanced search features, ensure you have:
-
-1. **Configuration Files**:
-   ```bash
-   # Copy and customize the reasoning analysis prompt template
-   cp example_reasoning_search_analysis_prompt.txt reasoning_search_analysis_prompt.txt
-   
-   # Optional: Use existing search prompt templates
-   cp example_refine_search_prompt.txt refine_search_prompt.txt
-   cp example_summarize_search_prompt.txt summarize_search_prompt.txt
-   ```
-
-2. **LM Studio/Ollama Setup** (same as AI chat):
-   - Valid `lmapiconf.txt` configuration with `DEFAULT_REASON_MODEL=deepseek/deepseek-r1-0528-qwen3-8b`
-   - Running LM Studio or Ollama instance
-   - DeepSeek R1 reasoning model loaded and accessible
-
-3. **Specialized Features**:
-   - **Reasoning Model**: Uses `deepseek/deepseek-r1-0528-qwen3-8b` for analytical capabilities
-   - **Analytical Prompts**: Specialized prompts for reasoning-focused analysis
-   - **Fallback Behavior**: Uses regular search prompts if reasoning-specific ones aren't found
-   - **Independent Operation**: Works separately from regular AI chat and search functions
 
 ### AI-Enhanced Web Search Command
 
@@ -486,79 +529,17 @@ The `^lm -s` command provides intelligent web search functionality with AI assis
   - **⚡ Real-time Progress** - Live updates during the search process
   - **🛡️ Robust Error Handling** - Comprehensive fallback strategies
 
-### Setup for AI-Enhanced Search
-
-To enable AI-enhanced search features, ensure you have:
-
-1. **Configuration Files**:
-   ```bash
-   # Copy and customize the search prompt templates
-   cp example_refine_search_prompt.txt refine_search_prompt.txt
-   cp example_summarize_search_prompt.txt summarize_search_prompt.txt
-   ```
-
-2. **LM Studio/Ollama Setup** (same as AI chat):
-   - Valid `lmapiconf.txt` configuration
-   - Running LM Studio or Ollama instance
-   - Model loaded and accessible
-
-3. **Fallback Behavior**:
-   - If AI configuration fails, automatically falls back to basic search
-   - No configuration required for basic search functionality
-   - All search attempts will work, with varying levels of intelligence
-
-### 🔍 Enhanced Web Search with Embedded Links
-
-The AI-enhanced search functionality provides intelligent processing with embedded source links directly in the response.
-
-**How It Works:**
-1. **Query Refinement** - AI optimizes your search query for better results
-2. **Web Search** - Performs DuckDuckGo search with the refined query
-3. **AI Summarization** - Creates comprehensive responses with embedded source links
-
-**User Experience:**
-```
-User: ^lm -s rust programming tutorial
-Bot: 🧠 Refining search query...
-     🔍 Searching with optimized query...
-     🤖 Generating AI summary...
-     
-     **Rust Programming Fundamentals**
-     
-     Rust is a systems programming language focused on **safety**, **speed**, and **concurrency**. 
-     Here are the key learning resources:
-     
-     **Getting Started:**
-     • [The Rust Book](https://doc.rust-lang.org/book/) - Official comprehensive guide
-     • [Rustlings](https://github.com/rust-lang/rustlings) - Interactive exercises
-     • **Rust by Example** - Practical code examples and explanations
-     
-     ---
-     *🔍 Searched: rust programming tutorial → rust programming language tutorial guide*
-```
-
-**Benefits:**
-- **🔗 Embedded Links** - Source links naturally integrated in the response text
-- **📊 Smart Formatting** - Discord markdown with bold text, code blocks, and organized structure
-- **🧠 AI Processing** - Intelligent synthesis of multiple search results
-- **🛡️ Robust Fallback** - Falls back to basic search when AI enhancement fails
-
-**Configuration:**
-- Enhanced mode requires LM Studio/Ollama setup with `lmapiconf.txt`
-- Optional `refine_search_prompt.txt` and `summarize_search_prompt.txt` for customization
-- Basic search works without any configuration - just needs internet connection
-
 ## Development
 
 To add new commands:
 
-1. Create a new command function in a separate module file (e.g., `src/mycommand.rs`)
-2. Add the module declaration to `main.rs`: `mod mycommand;`
-3. Import the command constant in `main.rs`: `use crate::mycommand::MYCOMMAND_COMMAND;`
-4. Add the command to the `#[commands()]` attribute in the General group in `main.rs`
+1. Create a new command function in a separate module file (e.g., `src/commands/mycommand.rs`)
+2. Add the module declaration to `src/commands/mod.rs`
+3. Import the command constant in `src/main.rs`: `use crate::commands::mycommand::MYCOMMAND_COMMAND;`
+4. Add the command to the `#[commands()]` attribute in the General group in `src/main.rs`
 5. Implement the command logic in your module file
 
-Example command module (`src/mycommand.rs`):
+Example command module (`src/commands/mycommand.rs`):
 ```rust
 use serenity::{
     client::Context,
@@ -573,23 +554,39 @@ pub async fn mycommand(ctx: &Context, msg: &Message, _args: Args) -> CommandResu
 }
 ```
 
-Then update `main.rs`:
+Then update `src/commands/mod.rs`:
 ```rust
-mod mycommand;
-use crate::mycommand::MYCOMMAND_COMMAND;
+pub mod mycommand;
+```
+
+And update `src/main.rs`:
+```rust
+use crate::commands::mycommand::MYCOMMAND_COMMAND;
 
 #[group]
-#[commands(ping, echo, help, ppfp, lm, reason, mycommand)]
+#[commands(ping, echo, lm, reason, sum, mycommand)]
 struct General;
 ```
 
 ### Configuration Loading
 
-Both the `^lm` and `^reason` commands use robust multi-path configuration loading:
-- Searches for `lmapiconf.txt` in multiple locations: current directory, parent directories, and src/
+All commands use robust multi-path configuration loading:
+- Searches for configuration files in multiple locations: current directory, parent directories, and src/
 - Each command loads configuration independently for maximum reliability
 - Comprehensive error messages help diagnose configuration issues
 - Console logging shows which configuration files and models are being used
+
+### Enhanced Logging System
+
+The bot includes a comprehensive logging system that provides complete visibility into operations:
+
+- **📊 Log Levels**: trace, debug, info, warn, error with appropriate filtering
+- **🔍 Unique Tracking**: Each command execution gets a unique UUID for tracking
+- **📈 Performance Metrics**: Character counts, processing times, and success rates
+- **🛠️ Error Context**: Detailed error logging with stack traces and recovery suggestions
+- **📝 User Analytics**: Command usage patterns and response quality tracking
+- **🔄 Real-Time Updates**: Live logging during streaming operations
+- **📁 Persistent Storage**: All logs saved to `log.txt` for analysis
 
 ### Dependencies
 
@@ -611,4 +608,46 @@ The bot uses these key dependencies:
 - `serde` (1.0) - JSON serialization/deserialization with derive macros
 - `serde_json` (1.0) - JSON processing for API requests/responses
 
+#### Logging & Utilities
+- `env_logger` (0.10) - Environment-based logging configuration
+- `log` (0.4) - Logging facade for Rust
+- `uuid` (1.0) - UUID generation for request tracking
+- `chrono` (0.4) - Date and time handling
+
 All dependencies are specified in `Cargo.toml` with appropriate feature flags for optimal performance and functionality.
+
+## Troubleshooting
+
+### Common Issues
+
+1. **Bot not responding to mentions**
+   - Check that the bot has the correct permissions
+   - Verify the bot user ID in the code matches your bot
+   - Ensure the bot is online and connected
+
+2. **AI commands not working**
+   - Verify LM Studio or Ollama is running
+   - Check `lmapiconf.txt` configuration
+   - Ensure models are loaded in your AI server
+   - Check the log file for detailed error messages
+
+3. **YouTube summarization failing**
+   - Install yt-dlp: `pip install yt-dlp` or use package manager
+   - Verify yt-dlp is in your PATH: `yt-dlp --version`
+   - Check the log file for specific error details
+
+4. **Logging issues**
+   - Ensure `RUST_LOG=trace` is set in `botconfig.txt`
+   - Check that `log.txt` is writable
+   - Verify no other processes are locking the log file
+
+### Getting Help
+
+- Check the `log.txt` file for detailed error messages and debugging information
+- Review the `LOGGING.md` file for logging system documentation
+- Examine the `PLANNING.md` file for development roadmap and known issues
+- Ensure all configuration files are properly set up using the example templates
+
+## License
+
+This project is licensed under the MIT License - see the LICENSE file for details.
