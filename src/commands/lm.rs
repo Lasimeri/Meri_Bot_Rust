@@ -108,6 +108,298 @@ pub struct Delta {
 
 // Forward declaration of handle_lm_request for use in lm command
 
+/// Handle LM request with global context (shared across all users)
+/// This is used when the bot is mentioned, providing a shared conversation history
+pub async fn handle_lm_request_global(
+    ctx: &Context,
+    msg: &Message,
+    input: &str,
+    original_prompt: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    println!("[DEBUG][HANDLE_LM_GLOBAL] === STARTING GLOBAL LM REQUEST ===");
+    println!("[DEBUG][HANDLE_LM_GLOBAL] User: {} (ID: {})", msg.author.name, msg.author.id);
+    println!("[DEBUG][HANDLE_LM_GLOBAL] Input received: '{}'", input);
+    if let Some(orig) = original_prompt {
+        println!("[DEBUG][HANDLE_LM_GLOBAL] Original prompt: '{}'", orig);
+    } else {
+        println!("[DEBUG][HANDLE_LM_GLOBAL] No original prompt provided");
+    }
+    println!("[DEBUG][HANDLE_LM_GLOBAL] Message attachments: {}", msg.attachments.len());
+    println!("[DEBUG][HANDLE_LM_GLOBAL] Has referenced message: {}", msg.referenced_message.is_some());
+    
+    // Resolve user IDs to usernames in the input
+    let processed_input = resolve_user_mentions(ctx, input).await;
+    println!("[DEBUG][HANDLE_LM_GLOBAL] Processed input with resolved mentions: '{}'", processed_input);
+    
+    // Check if this is a vision request
+    if processed_input.starts_with("-v") || processed_input.starts_with("--vision") {
+        println!("[DEBUG][HANDLE_LM_GLOBAL] === VISION REQUEST DETECTED ===");
+        println!("[DEBUG][HANDLE_LM_GLOBAL] Delegating to vision handling");
+        
+        let vision_prompt = if processed_input.starts_with("-v") {
+            let after_flag = if processed_input.starts_with("-v ") {
+                &processed_input[3..] // "-v "
+            } else {
+                &processed_input[2..] // "-v"
+            };
+            after_flag.trim().to_string()
+        } else {
+            let after_flag = if processed_input.starts_with("--vision ") {
+                &processed_input[9..] // "--vision "
+            } else {
+                &processed_input[8..] // "--vision"
+            };
+            after_flag.trim().to_string()
+        };
+        
+        println!("[DEBUG][HANDLE_LM_GLOBAL] Extracted vision prompt: '{}'", vision_prompt);
+        
+        if vision_prompt.is_empty() {
+            println!("[DEBUG][HANDLE_LM_GLOBAL] Vision prompt is empty, returning error");
+            msg.reply(ctx, "Please provide a prompt for vision analysis! Usage: `<@Bot> -v <prompt>` with image attached.").await?;
+            return Ok(());
+        }
+
+        // Enhanced attachment detection with more debugging
+        println!("[DEBUG][HANDLE_LM_GLOBAL] === ATTACHMENT DETECTION ===");
+        println!("[DEBUG][HANDLE_LM_GLOBAL] Current message attachments: {}", msg.attachments.len());
+        
+        let attachment_to_process = if !msg.attachments.is_empty() {
+            println!("[DEBUG][HANDLE_LM_GLOBAL] Found {} attachments in current message", msg.attachments.len());
+            for (i, att) in msg.attachments.iter().enumerate() {
+                println!("[DEBUG][HANDLE_LM_GLOBAL] Attachment {}: {} ({})", i, att.filename, att.content_type.as_deref().unwrap_or("unknown"));
+            }
+            Some(&msg.attachments[0])
+        } else {
+            println!("[DEBUG][HANDLE_LM_GLOBAL] No attachments in current message");
+            if let Some(referenced_msg) = &msg.referenced_message {
+                println!("[DEBUG][HANDLE_LM_GLOBAL] Checking referenced message from user: {}", referenced_msg.author.name);
+                println!("[DEBUG][HANDLE_LM_GLOBAL] Referenced message attachments: {}", referenced_msg.attachments.len());
+                
+                if !referenced_msg.attachments.is_empty() {
+                    println!("[DEBUG][HANDLE_LM_GLOBAL] Found {} attachments in referenced message", referenced_msg.attachments.len());
+                    for (i, att) in referenced_msg.attachments.iter().enumerate() {
+                        println!("[DEBUG][HANDLE_LM_GLOBAL] Referenced attachment {}: {} ({})", i, att.filename, att.content_type.as_deref().unwrap_or("unknown"));
+                    }
+                    Some(&referenced_msg.attachments[0])
+                } else {
+                    println!("[DEBUG][HANDLE_LM_GLOBAL] No attachments found in referenced message");
+                    None
+                }
+            } else {
+                println!("[DEBUG][HANDLE_LM_GLOBAL] No referenced message found");
+                None
+            }
+        };
+
+        let attachment = match attachment_to_process {
+            Some(att) => {
+                println!("[DEBUG][HANDLE_LM_GLOBAL] Using attachment: {} ({})", att.filename, att.content_type.as_deref().unwrap_or("unknown"));
+                att
+            },
+            None => {
+                println!("[DEBUG][HANDLE_LM_GLOBAL] No image attachments found in current or referenced message");
+                msg.reply(ctx, "Please attach an image for vision analysis, or reply to a message with an image attachment.").await?;
+                return Ok(());
+            }
+        };
+
+        let content_type = attachment.content_type.as_deref().unwrap_or("");
+        println!("[DEBUG][HANDLE_LM_GLOBAL] Checking content type: '{}'", content_type);
+        
+        if !content_type.starts_with("image/") {
+            println!("[DEBUG][HANDLE_LM_GLOBAL] Attachment is not an image, returning error");
+            msg.reply(ctx, "Attached file is not an image. Please attach a valid image file.").await?;
+            return Ok(());
+        }
+
+        println!("[DEBUG][HANDLE_LM_GLOBAL] === CALLING VISION HANDLER ===");
+        println!("[DEBUG][HANDLE_LM_GLOBAL] Calling vision handler for attachment: {}", attachment.filename);
+        return crate::commands::vis::handle_vision_request(ctx, msg, &vision_prompt, attachment).await;
+    }
+    
+    // Regular LM handling with RAG support
+    println!("[DEBUG][HANDLE_LM_GLOBAL] === REGULAR LM REQUEST ===");
+    println!("[DEBUG][HANDLE_LM_GLOBAL] Processing as regular LM request");
+    
+    let prompt = processed_input.clone();
+    println!("[DEBUG][HANDLE_LM_GLOBAL] Using processed prompt: '{}'", prompt);
+    
+    // Process attachments for RAG if any
+    println!("[DEBUG][HANDLE_LM_GLOBAL] === RAG ATTACHMENT PROCESSING ===");
+    let mut processed_documents = Vec::new();
+    if !msg.attachments.is_empty() {
+        println!("[DEBUG][HANDLE_LM_GLOBAL] Found {} attachments, processing for document analysis", msg.attachments.len());
+        
+        match process_attachments(&msg.attachments, ctx).await {
+            Ok(docs) => {
+                processed_documents = docs;
+                println!("[DEBUG][HANDLE_LM_GLOBAL] Successfully processed {} documents", processed_documents.len());
+                for (i, doc) in processed_documents.iter().enumerate() {
+                    println!("[DEBUG][HANDLE_LM_GLOBAL] Document {}: {} ({} chars, type: {})", 
+                        i + 1, doc.filename, doc.content.len(), doc.content_type);
+                }
+            }
+            Err(e) => {
+                eprintln!("[DEBUG][HANDLE_LM_GLOBAL] Failed to process attachments: {}", e);
+                msg.reply(ctx, &format!("⚠️ Failed to process some attachments: {}\n\nContinuing with text-only analysis.", e)).await?;
+            }
+        }
+    } else {
+        println!("[DEBUG][HANDLE_LM_GLOBAL] No attachments found for RAG processing");
+    }
+    
+    // Create RAG-enhanced prompt if documents were processed
+    println!("[DEBUG][HANDLE_LM_GLOBAL] === PROMPT ENHANCEMENT ===");
+    let final_prompt = if !processed_documents.is_empty() {
+        let enhanced = create_rag_prompt(&prompt, &processed_documents);
+        println!("[DEBUG][HANDLE_LM_GLOBAL] Created RAG-enhanced prompt ({} chars)", enhanced.len());
+        enhanced
+    } else {
+        println!("[DEBUG][HANDLE_LM_GLOBAL] Using original prompt (no RAG enhancement)");
+        prompt.to_string()
+    };
+
+    // Record user prompt in global context history (store processed prompt, not RAG-enhanced)
+    println!("[DEBUG][HANDLE_LM_GLOBAL] === GLOBAL CONTEXT RECORDING ===");
+    {
+        let mut data_map = ctx.data.write().await;
+        
+        // Get global context
+        let global_context = data_map.get_mut::<crate::GlobalLmContextMap>().expect("Global LM context map not initialized");
+        
+        // Log current context state before adding message
+        println!("[DEBUG][HANDLE_LM_GLOBAL] Current global context state: {}", global_context.get_context_info());
+        
+        // Force cleanup if context is getting too large
+        if global_context.needs_cleanup() {
+            println!("[DEBUG][HANDLE_LM_GLOBAL] Global context is large, forcing cleanup before adding new message");
+            global_context.force_cleanup();
+        }
+        
+        // Use processed prompt for context (with resolved mentions)
+        let context_prompt = &processed_input;
+        println!("[DEBUG][HANDLE_LM_GLOBAL] Recording processed prompt in global context: '{}'", context_prompt);
+        global_context.add_user_message(ChatMessage { role: "user".to_string(), content: context_prompt.to_string() });
+        
+        // Log context state after adding message
+        println!("[DEBUG][HANDLE_LM_GLOBAL] Global context after adding user message: {}", global_context.get_context_info());
+        
+        // Check if context needs cleanup
+        if global_context.needs_cleanup() {
+            println!("[DEBUG][HANDLE_LM_GLOBAL] Global context is getting large, may need cleanup soon");
+        }
+    }
+
+    println!("[DEBUG][HANDLE_LM_GLOBAL] === CONFIGURATION LOADING ===");
+    let config = crate::commands::search::load_lm_config().await?;
+    println!("[DEBUG][HANDLE_LM_GLOBAL] Loaded LM config - Model: {}, URL: {}", config.default_model, config.base_url);
+    
+    let base_system_prompt = load_system_prompt().await?;
+    println!("[DEBUG][HANDLE_LM_GLOBAL] Loaded system prompt ({} chars)", base_system_prompt.len());
+    
+    println!("[DEBUG][HANDLE_LM_GLOBAL] === MESSAGE BUILDING ===");
+    let mut messages = Vec::new();
+    messages.push(ChatMessage { role: "system".to_string(), content: base_system_prompt });
+    println!("[DEBUG][HANDLE_LM_GLOBAL] Added system message");
+    
+    {
+        let data_map = ctx.data.read().await;
+        if let Some(global_context) = data_map.get::<crate::GlobalLmContextMap>() {
+            // Safety check: force cleanup if context is too large
+            if global_context.needs_cleanup() {
+                println!("[DEBUG][HANDLE_LM_GLOBAL] Global context is large, will force cleanup before loading messages");
+            }
+            
+            let conversation_messages = global_context.get_conversation_messages();
+            println!("[DEBUG][HANDLE_LM_GLOBAL] Loading {} conversation messages from global context", conversation_messages.len());
+            for (i, entry) in conversation_messages.iter().enumerate() {
+                // Process mentions in historical messages to ensure no user IDs are sent to the AI
+                let processed_content = resolve_user_mentions(ctx, &entry.content).await;
+                let processed_message = ChatMessage {
+                    role: entry.role.clone(),
+                    content: processed_content,
+                };
+                messages.push(processed_message);
+                println!("[DEBUG][HANDLE_LM_GLOBAL] Added processed global context message {}: {} ({} chars)", 
+                    i + 1, entry.role, entry.content.len());
+            }
+            println!("[DEBUG][HANDLE_LM_GLOBAL] Loaded and processed {} global context messages", 
+                conversation_messages.len());
+        } else {
+            println!("[DEBUG][HANDLE_LM_GLOBAL] No global context found");
+        }
+    }
+    
+    messages.push(ChatMessage { role: "user".to_string(), content: final_prompt.clone() });
+    println!("[DEBUG][HANDLE_LM_GLOBAL] Added final user message: {} chars", final_prompt.len());
+    
+    let multimodal_messages = convert_to_multimodal(messages);
+    println!("[DEBUG][HANDLE_LM_GLOBAL] Converted to {} multimodal messages", multimodal_messages.len());
+    
+    // Log which model is being used for LM command
+    println!("[DEBUG][HANDLE_LM_GLOBAL] === API PREPARATION ===");
+    println!("[DEBUG][HANDLE_LM_GLOBAL] Using model '{}' for chat", config.default_model);
+    if !processed_documents.is_empty() {
+        println!("[DEBUG][HANDLE_LM_GLOBAL] Using document-enhanced prompt with {} documents", processed_documents.len());
+    }
+    
+    println!("[DEBUG][HANDLE_LM_GLOBAL] === SENDING INITIAL MESSAGE ===");
+    let mut initial_msg = msg.channel_id.send_message(&ctx.http, |m| {
+        let content = if !processed_documents.is_empty() {
+            format!("**AI Response (Global Context - Document Analysis - Part 1):**\n```\n\n```")
+        } else {
+            "**AI Response (Global Context - Part 1):**\n```\n\n```".to_string()
+        };
+        m.content(content)
+    }).await?;
+    println!("[DEBUG][HANDLE_LM_GLOBAL] Initial Discord message sent successfully");
+    
+    println!("[DEBUG][HANDLE_LM_GLOBAL] === STARTING STREAMING ===");
+    let _stats = stream_chat_response(multimodal_messages, &config.default_model, &config, ctx, &mut initial_msg).await?;
+    println!("[DEBUG][HANDLE_LM_GLOBAL] Streaming completed successfully");
+    
+    // Record response in global history
+    println!("[DEBUG][HANDLE_LM_GLOBAL] === RECORDING RESPONSE ===");
+    let response_content = initial_msg.content.clone();
+    println!("[DEBUG][HANDLE_LM_GLOBAL] Response content length: {} chars", response_content.len());
+    
+    // Check for empty response content
+    if response_content.trim().is_empty() || response_content.len() < 10 {
+        eprintln!("[DEBUG][HANDLE_LM_GLOBAL] ERROR: Final Discord message has insufficient content");
+        eprintln!("[DEBUG][HANDLE_LM_GLOBAL] Response content: '{}'", response_content);
+        eprintln!("[DEBUG][HANDLE_LM_GLOBAL] Content length: {} chars", response_content.len());
+        return Err("API response resulted in empty or insufficient content - this indicates a problem with the streaming or API".into());
+    }
+    
+    {
+        let mut data_map = ctx.data.write().await;
+        let global_context = data_map.get_mut::<crate::GlobalLmContextMap>().expect("Global LM context map not initialized");
+        
+        // Log current context state before adding assistant message
+        println!("[DEBUG][HANDLE_LM_GLOBAL] Current global context state before adding assistant message: {}", global_context.get_context_info());
+        
+        // Force cleanup if context is getting too large
+        if global_context.needs_cleanup() {
+            println!("[DEBUG][HANDLE_LM_GLOBAL] Global context is large, forcing cleanup before adding assistant message");
+            global_context.force_cleanup();
+        }
+        
+        global_context.add_assistant_message(ChatMessage { role: "assistant".to_string(), content: response_content });
+        
+        // Log context state after adding assistant message
+        println!("[DEBUG][HANDLE_LM_GLOBAL] Global context after adding assistant message: {}", global_context.get_context_info());
+        
+        // Check if context needs cleanup
+        if global_context.needs_cleanup() {
+            println!("[DEBUG][HANDLE_LM_GLOBAL] Global context is getting large after adding assistant message");
+        }
+    }
+    
+    println!("[DEBUG][HANDLE_LM_GLOBAL] === GLOBAL LM REQUEST COMPLETED ===");
+    Ok(())
+}
+
 /// Resolve Discord user IDs to usernames in text
 /// This function finds patterns like <@123456789> and @123456789 and replaces them with username
 /// Features: timeout protection, rate limiting, robust error handling, and fallback mechanisms
@@ -781,10 +1073,33 @@ pub async fn lm(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
         
         if had_context {
             println!("[DEBUG][LM] Context cleared successfully");
-            msg.reply(ctx, "**LM Chat Context Cleared** ✅\nYour conversation history has been reset (50 user messages + 50 assistant messages).").await?;
+            msg.reply(ctx, "**LM Chat Context Cleared** ✅\nYour conversation history has been reset (250 user messages + 250 assistant messages).").await?;
         } else {
             println!("[DEBUG][LM] No context to clear");
             msg.reply(ctx, "**No LM Context Found** ℹ️\nYou don't have any active conversation history to clear.").await?;
+        }
+        return Ok(());
+    }
+
+    // Check if this is a clear global context request
+    if input.starts_with("--clear-global") || input == "-cg" {
+        println!("[DEBUG][LM] === CLEAR GLOBAL CONTEXT REQUEST DETECTED ===");
+        let mut data_map = ctx.data.write().await;
+        let global_context = data_map.get_mut::<crate::GlobalLmContextMap>().expect("Global LM context map not initialized");
+        
+        let had_context = {
+            let message_count = global_context.total_messages();
+            println!("[DEBUG][LM] Clearing global context (had {} messages)", message_count);
+            global_context.clear();
+            message_count > 0
+        };
+        
+        if had_context {
+            println!("[DEBUG][LM] Global context cleared successfully");
+            msg.reply(ctx, "**Global LM Chat Context Cleared** ✅\nThe shared conversation history has been reset (250 user messages + 250 assistant messages).").await?;
+        } else {
+            println!("[DEBUG][LM] No global context to clear");
+            msg.reply(ctx, "**No Global LM Context Found** ℹ️\nThere's no active shared conversation history to clear.").await?;
         }
         return Ok(());
     }

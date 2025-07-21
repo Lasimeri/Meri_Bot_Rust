@@ -223,7 +223,7 @@ pub async fn reason(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
 
     // Send initial "thinking" message
     let mut current_msg = match msg.channel_id.send_message(&ctx.http, |m| {
-        m.content("**Reasoning Analysis (Part 1):**\n```\n\n```")
+        m.content("**Reasoning Response (Part 1):**\n```\n\n```")
     }).await {
         Ok(message) => message,
         Err(e) => {
@@ -264,6 +264,37 @@ pub async fn reason(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
         }
     }
 
+    Ok(())
+}
+
+#[command]
+#[aliases("clearreason", "resetreason", "clearcontext")]
+/// Command to clear the user's reason chat context
+/// Removes all reasoning conversation history for the user
+pub async fn clearreasoncontext(ctx: &Context, msg: &Message, _args: Args) -> CommandResult {
+    // Clear the user's reason chat context robustly
+    let mut data_map = ctx.data.write().await;
+    let reason_map = data_map.get_mut::<ReasonContextMap>().expect("Reason context map not initialized");
+    
+    let user_id = msg.author.id;
+    let had_context = if let Some(context) = reason_map.get_mut(&user_id) {
+        let message_count = context.total_messages();
+        let context_info = context.get_context_info();
+        println!("[clearcontext] Clearing reason context for user {}: {}", user_id, context_info);
+        context.clear();
+        message_count > 0
+    } else {
+        false
+    };
+    
+    println!("[clearcontext] Cleared reason context for user {} (had_context={})", user_id, had_context);
+    
+    if had_context {
+        msg.reply(ctx, "**Reasoning Context Cleared** ✅\nYour reasoning conversation history has been fully reset (50 user messages + 50 assistant messages). The next reasoning question you ask will start a brand new context.").await?;
+    } else {
+        msg.reply(ctx, "**No Reasoning Context Found** ℹ️\nYou don't have any active reasoning conversation history to clear. Start a reasoning conversation with `^reason <your question>`.\n\nIf you believe reasoning context is still being used, please report this as a bug.").await?;
+    }
+    
     Ok(())
 }
 
@@ -480,10 +511,16 @@ async fn stream_reasoning_response(
     ctx: &Context,
     initial_msg: &mut Message,
 ) -> Result<StreamingStats, Box<dyn std::error::Error + Send + Sync>> {
+    println!("[DEBUG][REASONING] === STARTING REASONING STREAM RESPONSE ===");
+    println!("[DEBUG][REASONING] Model: {}", model);
+    println!("[DEBUG][REASONING] Messages count: {}", messages.len());
+    println!("[DEBUG][REASONING] Base URL: {}", config.base_url);
+    println!("[DEBUG][REASONING] Timeout: {} seconds", config.timeout);
+    
     let client = reqwest::Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(config.timeout * 3))
-        .timeout(std::time::Duration::from_secs(60)) // Add 60-second timeout
+        .timeout(std::time::Duration::from_secs(60))
         .build()?;
+    println!("[DEBUG][REASONING] HTTP client created");
         
     let chat_request = ChatRequest {
         model: model.to_string(),
@@ -492,174 +529,300 @@ async fn stream_reasoning_response(
         max_tokens: config.default_max_tokens,
         stream: true,
     };
+    println!("[DEBUG][REASONING] Chat request created - Temperature: {}, Max tokens: {}, Stream: {}", 
+        chat_request.temperature, chat_request.max_tokens, chat_request.stream);
 
-    let response = client
-        .post(&format!("{}/v1/chat/completions", config.base_url))
-        .json(&chat_request)
-        .send()
-        .await?;
+    let api_url = format!("{}/v1/chat/completions", config.base_url);
+    println!("[DEBUG][REASONING] API URL: {}", api_url);
 
-    if !response.status().is_success() {
-        return Err(format!("API request failed: HTTP {}", response.status()).into());
+    // First, test basic connectivity to the server with enhanced error handling
+    println!("[DEBUG][REASONING] === TESTING BASIC CONNECTIVITY ===");
+    match client.get(&config.base_url).send().await {
+        Ok(response) => {
+            println!("[DEBUG][REASONING] Basic connectivity test successful - Status: {}", response.status());
+        }
+        Err(e) => {
+            println!("[DEBUG][REASONING] Basic connectivity test failed: {}", e);
+            
+            // Check if this is a Windows permission error
+            let error_msg = format!("{}", e);
+            if error_msg.contains("os error 10013") || error_msg.contains("access permissions") {
+                return Err(format!(
+                    "Windows Network Permission Error (10013): Cannot connect to {}.\n\n**Common Solutions:**\n\
+                    1. **Windows Firewall:** Allow the application through Windows Defender Firewall\n\
+                    2. **Network Access:** Ensure the AI server at {} is running and accessible\n\
+                    3. **Port Access:** Check if port 11434 is blocked by antivirus or firewall\n\
+                    4. **Local Network:** Try using localhost (127.0.0.1) instead of {} if running locally\n\
+                    5. **Administrator:** Try running as administrator if needed\n\n\
+                    **Original error:** {}", 
+                    config.base_url, config.base_url, config.base_url.replace("http://", ""), e
+                ).into());
+            } else if error_msg.contains("timeout") || error_msg.contains("timed out") {
+                return Err(format!(
+                    "Connection Timeout: Cannot reach AI server at {}.\n\n**Check:**\n\
+                    1. AI server is running and accessible\n\
+                    2. Network connection is stable\n\
+                    3. Server is not overloaded\n\n\
+                    **Original error:** {}", 
+                    config.base_url, e
+                ).into());
+            } else if error_msg.contains("refused") || error_msg.contains("connection refused") {
+                return Err(format!(
+                    "Connection Refused: AI server at {} is not accepting connections.\n\n**Check:**\n\
+                    1. AI server (LM Studio/Ollama) is running\n\
+                    2. Server is listening on the correct port\n\
+                    3. No other application is using the port\n\n\
+                    **Original error:** {}", 
+                    config.base_url, e
+                ).into());
+            } else {
+                return Err(format!("Cannot reach remote server {}: {}", config.base_url, e).into());
+            }
+        }
     }
 
+    // Now attempt the actual streaming API call
+    println!("[DEBUG][REASONING] === MAKING STREAMING API REQUEST ===");
+    let response = match client
+        .post(&api_url)
+        .json(&chat_request)
+        .send()
+        .await
+    {
+        Ok(resp) => {
+            println!("[DEBUG][REASONING] API request sent successfully - Status: {}", resp.status());
+            resp
+        }
+        Err(e) => {
+            println!("[DEBUG][REASONING] API request failed: {}", e);
+            
+            // Enhanced error handling for API requests
+            let error_msg = format!("{}", e);
+            if error_msg.contains("os error 10013") || error_msg.contains("access permissions") {
+                return Err(format!(
+                    "Windows Network Permission Error (10013): Cannot connect to AI API at {}.\n\n**Solutions:**\n\
+                    1. **Windows Firewall:** Add firewall exception for this application\n\
+                    2. **Run as Administrator:** Try running the bot as administrator\n\
+                    3. **Check AI Server:** Ensure LM Studio/Ollama is running at {}\n\
+                    4. **Port Access:** Verify port 11434 isn't blocked\n\
+                    5. **Network Config:** Try localhost (127.0.0.1) if running locally\n\n\
+                    **Original error:** {}", 
+                    api_url, config.base_url, e
+                ).into());
+            } else {
+                return Err(format!("Streaming API request to {} failed: {}", api_url, e).into());
+            }
+        }
+    };
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let error_text = response.text().await.unwrap_or_else(|_| "Unable to read error response".to_string());
+        println!("[DEBUG][REASONING] API returned error status {}: {}", status, error_text);
+        return Err(format!("Streaming API request failed: HTTP {} - {}", status, error_text).into());
+    }
+
+    println!("[DEBUG][REASONING] === BUFFERING COMPLETE RESPONSE ===");
     let mut stream = response.bytes_stream();
+    
+    let mut raw_response = String::new();
+    let mut chunk_count = 0;
+    let mut line_buffer = String::new();
+    let mut received_any_content = false;
+    let mut stream_complete = false;
+
+    println!("[DEBUG][REASONING] Starting to buffer response from API...");
+
+    // STEP 1: Buffer the complete response from the API
+    while let Some(chunk) = stream.next().await {
+        if stream_complete {
+            println!("[DEBUG][REASONING] Stream marked as complete, stopping buffering");
+            break;
+        }
+        
+        match chunk {
+            Ok(bytes) => {
+                chunk_count += 1;
+                if chunk_count == 1 {
+                    println!("[DEBUG][REASONING] Received first chunk ({} bytes)", bytes.len());
+                } else if chunk_count % 10 == 0 {
+                    println!("[DEBUG][REASONING] Buffered {} chunks, total response: {} chars", chunk_count, raw_response.len());
+                }
+                
+                line_buffer.push_str(&String::from_utf8_lossy(&bytes));
+
+                while let Some(i) = line_buffer.find('\n') {
+                    let line = line_buffer.drain(..=i).collect::<String>();
+                    let line = line.trim();
+
+                    if let Some(json_str) = line.strip_prefix("data: ") {
+                        if json_str.trim() == "[DONE]" {
+                            println!("[DEBUG][REASONING] Received [DONE] signal, marking stream complete");
+                            stream_complete = true;
+                            break;
+                        }
+
+                        if let Ok(response_chunk) = serde_json::from_str::<ChatResponse>(json_str) {
+                            for choice in response_chunk.choices {
+                                if let Some(finish_reason) = choice.finish_reason {
+                                    if finish_reason == "stop" {
+                                        println!("[DEBUG][REASONING] Received finish_reason=stop, marking stream complete");
+                                        stream_complete = true;
+                                        break;
+                                    }
+                                }
+
+                                if let Some(delta) = choice.delta {
+                                    if let Some(content) = delta.content {
+                                        received_any_content = true;
+                                        raw_response.push_str(&content);
+                                        println!("[DEBUG][REASONING] Added content chunk: '{}' (total: {} chars)", 
+                                            content, raw_response.len());
+                                    } else {
+                                        println!("[DEBUG][REASONING] Delta has no content field");
+                                    }
+                                } else {
+                                    println!("[DEBUG][REASONING] Choice has no delta field");
+                                }
+                            }
+                        } else {
+                            if !json_str.trim().is_empty() {
+                                println!("[DEBUG][REASONING] Failed to parse JSON chunk: {}", json_str);
+                            }
+                        }
+                    }
+                }
+                
+                // Break out of the outer loop if stream is complete
+                if stream_complete {
+                    println!("[DEBUG][REASONING] Breaking out of chunk processing loop");
+                    break;
+                }
+            }
+            Err(e) => {
+                eprintln!("[DEBUG][REASONING] Stream error: {}", e);
+                return Err(e.into());
+            }
+        }
+    }
+
+    println!("[DEBUG][REASONING] === BUFFERING COMPLETE ===");
+    println!("[DEBUG][REASONING] Buffered {} chunks, total response: {} chars", chunk_count, raw_response.len());
+    println!("[DEBUG][REASONING] Raw response content: '{}'", raw_response);
+    
+    if !received_any_content {
+        eprintln!("[DEBUG][REASONING] No content received from API stream");
+        return Err("No content received from API stream".into());
+    }
+    
+    // Check for zero character response
+    if raw_response.is_empty() {
+        eprintln!("[DEBUG][REASONING] ERROR: API returned 0 characters in response");
+        eprintln!("[DEBUG][REASONING] Chunk count: {}", chunk_count);
+        eprintln!("[DEBUG][REASONING] Received any content flag: {}", received_any_content);
+        return Err("API returned 0 characters in response - this indicates a problem with the API or model".into());
+    }
+
+    // STEP 2: Process the buffered content and stream to Discord
+    println!("[DEBUG][REASONING] === PROCESSING AND STREAMING TO DISCORD ===");
+    
+    // Apply thinking tag filtering to the complete response
+    let filtered_response = filter_thinking_tags(&raw_response);
+    println!("[DEBUG][REASONING] Filtered response length: {} chars", filtered_response.len());
+    println!("[DEBUG][REASONING] Filtered response content: '{}'", filtered_response);
+    
+    // Apply reasoning content processing
+    let processed_response = process_reasoning_content(&filtered_response);
+    println!("[DEBUG][REASONING] Processed response length: {} chars", processed_response.len());
+    println!("[DEBUG][REASONING] Processed response content: '{}'", processed_response);
+    
+    if processed_response.is_empty() {
+        println!("[DEBUG][REASONING] Processed response is empty, sending fallback message");
+        let _ = initial_msg.edit(&ctx.http, |m| {
+            m.content("**Reasoning Response Complete**\n\nThe AI completed its reasoning process, but the response appears to contain only thinking content.")
+        }).await;
+        
+        let stats = StreamingStats {
+            total_characters: raw_response.len(),
+            message_count: 1,
+            filtered_characters: raw_response.len() - filtered_response.len(),
+        };
+        return Ok(stats);
+    }
+    
     let mut message_state = MessageState {
         current_content: String::new(),
         current_message: initial_msg.clone(),
         message_index: 1,
         char_limit: config.max_discord_message_length - config.response_format_padding,
     };
+    println!("[DEBUG][REASONING] Message state initialized - Char limit: {}", message_state.char_limit);
     
-    let mut raw_response = String::new();
-    let mut last_filtered = String::new();
-    let mut accumulated_filtered = String::new();
-    let mut last_update = std::time::Instant::now();
-    let update_interval = std::time::Duration::from_millis(1500); // Increased from 800ms to reduce API calls
-    let mut line_buffer = String::new();
-
-    println!("Starting optimized real-time streaming for reasoning response...");
-
-    while let Some(chunk) = stream.next().await {
-        match chunk {
-            Ok(bytes) => {
-                line_buffer.push_str(&String::from_utf8_lossy(&bytes));
-
-                while let Some(i) = line_buffer.find('\n') {
-                    let line = line_buffer.drain(..=i).collect::<String>();
-                    let line = line.trim();
-                    
-                    if let Some(json_str) = line.strip_prefix("data: ") {
-                        if json_str.trim() == "[DONE]" {
-                            // Process final content
-                            let final_content = process_reasoning_content(&raw_response);
-                            if !final_content.is_empty() {
-                                if let Err(e) = finalize_message_content(&mut message_state, &final_content, ctx, config).await {
-                                    eprintln!("Failed to finalize message: {}", e);
-                                }
-                            } else {
-                                let _ = message_state.current_message.edit(&ctx.http, |m| {
-                                    m.content("**Reasoning Complete**\n\nThe AI completed its reasoning process, but the response appears to contain only thinking content.")
-                                }).await;
-                            }
-                            
-                            let stats = StreamingStats {
-                                total_characters: raw_response.len(),
-                                message_count: message_state.message_index,
-                                filtered_characters: raw_response.len() - accumulated_filtered.len(),
-                            };
-                            return Ok(stats);
-                        }
-                        
-                        if let Ok(response_chunk) = serde_json::from_str::<ChatResponse>(json_str) {    
-                            for choice in response_chunk.choices {
-                                if let Some(finish_reason) = choice.finish_reason {
-                                    if finish_reason == "stop" {
-                                        // Process final content
-                                        let final_content = process_reasoning_content(&raw_response);
-                                        if !final_content.is_empty() {
-                                            if let Err(e) = finalize_message_content(&mut message_state, &final_content, ctx, config).await {
-                                                eprintln!("Failed to finalize message: {}", e);
-                                            }
-                                        } else {
-                                            let _ = message_state.current_message.edit(&ctx.http, |m| {
-                                                m.content("**Reasoning Complete**\n\nThe AI completed its reasoning process, but the response appears to contain only thinking content.")
-                                            }).await;
-                                        }
-                                        
-                                        let stats = StreamingStats {
-                                            total_characters: raw_response.len(),
-                                            message_count: message_state.message_index,
-                                            filtered_characters: raw_response.len() - accumulated_filtered.len(),
-                                        };
-                                        
-                                        return Ok(stats);
-                                    }
-                                }
-                                
-                                if let Some(delta) = choice.delta {
-                                    if let Some(content) = delta.content {
-                                        raw_response.push_str(&content);
-                                        
-                                        // Only update Discord when we have significant new content or time has passed
-                                        if (last_update.elapsed() >= update_interval) || 
-                                           raw_response.len() - last_filtered.len() > 200 { // Update when enough new raw content
-                                            let current_filtered = filter_thinking_tags(&raw_response);
-                                            
-                                            // Safe slicing: only get new content if current_filtered is longer than last_filtered
-                                            if current_filtered.len() > last_filtered.len() {
-                                                let new_content = &current_filtered[last_filtered.len()..];
-                                                if !new_content.is_empty() {
-                                                    accumulated_filtered.push_str(new_content);
-                                                    last_filtered = current_filtered;
-                                                    
-                                                    // Only update Discord if we have enough new content
-                                                    if accumulated_filtered.len() > 100 {
-                                                        if let Err(e) = update_discord_message(&mut message_state, &accumulated_filtered, ctx, config).await {
-                                                            eprintln!("Failed to update Discord message: {}", e);
-                                                            return Err(e);
-                                                        }
-                                                        accumulated_filtered.clear();
-                                                    }
-                                                }
-                                            } else if current_filtered != last_filtered {
-                                                // Content changed but didn't grow - replace last_filtered
-                                                last_filtered = current_filtered;
-                                            }
-                                            
-                                            last_update = std::time::Instant::now();
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            Err(e) => {
-                eprintln!("Stream error: {}", e);
-                // Process any remaining content using full raw
-                let final_content = process_reasoning_content(&raw_response);
-                if !final_content.is_empty() {
-                    let _ = finalize_message_content(&mut message_state, &final_content, ctx, config).await;
-                } else if !last_filtered.is_empty() {
-                    let _ = finalize_message_content(&mut message_state, &last_filtered, ctx, config).await;
-                }
-                return Err(e.into());
-            }
+    // Split the processed response into chunks for Discord streaming
+    let chunk_size = 100; // Characters per Discord update
+    let mut chars_processed = 0;
+    
+    while chars_processed < processed_response.len() {
+        let end_pos = std::cmp::min(chars_processed + chunk_size, processed_response.len());
+        let chunk = &processed_response[chars_processed..end_pos];
+        
+        println!("[DEBUG][REASONING] Streaming chunk {} chars to Discord", chunk.len());
+        println!("[DEBUG][REASONING] Chunk content: '{}'", chunk);
+        println!("[DEBUG][REASONING] Current state content before update: {} chars", message_state.current_content.len());
+        println!("[DEBUG][REASONING] Current state content before update: '{}'", message_state.current_content);
+        
+        if let Err(e) = update_discord_message(&mut message_state, chunk, ctx, config).await {
+            eprintln!("[DEBUG][REASONING] Failed to update Discord message: {}", e);
+            return Err(e);
         }
+        
+        println!("[DEBUG][REASONING] Current state content after update: {} chars", message_state.current_content.len());
+        println!("[DEBUG][REASONING] Current state content after update: '{}'", message_state.current_content);
+        
+        chars_processed = end_pos;
+        
+        // Small delay to make streaming visible
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
     }
 
-    // Final cleanup using full raw
-    let final_content = process_reasoning_content(&raw_response);
-    let final_filtered_len = if !final_content.is_empty() {
-        if let Err(e) = finalize_message_content(&mut message_state, &final_content, ctx, config).await {
-            eprintln!("Failed to finalize remaining content: {}", e);
-        }
-        final_content.len()
-    } else if !last_filtered.is_empty() {
-        let filtered_len = last_filtered.len();
-        if let Err(e) = finalize_message_content(&mut message_state, &last_filtered, ctx, config).await {
-            eprintln!("Failed to finalize remaining content: {}", e);
-        }
-        filtered_len
-    } else {
-        let _ = message_state.current_message.edit(&ctx.http, |m| {
-            m.content("**Reasoning Complete**\n\nThe AI completed its reasoning process, but the response appears to contain only thinking content.")
-        }).await;
-        0
-    };
+    // Finalize the message
+    println!("[DEBUG][REASONING] === FINALIZING DISCORD MESSAGE ===");
+    println!("[DEBUG][REASONING] About to finalize with processed content length: {} chars", processed_response.len());
+    println!("[DEBUG][REASONING] Final message state content: {} chars", message_state.current_content.len());
+    println!("[DEBUG][REASONING] Final message state content: '{}'", message_state.current_content);
+    
+    // Check if we have content to finalize
+    if processed_response.is_empty() {
+        eprintln!("[DEBUG][REASONING] ERROR: Cannot finalize - no content was processed from API");
+        return Err("No content was processed from API - cannot finalize empty message".into());
+    }
+    
+    // Check if the message state has content (this should catch streaming issues)
+    if message_state.current_content.trim().is_empty() {
+        eprintln!("[DEBUG][REASONING] ERROR: Message state has no content despite processed response");
+        eprintln!("[DEBUG][REASONING] Processed response length: {} chars", processed_response.len());
+        eprintln!("[DEBUG][REASONING] Message state content length: {} chars", message_state.current_content.len());
+        return Err("Message state has no content despite processed response - streaming to Discord failed".into());
+    }
+    
+    if let Err(e) = finalize_message_content(&mut message_state, "", ctx, config).await {
+        eprintln!("[DEBUG][REASONING] Failed to finalize Discord message: {}", e);
+        return Err(e);
+    }
 
     let stats = StreamingStats {
         total_characters: raw_response.len(),
         message_count: message_state.message_index,
-        filtered_characters: raw_response.len() - final_filtered_len,
+        filtered_characters: raw_response.len() - filtered_response.len(),
     };
 
+    println!("[DEBUG][REASONING] === REASONING STREAMING COMPLETED ===");
+    println!("[DEBUG][REASONING] Final stats - Total chars: {}, Messages: {}, Filtered chars: {}", 
+        stats.total_characters, stats.message_count, stats.filtered_characters);
     Ok(stats)
 }
 
-// Helper function to update Discord message with new content
+// Helper function to update Discord message with new content for reasoning
 // Handles chunking and message creation if content exceeds Discord's limit
 #[allow(unused_variables)]
 async fn update_discord_message(
@@ -668,57 +831,77 @@ async fn update_discord_message(
     ctx: &Context,
     config: &LMConfig,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Only update if we have new content
-    if new_content.is_empty() {
-        return Ok(());
+    println!("[DEBUG][REASONING_UPDATE] Updating Discord message with {} chars", new_content.len());
+    
+    println!("[DEBUG][REASONING_UPDATE] New content to add: '{}' ({} chars)", new_content, new_content.len());
+    
+    // First, add the new content to the state
+    if state.current_content.is_empty() {
+        println!("[DEBUG][REASONING_UPDATE] State content was empty, setting to new content");
+        state.current_content = new_content.to_string();
+    } else {
+        println!("[DEBUG][REASONING_UPDATE] State content was not empty, appending new content");
+        state.current_content.push_str(new_content);
     }
     
-    state.current_content.push_str(new_content);
-
+    println!("[DEBUG][REASONING_UPDATE] State content after adding: '{}' ({} chars)", state.current_content, state.current_content.len());
+    
+    // Then create the formatted content for Discord
     let potential_content = format!("**Reasoning Response (Part {}):**\n```\n{}\n```", 
-            state.message_index, state.current_content);
+        state.message_index, state.current_content);
+    
+    println!("[DEBUG][REASONING_UPDATE] Formatted content for Discord: '{}' ({} chars)", potential_content, potential_content.len());
 
     // Check if we need to create a new message
     if potential_content.len() > state.char_limit {
-        // Find a good split point for the content that is over the limit
-        let mut split_at = state.current_content.len() - new_content.len();
-        if let Some(pos) = state.current_content[..split_at].rfind('\n') {
-            split_at = pos;
-        } else if let Some(pos) = state.current_content[..split_at].rfind(' ') {
-            split_at = pos;
-        }
-
-        let (part1, part2) = state.current_content.split_at(split_at);
+        println!("[DEBUG][REASONING_UPDATE] Content exceeds limit ({} > {}), creating new message", 
+            potential_content.len(), state.char_limit);
         
+        // Finalize current message
         let final_content = format!("**Reasoning Response (Part {}):**\n```\n{}\n```", 
-            state.message_index, part1);
-        
-        state.current_message.edit(&ctx.http, |m| {
+            state.message_index, state.current_content);
+        let edit_result = state.current_message.edit(&ctx.http, |m| {
             m.content(final_content)
-        }).await?;
+        }).await;
+        if let Err(e) = edit_result {
+            eprintln!("[ERROR][REASONING_UPDATE] Failed to finalize message part {}: {}", state.message_index, e);
+        } else {
+            println!("[DEBUG][REASONING_UPDATE] Finalized message part {}", state.message_index);
+        }
 
         // Create new message
         state.message_index += 1;
-        state.current_content = part2.trim_start().to_string();
+        // Reset current_content for the new message
+        state.current_content = new_content.to_string();
         let new_msg_content = format!("**Reasoning Response (Part {}):**\n```\n{}\n```", 
             state.message_index, state.current_content);
-        
-        let new_message = state.current_message.channel_id.send_message(&ctx.http, |m| {
+        let send_result = state.current_message.channel_id.send_message(&ctx.http, |m| {
             m.content(new_msg_content)
-        }).await?;
-
-        state.current_message = new_message;
+        }).await;
+        match send_result {
+            Ok(new_message) => {
+                println!("[DEBUG][REASONING_UPDATE] Created new message part {}", state.message_index);
+                state.current_message = new_message;
+            }
+            Err(e) => {
+                eprintln!("[ERROR][REASONING_UPDATE] Failed to create new message part {}: {}", state.message_index, e);
+            }
+        }
     } else {
         // Update current message
-        state.current_message.edit(&ctx.http, |m| {
+        println!("[DEBUG][REASONING_UPDATE] Updating existing message part {}", state.message_index);
+        let edit_result = state.current_message.edit(&ctx.http, |m| {
             m.content(&potential_content)
-        }).await?;
+        }).await;
+        if let Err(e) = edit_result {
+            eprintln!("[ERROR][REASONING_UPDATE] Failed to update existing message part {}: {}", state.message_index, e);
+        }
     }
 
     Ok(())
 }
 
-// Helper function to finalize message content at the end of streaming
+// Helper function to finalize message content at the end of streaming for reasoning
 // Ensures all remaining content is posted and marks the message as complete
 #[allow(unused_variables)]
 async fn finalize_message_content(
@@ -727,24 +910,47 @@ async fn finalize_message_content(
     ctx: &Context,
     config: &LMConfig,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    if remaining_content.trim().is_empty() {
+    println!("[DEBUG][REASONING_FINALIZE] Finalizing message with {} chars", remaining_content.len());
+    println!("[DEBUG][REASONING_FINALIZE] Current state content: {} chars", state.current_content.len());
+    
+    // Check for zero content error condition - this should catch cases where API returned content but it wasn't streamed properly
+    if remaining_content.is_empty() && state.current_content.trim().is_empty() {
+        eprintln!("[DEBUG][REASONING_FINALIZE] ERROR: Attempting to finalize message with 0 total characters");
+        eprintln!("[DEBUG][REASONING_FINALIZE] Remaining content: '{}' ({} chars)", remaining_content, remaining_content.len());
+        eprintln!("[DEBUG][REASONING_FINALIZE] State content: '{}' ({} chars)", state.current_content, state.current_content.len());
+        eprintln!("[DEBUG][REASONING_FINALIZE] This indicates either:");
+        eprintln!("[DEBUG][REASONING_FINALIZE] 1. No content was received from the API");
+        eprintln!("[DEBUG][REASONING_FINALIZE] 2. Content was received but not properly streamed to Discord");
+        eprintln!("[DEBUG][REASONING_FINALIZE] 3. The update_discord_message function failed to populate current_content");
+        return Err("Cannot finalize message with 0 characters - this indicates no content was received from the API or streaming failed".into());
+    }
+    
+    // Add any remaining content if provided
+    if !remaining_content.trim().is_empty() {
+        update_discord_message(state, remaining_content, ctx, config).await?;
+    }
+    
+    // Check if we have any content to finalize (either from remaining_content or existing state)
+    if state.current_content.trim().is_empty() {
+        println!("[DEBUG][REASONING_FINALIZE] No content to finalize");
         return Ok(());
     }
-
-    // Add any remaining content and finalize
-    update_discord_message(state, remaining_content, ctx, config).await?;
     
     // Mark the final message as complete
     let final_display = if state.message_index == 1 {
-        format!("**Reasoning Complete**\n```\n{}\n```", state.current_content)
+        format!("**Reasoning Response Complete**\n```\n{}\n```", state.current_content)
     } else {
-        format!("**Reasoning Complete (Part {}/{})**\n```\n{}\n```", 
+        format!("**Reasoning Response Complete (Part {}/{})**\n```\n{}\n```", 
             state.message_index, state.message_index, state.current_content)
     };
 
-    state.current_message.edit(&ctx.http, |m| {
+    println!("[DEBUG][REASONING_FINALIZE] Marking message as complete - Part {}", state.message_index);
+    let edit_result = state.current_message.edit(&ctx.http, |m| {
         m.content(final_display)
-    }).await?;
+    }).await;
+    if let Err(e) = edit_result {
+        eprintln!("[ERROR][REASONING_FINALIZE] Failed to finalize Discord message part {}: {}", state.message_index, e);
+    }
 
     Ok(())
 }

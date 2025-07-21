@@ -3,6 +3,7 @@
 // for all bot commands, making them easily accessible from main.rs
 
 pub mod echo;           // Echo command for testing
+pub mod help;           // Help system and command documentation
 pub mod ping;           // Basic ping/pong functionality
 pub mod lm;             // Language model integration (AI chat)
 pub mod reason;         // Reasoning and analysis capabilities

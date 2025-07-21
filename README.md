@@ -1,6 +1,6 @@
 # Meri Bot Rust
 
-A powerful Discord bot written in Rust using the Serenity framework, featuring real-time AI chat streaming, advanced reasoning capabilities, comprehensive content summarization, and enhanced logging for complete visibility into bot operations.
+A powerful Discord bot written in Rust using the Serenity framework, featuring real-time AI chat streaming, advanced reasoning capabilities, comprehensive content summarization, enhanced logging for complete visibility into bot operations, and multimodal vision analysis.
 
 ## ⚠️ IMPORTANT: Bot Interaction Method
 
@@ -20,6 +20,7 @@ A powerful Discord bot written in Rust using the Serenity framework, featuring r
 - The `.gitignore` file is configured to prevent accidental uploads of:
   - `botconfig.txt` (contains Discord token)
   - `lmapiconf.txt` (contains model names and API settings)
+  - `serpapi.txt` (contains SerpAPI key for web search)
   - `system_prompt.txt` and `reasoning_prompt.txt` (may contain custom prompts)
 - Use the example files as templates and customize your actual configuration files
 - If you accidentally commit sensitive data, regenerate tokens and review what was exposed
@@ -153,6 +154,7 @@ A powerful Discord bot written in Rust using the Serenity framework, featuring r
 - LM Studio or Ollama (for AI chat and reasoning functionality) - optional
 - yt-dlp (for YouTube transcript extraction) - optional, required for YouTube summarization
 - Internet connection (for web search functionality)
+- SerpAPI key (for enhanced web search functionality) - optional
 
 ## Setup
 
@@ -213,7 +215,16 @@ A powerful Discord bot written in Rust using the Serenity framework, featuring r
    - For reasoning tasks, consider using models optimized for logical analysis (e.g., qwen3:4b, qwen3:8b, etc.).
    - The `system_prompt.txt` configures the AI's behavior and personality for chat interactions.
 
-5. **Build and run**
+5. **Set up SerpAPI (Optional - for enhanced web search)**
+   
+   Create a `serpapi.txt` file in the project root:
+   ```
+   your_serpapi_key_here
+   ```
+   
+   **Note:** Get your SerpAPI key from [SerpAPI](https://serpapi.com/). This enables enhanced web search functionality with reasoning-enhanced search.
+
+6. **Build and run**
    ```bash
    cargo build --release
    cargo run
@@ -285,7 +296,23 @@ $env:DISCORD_TOKEN="your_actual_discord_token"
 .\run_bot.ps1
 ```
 
-### Option 2: Direct Environment Variables
+### Option 2: Using the Bot Commands Interface (Windows)
+```cmd
+# Run the bot commands interface
+bot_commands.bat
+```
+
+This opens a dedicated command window for bot management with the following commands:
+- `help` - Show available bot commands
+- `status` - Show bot status
+- `sysinfo` - Get system information
+- `processes` - List running processes
+- `disk` - Get disk space information
+- `network` - Get network information
+- `new` - Open a new command prompt window
+- `exit` - Close the window
+
+### Option 3: Direct Environment Variables
 ```powershell
 $env:DISCORD_TOKEN="your_actual_discord_token"
 $env:PREFIX="^"
@@ -305,7 +332,9 @@ meri_bot_rust/
 │   │   ├── lm.rs              # LM Studio AI chat and search commands
 │   │   ├── reason.rs          # AI reasoning command  
 │   │   ├── sum.rs             # Content summarization command
-│   │   └── search.rs          # DuckDuckGo web search functionality
+│   │   ├── search.rs          # DuckDuckGo web search functionality
+│   │   ├── vis.rs             # Vision analysis and image processing
+│   │   └── help.rs            # Help command system
 │   ├── terminal.rs            # External command execution and system management
 │   └── terminal_manager.rs    # Terminal output management and prompt handling
 ├── contexts/                  # Persistent conversation history storage
@@ -330,6 +359,8 @@ meri_bot_rust/
 ├── example_summarize_search_prompt.txt # Example search summarization prompt template
 ├── example_youtube_prompt_generation_prompt.txt # Example YouTube prompt generation template
 ├── example_youtube_summarization_prompt.txt # Example YouTube summarization template
+├── serpapi.txt               # SerpAPI key for enhanced web search (optional)
+├── bot_commands.bat          # Windows bot command interface
 ├── run_bot.ps1              # Helper script to run the bot
 ├── log.txt                  # Comprehensive logging output
 ├── LOGGING.md               # Detailed logging documentation
@@ -529,6 +560,17 @@ The `^lm -s` command provides intelligent web search functionality with AI assis
   - **⚡ Real-time Progress** - Live updates during the search process
   - **🛡️ Robust Error Handling** - Comprehensive fallback strategies
 
+### Vision Analysis Module
+
+The bot includes a dedicated vision analysis module (`vis.rs`) that provides advanced image processing capabilities:
+
+- **GIF Support**: Automatically extracts the first frame from animated GIFs and converts to PNG for vision model compatibility
+- **Multiple Formats**: Supports JPG, PNG, GIF, and WebP image formats
+- **Base64 Encoding**: Converts images to base64 data URIs for multimodal AI processing
+- **Error Handling**: Robust error handling with fallback mechanisms
+- **Memory Efficient**: Processes images in memory without persistent disk storage
+- **Cross-Platform**: Works on Windows, macOS, and Linux
+
 ## Development
 
 To add new commands:
@@ -608,11 +650,23 @@ The bot uses these key dependencies:
 - `serde` (1.0) - JSON serialization/deserialization with derive macros
 - `serde_json` (1.0) - JSON processing for API requests/responses
 
+#### Image Processing
+- `image` (0.24) - Image processing with GIF, PNG, JPEG support
+- `base64` (0.22) - Base64 encoding for image data URIs
+- `mime` (0.3) - MIME type handling
+- `mime_guess` (2.0) - MIME type detection
+
+#### Document Processing
+- `pdf-extract` (0.6) - PDF text extraction
+
 #### Logging & Utilities
 - `env_logger` (0.10) - Environment-based logging configuration
 - `log` (0.4) - Logging facade for Rust
 - `uuid` (1.0) - UUID generation for request tracking
 - `chrono` (0.4) - Date and time handling
+- `regex` (1.10) - Regular expression support
+- `once_cell` (1.19) - One-time initialization
+- `lazy_static` (1.4) - Lazy static initialization
 
 All dependencies are specified in `Cargo.toml` with appropriate feature flags for optimal performance and functionality.
 
@@ -636,7 +690,19 @@ All dependencies are specified in `Cargo.toml` with appropriate feature flags fo
    - Verify yt-dlp is in your PATH: `yt-dlp --version`
    - Check the log file for specific error details
 
-4. **Logging issues**
+4. **Vision analysis not working**
+   - Ensure you have the required image processing dependencies
+   - Check that the image format is supported (JPG, PNG, GIF, WebP)
+   - Verify the AI model supports vision capabilities
+   - Check the log file for processing errors
+
+5. **Web search not working**
+   - Verify your SerpAPI key in `serpapi.txt` is valid
+   - Check internet connectivity
+   - Ensure the search query is properly formatted
+   - Check the log file for API errors
+
+6. **Logging issues**
    - Ensure `RUST_LOG=trace` is set in `botconfig.txt`
    - Check that `log.txt` is writable
    - Verify no other processes are locking the log file

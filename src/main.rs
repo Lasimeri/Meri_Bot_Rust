@@ -54,8 +54,9 @@ use crate::terminal_manager::{TerminalManager, TerminalEvent, get_terminal_manag
 use crate::commands::ping::PING_COMMAND;
 use crate::commands::echo::ECHO_COMMAND;
 use crate::commands::lm::{LM_COMMAND, CLEARCONTEXT_COMMAND};
-use crate::commands::reason::REASON_COMMAND;
+use crate::commands::reason::{REASON_COMMAND, CLEARREASONCONTEXT_COMMAND};
 use crate::commands::sum::SUM_COMMAND;
+use crate::commands::help::{HELP_COMMAND, LMHELP_COMMAND, REASONHELP_COMMAND};
 
 // ============================================================================
 // DATA STRUCTURES
@@ -221,6 +222,13 @@ impl TypeMapKey for UserConversationHistoryMap {
     type Value = HashMap<UserId, Vec<ChatMessage>>;
 }
 
+/// TypeMap key for global LM chat context - stores conversation history shared across all users
+/// Used when the bot is mentioned (not for ^lm command)
+pub struct GlobalLmContextMap;
+impl TypeMapKey for GlobalLmContextMap {
+    type Value = UserContext;
+}
+
 // ============================================================================
 // COMMAND GROUP
 // ============================================================================
@@ -228,7 +236,7 @@ impl TypeMapKey for UserConversationHistoryMap {
 /// Command group declaration - includes all available commands
 /// This groups commands for the Discord bot framework
 #[group]
-#[commands(ping, echo, lm, clearcontext, reason, sum)]
+#[commands(ping, echo, lm, clearcontext, clearreasoncontext, reason, sum, help, lmhelp, reasonhelp)]
 struct General;
 
 // ============================================================================
@@ -337,6 +345,7 @@ fn validate_discord_token() -> Result<String, String> {
 pub async fn save_contexts_to_disk(
     lm_contexts: &HashMap<UserId, UserContext>,
     reason_contexts: &HashMap<UserId, UserContext>,
+    global_lm_context: &UserContext,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Create contexts directory if it doesn't exist
     let contexts_dir = Path::new("contexts");
@@ -356,13 +365,19 @@ pub async fn save_contexts_to_disk(
     let mut reason_file_handle = std::fs::File::create(&reason_file)?;
     reason_file_handle.write_all(reason_json.as_bytes())?;
 
-    println!("Saved {} LM contexts and {} Reason contexts to disk", 
+    // Save global LM context (shared across all users)
+    let global_lm_file = contexts_dir.join("global_lm_context.json");
+    let global_lm_json = serde_json::to_string_pretty(global_lm_context)?;
+    let mut global_lm_file_handle = std::fs::File::create(&global_lm_file)?;
+    global_lm_file_handle.write_all(global_lm_json.as_bytes())?;
+
+    println!("Saved {} LM contexts, {} Reason contexts, and 1 global LM context to disk", 
         lm_contexts.len(), reason_contexts.len());
     Ok(())
 }
 
 /// Load all user contexts from disk on bot startup
-pub async fn load_contexts_from_disk() -> Result<(HashMap<UserId, UserContext>, HashMap<UserId, UserContext>), Box<dyn std::error::Error + Send + Sync>> {
+pub async fn load_contexts_from_disk() -> Result<(HashMap<UserId, UserContext>, HashMap<UserId, UserContext>, UserContext), Box<dyn std::error::Error + Send + Sync>> {
     let contexts_dir = Path::new("contexts");
     
     // Load LM contexts (language model conversation history)
@@ -383,10 +398,19 @@ pub async fn load_contexts_from_disk() -> Result<(HashMap<UserId, UserContext>, 
         HashMap::new()
     };
 
-    println!("Loaded {} LM contexts and {} Reason contexts from disk", 
+    // Load global LM context (shared across all users)
+    let global_lm_file = contexts_dir.join("global_lm_context.json");
+    let global_lm_context = if global_lm_file.exists() {
+        let global_lm_content = std::fs::read_to_string(&global_lm_file)?;
+        serde_json::from_str::<UserContext>(&global_lm_content)?
+    } else {
+        UserContext::new()
+    };
+
+    println!("Loaded {} LM contexts, {} Reason contexts, and 1 global LM context from disk", 
         lm_contexts.len(), reason_contexts.len());
     
-    Ok((lm_contexts, reason_contexts))
+    Ok((lm_contexts, reason_contexts, global_lm_context))
 }
 
 // ============================================================================
@@ -431,149 +455,39 @@ impl EventHandler for Handler {
     }
 }
 
-/// Handle user ID mentions with context-aware processing
+/// Handle user ID mentions - functions as ^lm command but with global context
 async fn handle_user_mention(ctx: &Context, msg: &Message, bot_user_id: &str) {
-            let bot_id = ctx.cache.current_user_id();
-            
     // Log the mention
     log_mention(msg, bot_user_id);
             
-            // Extract the prompt after removing the user ID mention
-            let prompt = msg.content
-                .replace(&format!("<@{}>", bot_user_id), "")
-                .trim()
-                .to_string();
-                
-            // Check if this is a reply to another message (for context-aware responses)
-            if let Some(referenced) = &msg.referenced_message {
-        handle_reply_mention(ctx, msg, &prompt, referenced, bot_id).await;
-    } else {
-        handle_direct_mention(ctx, msg, &prompt).await;
-    }
-}
-
-/// Handle user mentions that are replies to other messages
-async fn handle_reply_mention(
-    ctx: &Context, 
-    msg: &Message, 
-    prompt: &str, 
-    referenced: &Message, 
-    bot_id: serenity::model::id::UserId
-) {
-                // Check if the referenced message was authored by the bot itself
-                // Allow responses to bot's own messages, but add some basic loop prevention
-                if referenced.author.id == bot_id {
-                    if let Some(manager) = get_terminal_manager() {
-                        manager.send_output(format!("[MAIN] User is asking about bot's own message - allowing response with loop prevention"));
-                    } else {
-                        println!("[MAIN] User is asking about bot's own message - allowing response with loop prevention");
-                    }
-                    
-                    // Basic loop prevention: don't respond if the bot's message was very recent (< 5 seconds)
-                    // This prevents rapid back-and-forth but allows legitimate questions about bot responses
-                    let message_age = msg.timestamp.timestamp() - referenced.timestamp.timestamp();
-                    if message_age < 5 {
-                        if let Some(manager) = get_terminal_manager() {
-                            manager.send_output(format!("[MAIN] Bot's referenced message is too recent ({} seconds) - preventing potential rapid loop", message_age));
-                        } else {
-                            println!("[MAIN] Bot's referenced message is too recent ({} seconds) - preventing potential rapid loop", message_age);
-                        }
-            let _ = msg.reply(ctx, "Please wait a moment before asking about my recent response to avoid loops.").await;
-                        return;
-                    }
-                }
-                    
-    log_reply_mention(msg, referenced, prompt);
-                
-                // Check for -v flag - directly invoke lm command for proper handling
-                // Vision requests need special handling for attachments
-                if prompt.starts_with("-v") || prompt.starts_with("--vision") {
-        handle_vision_reply(ctx, msg, prompt).await;
-                } else {
-                    // RAG-enhanced LM handling for user ID mentions in replies
-                    // This provides context-aware responses about specific messages
-                    let rag_input = format!(
-                        "CONTEXT: The user {} is asking you about a message posted by {}.\n\n\
-                        ORIGINAL MESSAGE BY {}:\n\
-                        \"{}\"\n\n\
-                        USER'S QUESTION ABOUT THIS MESSAGE:\n\
-                        \"{}\"\n\n\
-                        Please respond to {}'s question specifically about {}'s message above. \
-                        Reference the original message content when relevant to provide context and clarity.",
-                        msg.author.name,
-                        referenced.author.name,
-                        referenced.author.name,
-                        referenced.content,
-                        prompt,
-                        msg.author.name,
-                        referenced.author.name
-                    );
-                    
-        log_rag_request(msg, referenced, &rag_input);
-            
-        if let Err(e) = crate::commands::lm::handle_lm_request(ctx, msg, &rag_input, Some(prompt)).await {
-            log_error("User ID mention RAG request failed", &e);
-            let _ = msg.reply(ctx, format!("LM error: {}", e)).await;
-        }
-                }
-}
-
-/// Handle direct user mentions (not replies)
-async fn handle_direct_mention(ctx: &Context, msg: &Message, prompt: &str) {
-    log_direct_mention(msg, prompt);
-                
-                if prompt.is_empty() {
-        let _ = msg.reply(ctx, "Please provide a prompt! Usage: `<@Meri_> <your prompt>`\n\nTo ask about a specific message, reply to that message with your question.").await;
-                    return;
-                }
-                
-                // Check for -v flag in direct mentions - directly invoke lm command for proper handling
-                if prompt.starts_with("-v") || prompt.starts_with("--vision") {
-        handle_vision_direct(ctx, msg, prompt).await;
-                    } else {
-        // Add context for regular direct mentions
-        let direct_input = format!(
-            "CONTEXT: The user {} is asking you a direct question (not about a specific message).\n\n\
-            USER'S QUESTION:\n\
-            \"{}\"\n\n\
-            Please respond to {}'s question directly.",
-            msg.author.name,
-            prompt,
-            msg.author.name
-        );
-        
-        if let Err(e) = crate::commands::lm::handle_lm_request(ctx, msg, &direct_input, Some(prompt)).await {
-            log_error("Direct user ID mention request failed", &e);
-            let _ = msg.reply(ctx, format!("LM error: {}", e)).await;
-        }
-    }
-}
-
-/// Handle vision requests in replies
-async fn handle_vision_reply(ctx: &Context, msg: &Message, prompt: &str) {
-    log_vision_request(msg, "reply");
-                    
-                    // Create Args from the prompt and call lm command directly
-    let args = Args::new(prompt, &[Delimiter::Single(' ')]);
-    if let Err(e) = crate::commands::lm::lm(ctx, msg, args).await {
-        log_error("Vision request failed", &e);
-        let _ = msg.reply(ctx, format!("Vision analysis error: {}", e)).await;
-                        } else {
-        log_success("Vision request completed successfully");
-    }
-}
-
-/// Handle vision requests in direct mentions
-async fn handle_vision_direct(ctx: &Context, msg: &Message, prompt: &str) {
-    log_vision_request(msg, "direct");
+    // Extract the prompt after removing the user ID mention
+    let prompt = msg.content
+        .replace(&format!("<@{}>", bot_user_id), "")
+        .trim()
+        .to_string();
     
-    // Create Args from the prompt and call lm command directly
-    let args = Args::new(prompt, &[Delimiter::Single(' ')]);
-    if let Err(e) = crate::commands::lm::lm(ctx, msg, args).await {
-        log_error("Vision request failed", &e);
-        let _ = msg.reply(ctx, format!("Vision analysis error: {}", e)).await;
-                    } else {
-        log_success("Vision request completed successfully");
+    // Check for special flags that need to be handled by the regular lm command
+    if prompt.starts_with("-s ") || prompt.starts_with("--search ") || 
+       prompt.starts_with("--test") || prompt == "-t" ||
+       prompt.starts_with("--clear") || prompt == "-c" ||
+       prompt.starts_with("--clear-global") || prompt == "-cg" {
+        // For search, test, and clear commands, use the regular lm command
+        // These don't need global context
+        let args = Args::new(&prompt, &[Delimiter::Single(' ')]);
+        if let Err(e) = crate::commands::lm::lm(ctx, msg, args).await {
+            log_error("User mention request failed", &e);
+            let _ = msg.reply(ctx, format!("LM error: {}", e)).await;
+        } else {
+            log_success("User mention request completed successfully");
+        }
+    } else {
+        // For regular chat, vision, and other features, use global context
+        if let Err(e) = crate::commands::lm::handle_lm_request_global(ctx, msg, &prompt, Some(&prompt)).await {
+            log_error("Global user mention request failed", &e);
+            let _ = msg.reply(ctx, format!("LM error: {}", e)).await;
+        } else {
+            log_success("Global user mention request completed successfully");
+        }
     }
 }
 
@@ -593,72 +507,7 @@ fn log_mention(msg: &Message, _bot_user_id: &str) {
     }
 }
 
-/// Log a reply mention
-fn log_reply_mention(_msg: &Message, referenced: &Message, prompt: &str) {
-    let author_name = referenced.author.name.clone();
-    let prompt = prompt.to_string();
-    if let Some(manager) = get_terminal_manager() {
-        tokio::spawn(async move {
-            manager.send_output(format!("[MAIN] User ID mention used in reply to {}", author_name)).await;
-            manager.send_output(format!("[MAIN] Prompt: '{}'", prompt)).await;
-        });
-                } else {
-        println!("[MAIN] User ID mention used in reply to {}", author_name);
-        println!("[MAIN] Prompt: '{}'", prompt);
-    }
-}
 
-/// Log a direct mention
-fn log_direct_mention(msg: &Message, prompt: &str) {
-    let author_name = msg.author.name.clone();
-    let prompt = prompt.to_string();
-                        if let Some(manager) = get_terminal_manager() {
-        tokio::spawn(async move {
-            manager.send_output(format!("[MAIN] Direct user ID mention without reply from user {}", author_name)).await;
-            manager.send_output(format!("[MAIN] Prompt: '{}'", prompt)).await;
-        });
-                        } else {
-        println!("[MAIN] Direct user ID mention without reply from user {}", author_name);
-        println!("[MAIN] Prompt: '{}'", prompt);
-                        }
-}
-
-/// Log a vision request
-fn log_vision_request(msg: &Message, request_type: &str) {
-    let author_name = msg.author.name.clone();
-    let request_type = request_type.to_string();
-    if let Some(manager) = get_terminal_manager() {
-        tokio::spawn(async move {
-            manager.send_output(format!("[MAIN] Detected vision request in {} user ID mention", request_type)).await;
-            manager.send_output(format!("[MAIN] User {} requesting vision analysis", author_name)).await;
-            manager.send_output(format!("[MAIN] Invoking lm command directly for proper {} handling", 
-                if request_type == "reply" { "reply and attachment" } else { "attachment" })).await;
-        });
-    } else {
-        println!("[MAIN] Detected vision request in {} user ID mention", request_type);
-        println!("[MAIN] User {} requesting vision analysis", author_name);
-        println!("[MAIN] Invoking lm command directly for proper {} handling", 
-            if request_type == "reply" { "reply and attachment" } else { "attachment" });
-    }
-}
-
-/// Log a RAG request
-fn log_rag_request(msg: &Message, referenced: &Message, rag_input: &str) {
-    let msg_author = msg.author.name.clone();
-    let ref_author = referenced.author.name.clone();
-    let rag_input = rag_input.to_string();
-    if let Some(manager) = get_terminal_manager() {
-        tokio::spawn(async move {
-            manager.send_output("[MAIN] Processing user ID mention RAG request in reply".to_string()).await;
-            manager.send_output(format!("[MAIN] User {} asking about message from {}", msg_author, ref_author)).await;
-            manager.send_output(format!("[MAIN] RAG input: '{}'", rag_input)).await;
-        });
-    } else {
-        println!("[MAIN] Processing user ID mention RAG request in reply");
-        println!("[MAIN] User {} asking about message from {}", msg_author, ref_author);
-        println!("[MAIN] RAG input: '{}'", rag_input);
-    }
-}
 
 /// Log an error
 fn log_error(context: &str, error: &dyn std::fmt::Display) {
@@ -752,7 +601,6 @@ async fn handle_command_line(shutdown_tx: mpsc::Sender<String>, event_rx: mpsc::
 
 /// Handle terminal events
 async fn handle_terminal_event(event: Option<TerminalEvent>, stdout: &mut tokio::io::Stdout) {
-    use tokio::io::AsyncWriteExt;
     
     match event {
         Some(TerminalEvent::BotOutput(output)) => {
@@ -1060,9 +908,10 @@ async fn initialize_bot_data(client: &mut Client) {
         
         // Load existing contexts from disk
         match load_contexts_from_disk().await {
-            Ok((lm_contexts, reason_contexts)) => {
+            Ok((lm_contexts, reason_contexts, global_lm_context)) => {
                 data.insert::<LmContextMap>(lm_contexts);
                 data.insert::<ReasonContextMap>(reason_contexts);
+                data.insert::<GlobalLmContextMap>(global_lm_context);
                 println!("Context maps initialized with persistent data");
             }
             Err(e) => {
@@ -1070,6 +919,7 @@ async fn initialize_bot_data(client: &mut Client) {
                 println!("Initializing with empty context maps");
                 data.insert::<LmContextMap>(HashMap::new());
                 data.insert::<ReasonContextMap>(HashMap::new());
+                data.insert::<GlobalLmContextMap>(UserContext::new());
             }
         }
         
@@ -1218,8 +1068,9 @@ async fn cleanup_and_shutdown(client: &Client, cmd_task: tokio::task::JoinHandle
         let data = client.data.read().await;
         let lm_contexts = data.get::<LmContextMap>().cloned().unwrap_or_default();
         let reason_contexts = data.get::<ReasonContextMap>().cloned().unwrap_or_default();
+        let global_lm_context = data.get::<GlobalLmContextMap>().cloned().unwrap_or_else(|| crate::UserContext::new());
         
-        if let Err(e) = save_contexts_to_disk(&lm_contexts, &reason_contexts).await {
+        if let Err(e) = save_contexts_to_disk(&lm_contexts, &reason_contexts, &global_lm_context).await {
             eprintln!("Failed to save contexts to disk: {}", e);
         }
     }

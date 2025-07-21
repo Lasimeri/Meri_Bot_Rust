@@ -105,6 +105,29 @@ Enhanced logging for reasoning operations with thinking tag filtering:
 [2024-01-15T10:30:47Z INFO  commands::reason] Reasoning completed: 892 characters, 1 message, 156 chars filtered
 ```
 
+### 🖼️ Vision Analysis Module (`vis.rs`)
+Comprehensive logging for vision analysis and image processing:
+
+```rust
+// Image attachment processing
+[2024-01-15T10:30:45Z INFO  commands::vis] Processing attachment: image.png (image/png)
+[2024-01-15T10:30:45Z INFO  commands::vis] Downloaded 2048 bytes
+[2024-01-15T10:30:45Z INFO  commands::vis] Final processing complete - 2048 bytes encoded to base64
+
+// GIF processing
+[2024-01-15T10:30:45Z INFO  commands::vis] Detected GIF file, processing for vision compatibility...
+[2024-01-15T10:30:45Z INFO  commands::vis] Successfully loaded GIF image
+[2024-01-15T10:30:45Z INFO  commands::vis] Successfully processed GIF - converted to image/png
+[2024-01-15T10:30:45Z INFO  commands::vis] Final processing complete - 1536 bytes encoded to base64
+
+// Vision request processing
+[2024-01-15T10:30:45Z INFO  commands::vis] Processing vision request: "What's in this image?"
+[2024-01-15T10:30:45Z INFO  commands::vis] Image size: 2048 bytes, format: image/png
+[2024-01-15T10:30:45Z INFO  commands::vis] Creating vision message with multimodal content
+[2024-01-15T10:30:46Z INFO  commands::vis] Starting vision model streaming response
+[2024-01-15T10:30:47Z INFO  commands::vis] Vision analysis completed: 1024 characters, 1 message
+```
+
 ### 📺 Content Summarization Command (`^sum`)
 Comprehensive logging for the summarization command with enhanced tracking:
 
@@ -167,6 +190,18 @@ Logging for AI-enhanced and reasoning-enhanced search:
 [2024-01-15T10:30:48Z INFO  commands::reason] Search completed: 1800 characters, 1 message, 234 chars filtered
 ```
 
+### 🖼️ Profile Picture Command (`^ppfp`)
+Logging for profile picture display functionality:
+
+```rust
+// Profile picture request
+[2024-01-15T10:30:45Z INFO  commands::ping] Processing profile picture request for user: Alice
+[2024-01-15T10:30:45Z INFO  commands::ping] User avatar URL: https://cdn.discordapp.com/avatars/123456789/avatar.png
+[2024-01-15T10:30:45Z INFO  commands::ping] Downloading avatar image: 1024 bytes
+[2024-01-15T10:30:45Z INFO  commands::ping] Creating rich embed with avatar information
+[2024-01-15T10:30:45Z INFO  commands::ping] Profile picture displayed successfully
+```
+
 ## 🛠️ Error Logging
 
 ### Configuration Errors
@@ -181,6 +216,14 @@ Logging for AI-enhanced and reasoning-enhanced search:
 [2024-01-15T10:30:45Z ERROR commands::lm] HTTP request failed: reqwest::Error { kind: Connect, source: ... }
 [2024-01-15T10:30:45Z ERROR commands::lm] API response error: 404 Not Found
 [2024-01-15T10:30:45Z ERROR commands::lm] Stream processing error: Unexpected end of stream
+```
+
+### Vision Analysis Errors
+```rust
+[2024-01-15T10:30:45Z ERROR commands::vis] Failed to download image: HTTP 404 Not Found
+[2024-01-15T10:30:45Z ERROR commands::vis] Image processing failed: Unsupported image format
+[2024-01-15T10:30:45Z ERROR commands::vis] GIF processing failed: Invalid GIF data
+[2024-01-15T10:30:45Z ERROR commands::vis] Base64 encoding failed: Invalid image data
 ```
 
 ### YouTube Processing Errors
@@ -198,6 +241,13 @@ Logging for AI-enhanced and reasoning-enhanced search:
 [2024-01-15T10:30:45Z ERROR commands::lm] Discord API error: Missing Permissions
 ```
 
+### SerpAPI Errors
+```rust
+[2024-01-15T10:30:45Z ERROR commands::reason] SerpAPI key not found in serpapi.txt
+[2024-01-15T10:30:45Z ERROR commands::reason] SerpAPI request failed: Invalid API key
+[2024-01-15T10:30:45Z ERROR commands::reason] SerpAPI rate limit exceeded: Too many requests
+```
+
 ## 📊 Performance Metrics
 
 ### Response Time Tracking
@@ -212,6 +262,13 @@ Logging for AI-enhanced and reasoning-enhanced search:
 [2024-01-15T10:30:48Z INFO  commands::lm] Input statistics: 45 characters, 12 tokens
 [2024-01-15T10:30:48Z INFO  commands::lm] Output statistics: 2048 characters, 512 tokens
 [2024-01-15T10:30:48Z INFO  commands::lm] Message count: 1 (within Discord limits)
+```
+
+### Image Processing Statistics
+```rust
+[2024-01-15T10:30:48Z INFO  commands::vis] Image processing statistics: 2048 bytes, PNG format
+[2024-01-15T10:30:48Z INFO  commands::vis] Base64 encoding: 2731 characters
+[2024-01-15T10:30:48Z INFO  commands::vis] Processing time: 0.5 seconds
 ```
 
 ### Streaming Performance
@@ -247,6 +304,18 @@ Find all interactions from a specific user:
 grep "User: Alice" log.txt
 ```
 
+### Vision Analysis Tracking
+Find all vision-related operations:
+```bash
+grep "GIF_VISION\|commands::vis" log.txt
+```
+
+### Search Operation Tracking
+Find all search-related operations:
+```bash
+grep "search\|SerpAPI" log.txt
+```
+
 ## 📈 Log File Management
 
 ### File Size Monitoring
@@ -279,18 +348,21 @@ find . -name "log.txt.*" -mtime +30 -delete
 2. **Search by UUID** to track specific command executions
 3. **Monitor error patterns** to identify recurring issues
 4. **Check performance metrics** to optimize slow operations
+5. **Track vision processing** for image analysis debugging
 
 ### For Production
 1. **Use DEBUG or INFO level** to balance visibility and performance
 2. **Monitor log file size** and implement rotation if needed
 3. **Set up log monitoring** to alert on error conditions
 4. **Archive logs regularly** for historical analysis
+5. **Monitor API usage** for rate limiting and quota management
 
 ### For Troubleshooting
 1. **Start with ERROR level** to identify critical issues
 2. **Use UUID tracking** to follow specific user requests
 3. **Check configuration loading** logs for setup issues
 4. **Monitor network and API** logs for connectivity problems
+5. **Review vision processing** logs for image analysis issues
 
 ## 🔍 Log Format Reference
 
@@ -314,6 +386,11 @@ find . -name "log.txt.*" -mtime +30 -delete
 [timestamp] [level] [module] [UUID: uuid] Error: [error_description]
 ```
 
+### Vision Processing Format
+```
+[timestamp] [level] [module] [GIF_VISION] [message]
+```
+
 ## 📚 Related Documentation
 
 - **README.md** - Main project documentation
@@ -329,5 +406,7 @@ If you encounter logging issues:
 3. **Check disk space** - Ensure there's room for log file growth
 4. **Review recent changes** - New features may add logging requirements
 5. **Search existing logs** - Look for similar issues in the log history
+6. **Check vision dependencies** - Ensure image processing libraries are available
+7. **Verify API keys** - Check SerpAPI and other service configurations
 
-The enhanced logging system provides complete visibility into bot operations, making it easy to diagnose issues, monitor performance, and understand user interactions. 
+The enhanced logging system provides complete visibility into bot operations, making it easy to diagnose issues, monitor performance, and understand user interactions across all features including the new vision analysis capabilities. 
