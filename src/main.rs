@@ -56,6 +56,7 @@ use crate::commands::echo::ECHO_COMMAND;
 use crate::commands::lm::{LM_COMMAND, CLEARCONTEXT_COMMAND};
 use crate::commands::reason::{REASON_COMMAND, CLEARREASONCONTEXT_COMMAND};
 use crate::commands::sum::SUM_COMMAND;
+use crate::commands::rank::RANK_COMMAND;
 use crate::commands::help::{HELP_COMMAND, LMHELP_COMMAND, REASONHELP_COMMAND};
 
 // ============================================================================
@@ -236,7 +237,7 @@ impl TypeMapKey for GlobalLmContextMap {
 /// Command group declaration - includes all available commands
 /// This groups commands for the Discord bot framework
 #[group]
-#[commands(ping, echo, lm, clearcontext, clearreasoncontext, reason, sum, help, lmhelp, reasonhelp)]
+#[commands(ping, echo, lm, clearcontext, clearreasoncontext, reason, sum, rank, help, lmhelp, reasonhelp)]
 struct General;
 
 // ============================================================================
@@ -439,6 +440,24 @@ impl EventHandler for Handler {
     /// Called when the bot successfully connects to Discord
     async fn ready(&self, _: Context, ready: Ready) {
         println!("Bot connected as {}!", ready.user.name);
+        
+        // Generate and display invite link
+        let bot_user_id = env::var("BOT_USER_ID").unwrap_or_else(|_| "1385309017881968761".to_string());
+        let application_id = bot_user_id.split('.').next().unwrap_or(&bot_user_id);
+        let invite_link = format!("https://discord.com/api/oauth2/authorize?client_id={}&permissions=274877910016&scope=bot", application_id);
+        
+        println!("🎉 Bot is ready! Invite link:");
+        println!("🔗 {}", invite_link);
+        println!("📋 Copy this link to invite the bot to your server");
+        println!();
+        
+        // Also send to terminal manager if available
+        if let Some(manager) = get_terminal_manager() {
+            manager.send_output("🎉 Bot is ready! Invite link:".to_string()).await;
+            manager.send_output(format!("🔗 {}", invite_link)).await;
+            manager.send_output("📋 Copy this link to invite the bot to your server".to_string()).await;
+            manager.send_output("".to_string()).await;
+        }
     }
 
     /// Handle incoming Discord messages
@@ -448,6 +467,14 @@ impl EventHandler for Handler {
         // This allows the bot to be mentioned directly: <@BOT_ID> <message>
         let bot_user_id = env::var("BOT_USER_ID").unwrap_or_else(|_| "1385309017881968761".to_string()); // Configurable bot user ID
         let is_mentioned_by_id = msg.content.contains(&format!("<@{}>", bot_user_id));
+        
+        // Check if this message is a reply to a bot message
+        if let Some(referenced_message) = &msg.referenced_message {
+            if referenced_message.author.id.to_string() == bot_user_id {
+                // This is a reply to a bot message, ignore it
+                return;
+            }
+        }
         
         if is_mentioned_by_id {
             handle_user_mention(&ctx, &msg, &bot_user_id).await;
@@ -750,11 +777,21 @@ async fn main() {
     
     // Initialize logger - must be done before any logging calls
     // Use trace level to show all logs including debug and trace
-    // Output to log.txt file
+    // Output to both console and log.txt file for comprehensive debugging
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("trace"))
         .format_timestamp_secs()
+        .format_module_path(true)
+        .format_target(true)
+        .write_style(env_logger::WriteStyle::Always)
         .target(env_logger::Target::Pipe(Box::new(log_file)))
         .init();
+    
+    log::info!("=== LOGGING SYSTEM INITIALIZED ===");
+    log::info!("Log level: TRACE (maximum detail)");
+    log::info!("Log file: log.txt");
+    log::info!("Console logging: ENABLED");
+    log::info!("Module path logging: ENABLED");
+    log::info!("Target logging: ENABLED");
     
     // Load configuration from botconfig.txt file
     match load_bot_config() {
@@ -838,13 +875,17 @@ async fn main() {
     show_startup_messages().await;
 
     // Main event loop - wait for shutdown signal or client error
-    tokio::select! {
+    let shutdown_reason = tokio::select! {
         _ = signal::ctrl_c() => {
             handle_shutdown("SIGINT").await;
+            "SIGINT".to_string()
         }
         shutdown_signal = shutdown_rx.recv() => {
             if let Some(signal) = shutdown_signal {
                 handle_shutdown(&signal).await;
+                signal
+            } else {
+                "Unknown shutdown".to_string()
             }
         }
         result = client.start() => {
@@ -868,10 +909,12 @@ async fn main() {
                 log::info!("Discord client started successfully without errors");
             }
             handle_shutdown("Client task completed").await;
+            "Client task completed".to_string()
         }
-    }
+    };
 
-    // Cleanup and shutdown
+    // Cleanup and shutdown with context persistence
+    println!("Initiating graceful shutdown: {}", shutdown_reason);
     cleanup_and_shutdown(&client, cmd_task, terminal_child).await;
 }
 
@@ -1035,12 +1078,25 @@ async fn handle_minimal_command_line(shutdown_tx: mpsc::Sender<String>, event_rx
 
 /// Show startup messages
 async fn show_startup_messages() {
+    // Generate invite link
+    let bot_user_id = env::var("BOT_USER_ID").unwrap_or_else(|_| "1385309017881968761".to_string());
+    let application_id = bot_user_id.split('.').next().unwrap_or(&bot_user_id);
+    let invite_link = format!("https://discord.com/api/oauth2/authorize?client_id={}&permissions=274877910016&scope=bot", application_id);
+    
     if let Some(manager) = get_terminal_manager() {
         manager.send_output("Bot is running and connected to Discord!".to_string()).await;
+        manager.send_output("🎉 Bot is ready! Invite link:".to_string()).await;
+        manager.send_output(format!("🔗 {}", invite_link)).await;
+        manager.send_output("📋 Copy this link to invite the bot to your server".to_string()).await;
+        manager.send_output("".to_string()).await;
         manager.send_output("Type 'cmd' to open the command prompt window".to_string()).await;
         manager.send_output("Use 'quit' command or press Ctrl+C to stop gracefully".to_string()).await;
     } else {
         println!("Bot is running and connected to Discord!");
+        println!("🎉 Bot is ready! Invite link:");
+        println!("🔗 {}", invite_link);
+        println!("📋 Copy this link to invite the bot to your server");
+        println!();
         println!("Type 'cmd' to open the command prompt window");
         println!("Use 'quit' command or press Ctrl+C to stop gracefully");
     }
@@ -1053,9 +1109,8 @@ async fn handle_shutdown(signal: &str) {
         manager.send_output(format!("Received '{}' signal, stopping bot gracefully...", signal)).await;
     }
     
-    // Force exit after a short delay to ensure cleanup completes
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-    std::process::exit(0);
+    // Note: The actual cleanup is handled in the main function after this returns
+    // This function just logs the signal and returns to allow proper cleanup
 }
 
 /// Cleanup and shutdown the bot
@@ -1070,8 +1125,15 @@ async fn cleanup_and_shutdown(client: &Client, cmd_task: tokio::task::JoinHandle
         let reason_contexts = data.get::<ReasonContextMap>().cloned().unwrap_or_default();
         let global_lm_context = data.get::<GlobalLmContextMap>().cloned().unwrap_or_else(|| crate::UserContext::new());
         
+        println!("Saving conversation contexts to disk...");
+        println!("  - LM contexts: {} users", lm_contexts.len());
+        println!("  - Reason contexts: {} users", reason_contexts.len());
+        println!("  - Global LM context: {} total messages", global_lm_context.total_messages());
+        
         if let Err(e) = save_contexts_to_disk(&lm_contexts, &reason_contexts, &global_lm_context).await {
             eprintln!("Failed to save contexts to disk: {}", e);
+        } else {
+            println!("✅ Contexts saved successfully to disk");
         }
     }
     

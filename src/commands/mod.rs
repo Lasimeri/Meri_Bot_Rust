@@ -9,4 +9,5 @@ pub mod lm;             // Language model integration (AI chat)
 pub mod reason;         // Reasoning and analysis capabilities
 pub mod search;         // Web search and RAG (Retrieval-Augmented Generation) - Minimal placeholder
 pub mod sum;            // Text summarization capabilities
+pub mod rank;           // Content ranking and analysis capabilities
 pub mod vis;            // Vision/visual analysis capabilities 

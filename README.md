@@ -124,6 +124,20 @@ A powerful Discord bot written in Rust using the Serenity framework, featuring r
   - **Examples**: `^sum https://youtube.com/watch?v=...`, `^sum https://example.com`
   - **Requirements**: yt-dlp installed for YouTube support
 
+### 📊 Content Ranking Commands
+- `^rank <url>` - Rank and analyze content using Qwen3 reranking model (qwen3-reranker-4b)
+  - **Aliases**: `^analyze`, `^evaluate`
+  - **Features**:
+    - **Multi-dimensional ranking** across 5 key factors (Content Quality, Relevance, Engagement, Educational Value, Technical Excellence)
+    - **1-10 scale scoring** with detailed explanations for each factor
+    - **YouTube and webpage support** with specialized analysis for each content type
+    - **Customizable system prompts** via `rank_system_prompt.txt`
+    - **RAG processing** for comprehensive content analysis
+    - **Streaming responses** with real-time ranking updates
+    - **Actionable feedback** with strengths and improvement suggestions
+  - **Examples**: `^rank https://youtube.com/watch?v=...`, `^rank https://example.com`
+  - **Requirements**: yt-dlp installed for YouTube support
+
 ### 🔍 Web Search Commands
 - `^lm -s <search query>` - AI-enhanced web search with intelligent processing
   - **AI Mode (with LM Studio)**: Query refinement → web search → AI summarization with embedded links
@@ -195,6 +209,7 @@ A powerful Discord bot written in Rust using the Serenity framework, featuring r
    cp example_lmapiconf.txt lmapiconf.txt
    cp example_system_prompt.txt system_prompt.txt
    cp example_reasoning_prompt.txt reasoning_prompt.txt  # Optional for reasoning command
+   cp example_rank_system_prompt.txt rank_system_prompt.txt  # Optional for ranking command
    ```
    
    Edit `lmapiconf.txt` with your AI server settings:
@@ -214,6 +229,7 @@ A powerful Discord bot written in Rust using the Serenity framework, featuring r
    - Replace `your-chat-model-name` and `your-reasoning-model-name` with your actual model names.
    - For reasoning tasks, consider using models optimized for logical analysis (e.g., qwen3:4b, qwen3:8b, etc.).
    - The `system_prompt.txt` configures the AI's behavior and personality for chat interactions.
+   - The `rank_system_prompt.txt` configures the Qwen3 reranking model's analysis criteria and output format.
 
 5. **Set up SerpAPI (Optional - for enhanced web search)**
    
@@ -272,6 +288,20 @@ yt-dlp --version
 **Note**: The `^sum` command will automatically detect if yt-dlp is available and provide helpful error messages if it's not installed.
 
 ## Inviting the Bot to Your Server
+
+### Automatic Invite Link (Recommended)
+When you start the bot, it will automatically display an invite link in the terminal:
+
+```
+🎉 Bot is ready! Invite link:
+🔗 https://discord.com/api/oauth2/authorize?client_id=1385309017881968761&permissions=274877910016&scope=bot
+📋 Copy this link to invite the bot to your server
+```
+
+Simply copy and paste this link into your browser to invite the bot to your server.
+
+### Manual Invite Link Creation
+If you need to create a custom invite link:
 
 1. In the Discord Developer Portal, go to your application
 2. Navigate to OAuth2 → URL Generator
@@ -347,6 +377,7 @@ meri_bot_rust/
 ├── example_lmapiconf.txt     # Example LM API configuration template
 ├── system_prompt.txt         # AI system prompt (required for AI commands)
 ├── reasoning_prompt.txt      # Optional: Specialized prompt for reasoning command
+├── rank_system_prompt.txt    # Optional: Qwen3 reranking model prompt for content analysis
 ├── reasoning_search_analysis_prompt.txt # Optional: Reasoning-focused search analysis prompt
 ├── refine_search_prompt.txt     # Optional: AI search query refinement prompt
 ├── summarize_search_prompt.txt  # Optional: AI search result summarization prompt
@@ -354,6 +385,7 @@ meri_bot_rust/
 ├── youtube_summarization_prompt.txt # Optional: YouTube-specific summarization prompt
 ├── example_system_prompt.txt     # Example system prompt template
 ├── example_reasoning_prompt.txt  # Example reasoning prompt template
+├── example_rank_system_prompt.txt # Example Qwen3 reranking prompt template
 ├── example_reasoning_search_analysis_prompt.txt # Example reasoning search analysis template
 ├── example_refine_search_prompt.txt    # Example search refinement prompt template
 ├── example_summarize_search_prompt.txt # Example search summarization prompt template

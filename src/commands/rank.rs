@@ -1,16 +1,16 @@
-// sum.rs - Webpage and YouTube Summarization Command Module
-// This module implements the ^sum command, providing AI-powered summarization for webpages and YouTube videos.
+// rank.rs - Content Ranking Command Module
+// This module implements the ^rank command, providing AI-powered content ranking and analysis for webpages and YouTube videos.
 // It supports robust content fetching, VTT/HTML cleaning, RAG chunking, and real-time streaming to Discord.
 //
 // Key Features:
-// - Summarizes arbitrary webpages and YouTube videos
+// - Ranks and analyzes arbitrary webpages and YouTube videos
 // - Uses yt-dlp for YouTube transcript extraction
 // - Cleans and processes VTT/HTML content
 // - RAG (map-reduce) chunking for long content
-// - Real-time streaming of summary to Discord
+// - Real-time streaming of ranking analysis to Discord
 // - Multi-path config and prompt loading
 // - Robust error handling and logging
-//
+// - Thinking tag filtering and buffered streaming (like reason.rs)
 //
 // Used by: main.rs (command registration), search.rs (for config)
 
@@ -26,12 +26,63 @@ use std::fs;
 use std::process::Command;
 use uuid::Uuid;
 use log::{info, warn, error, debug, trace};
-use serde::Deserialize;
-use regex::Regex;
-use crate::commands::search::chat_completion;
-use std::time::Instant;
+use serde::{Deserialize, Serialize};
 
-// SSE response structures for streaming summary
+use futures_util::StreamExt;
+use regex::Regex;
+use once_cell::sync::Lazy;
+
+// Compile regex once for better performance - matches <think> tags
+// Used to filter out internal AI thoughts from streaming output
+static THINKING_TAG_REGEX: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?s)<think>.*?</think>").unwrap()
+});
+
+// Structures for streaming API responses
+// Used to parse streaming JSON chunks from the AI API
+#[derive(Deserialize)]
+struct ChatResponse {
+    choices: Vec<Choice>,
+}
+
+#[derive(Deserialize)]
+struct Choice {
+    delta: Option<Delta>,
+    finish_reason: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct Delta {
+    content: Option<String>,
+}
+
+// API Request structure for ranking model
+#[derive(Serialize)]
+struct ChatRequest {
+    model: String,              // Model name
+    messages: Vec<ChatMessage>, // Conversation history
+    temperature: f32,           // Sampling temperature
+    max_tokens: i32,            // Max tokens to generate
+    stream: bool,               // Whether to stream output
+}
+
+// Structure to track streaming statistics for ranking
+#[derive(Debug)]
+struct StreamingStats {
+    total_characters: usize,    // Total characters streamed
+    message_count: usize,       // Number of Discord messages sent
+    filtered_characters: usize, // Characters filtered by <think> tag removal
+}
+
+// Structure to track current message state during streaming
+struct MessageState {
+    current_content: String,    // Accumulated content for current Discord message
+    current_message: Message,   // Current Discord message object
+    message_index: usize,       // Part number (for chunked output)
+    char_limit: usize,          // Discord message length limit
+}
+
+// SSE response structures for streaming ranking analysis
 // Used to parse streaming JSON chunks from the AI API
 #[derive(Deserialize)]
 struct StreamResponse {
@@ -50,25 +101,25 @@ struct StreamDelta {
 }
 
 #[command]
-#[aliases("summarize", "webpage")]
-/// Main ^sum command handler
-/// Handles summarization of webpages and YouTube videos
+#[aliases("rank", "analyze", "evaluate")]
+/// Main ^rank command handler
+/// Handles ranking and analysis of webpages and YouTube videos
 /// Supports:
-///   - ^sum <url> (webpage or YouTube)
-pub async fn sum(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
+///   - ^rank <url> (webpage or YouTube)
+pub async fn rank(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
     let start_time = std::time::Instant::now();
     let command_uuid = Uuid::new_v4();
     
-    info!("📺 === SUM COMMAND STARTED ===");
+    info!("📊 === RANK COMMAND STARTED ===");
     info!("🆔 Command UUID: {}", command_uuid);
     info!("👤 User: {} ({})", msg.author.name, msg.author.id);
-    info!("📺 Channel: {} ({})", msg.channel_id, msg.channel_id.0);
-    info!("📺 Guild: {:?}", msg.guild_id);
-    info!("📺 Message ID: {}", msg.id);
-    info!("📺 Timestamp: {:?}", msg.timestamp);
+    info!("📊 Channel: {} ({})", msg.channel_id, msg.channel_id.0);
+    info!("📊 Guild: {:?}", msg.guild_id);
+    info!("📊 Message ID: {}", msg.id);
+    info!("📊 Timestamp: {:?}", msg.timestamp);
     
-    // Enhanced logging for web page summarization debugging
-    log::info!("🔍 === SUM COMMAND DEBUG INFO ===");
+    // Enhanced logging for content ranking debugging
+    log::info!("🔍 === RANK COMMAND DEBUG INFO ===");
     log::info!("🔍 Command UUID: {}", command_uuid);
     log::info!("🔍 User ID: {}", msg.author.id);
     log::info!("🔍 Channel ID: {}", msg.channel_id);
@@ -104,7 +155,7 @@ pub async fn sum(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
         debug!("🔍 Sending error message to user");
         trace!("🔍 Empty URL error: user_id={}, channel_id={}, command_uuid={}", 
                msg.author.id, msg.channel_id, command_uuid);
-        msg.reply(ctx, "Please provide a URL to summarize!\n\n**Usage:** `^sum <url>`").await?;
+        msg.reply(ctx, "Please provide a URL to rank and analyze!\n\n**Usage:** `^rank <url>`").await?;
         debug!("✅ Error message sent successfully");
         return Ok(());
     }
@@ -143,7 +194,7 @@ pub async fn sum(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
             info!("✅ === CONFIGURATION LOADED SUCCESSFULLY ===");
             info!("✅ LM configuration loaded successfully");
             debug!("🧠 Using default model: {}", cfg.default_model);
-            debug!("🧠 Using reasoning model: {}", cfg.default_reason_model);
+            debug!("🧠 Using ranking model: {}", cfg.default_ranking_model);
             debug!("🌐 API endpoint: {}", cfg.base_url);
             debug!("⏱️ Timeout setting: {} seconds", cfg.timeout);
             debug!("🔥 Temperature setting: {}", cfg.default_temperature);
@@ -194,7 +245,7 @@ pub async fn sum(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
     debug!("💬 === DISCORD MESSAGE CREATION ===");
     debug!("💬 Creating initial Discord response message...");
     trace!("🔍 Discord message creation: author={}, channel={}, command_uuid={}", msg.author.name, msg.channel_id, command_uuid);
-    let mut response_msg = msg.reply(ctx, "🔄 Fetching content...").await?;
+    let mut response_msg = msg.reply(ctx, "🔄 Fetching content for ranking...").await?;
     debug!("✅ Initial Discord message sent successfully");
     debug!("📝 Response message ID: {}", response_msg.id);
     debug!("📝 Response message channel ID: {}", response_msg.channel_id);
@@ -327,17 +378,17 @@ pub async fn sum(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
     // Update status
     debug!("📝 === DISCORD MESSAGE UPDATE ===");
     debug!("📝 Updating Discord message to show AI processing...");
-    trace!("🔍 Discord message update: changing content to '🤖 Generating summary...', command_uuid={}", command_uuid);
+    trace!("🔍 Discord message update: changing content to '🤖 Generating ranking analysis...', command_uuid={}", command_uuid);
     response_msg.edit(ctx, |m| {
-        m.content("🤖 Generating summary...")
+        m.content("🤖 Generating ranking analysis...")
     }).await?;
     debug!("✅ Discord message updated to show AI processing");
     trace!("🔍 Discord message update completed: command_uuid={}", command_uuid);
     
-    // Stream the summary
-    info!("🧠 === AI SUMMARIZATION PHASE ===");
-    info!("🧠 Starting AI summarization process with streaming...");
-    debug!("🚀 AI summarization phase initiated");
+    // Stream the ranking analysis
+    info!("🧠 === AI RANKING ANALYSIS PHASE ===");
+    info!("🧠 Starting AI ranking analysis process with streaming...");
+    debug!("🚀 AI ranking analysis phase initiated");
     
     let content_length = if let Some(ref path) = subtitle_file_path {
         debug!("📏 === CONTENT LENGTH CALCULATION ===");
@@ -363,38 +414,40 @@ pub async fn sum(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
         content.len()
     };
     
-    trace!("🔍 AI summarization phase: content_length={}, url={}, is_youtube={}, command_uuid={}", 
+    trace!("🔍 AI ranking analysis phase: content_length={}, url={}, is_youtube={}, command_uuid={}", 
            content_length, url, is_youtube, command_uuid);
     let processing_start = std::time::Instant::now();
     debug!("⏱️ AI processing start time: {:?}", processing_start);
     
-    match stream_summary(&content, url, &config, &mut response_msg, ctx, is_youtube, subtitle_file_path.as_deref()).await {
-        Ok(_) => {
+    match stream_ranking_analysis(&content, url, &config, &mut response_msg, ctx, is_youtube, subtitle_file_path.as_deref()).await {
+        Ok(stats) => {
             let processing_time = processing_start.elapsed();
-            info!("✅ === AI SUMMARIZATION SUCCESS ===");
-            info!("✅ Summary streaming completed successfully in {:.2}s", processing_time.as_secs_f64());
+            info!("✅ === AI RANKING ANALYSIS SUCCESS ===");
+            info!("✅ Ranking analysis streaming completed successfully in {:.2}s", processing_time.as_secs_f64());
             debug!("📊 AI processing statistics: {:.2}s processing time", processing_time.as_secs_f64());
             debug!("📊 Processing time in milliseconds: {} ms", processing_time.as_millis());
-            trace!("🔍 AI summarization success: processing_time_ms={}, content_length={}, command_uuid={}", 
-                   processing_time.as_millis(), content_length, command_uuid);
+            debug!("📊 Streaming stats: {} total chars, {} messages, {} filtered chars", 
+                   stats.total_characters, stats.message_count, stats.filtered_characters);
+            trace!("🔍 AI ranking analysis success: processing_time_ms={}, content_length={}, total_chars={}, messages={}, filtered_chars={}, command_uuid={}", 
+                   processing_time.as_millis(), content_length, stats.total_characters, stats.message_count, stats.filtered_characters, command_uuid);
         },
         Err(e) => {
-            error!("❌ === AI SUMMARIZATION ERROR ===");
-            error!("❌ Summary generation failed: {}", e);
-            debug!("🔍 AI summarization error details: {:?}", e);
-            debug!("🔍 AI summarization error type: {:?}", std::any::type_name_of_val(&e));
-            trace!("🔍 AI summarization error: error_type={}, command_uuid={}", 
+            error!("❌ === AI RANKING ANALYSIS ERROR ===");
+            error!("❌ Ranking analysis generation failed: {}", e);
+            debug!("🔍 AI ranking analysis error details: {:?}", e);
+            debug!("🔍 AI ranking analysis error type: {:?}", std::any::type_name_of_val(&e));
+            trace!("🔍 AI ranking analysis error: error_type={}, command_uuid={}", 
                    std::any::type_name_of_val(&e), command_uuid);
             response_msg.edit(ctx, |m| {
-                m.content(format!("❌ Failed to generate summary: {}", e))
+                m.content(format!("❌ Failed to generate ranking analysis: {}", e))
             }).await?;
-            debug!("✅ AI summarization error message sent to Discord");
+            debug!("✅ AI ranking analysis error message sent to Discord");
         }
     }
     
     let total_time = start_time.elapsed();
     info!("⏱️ === COMMAND COMPLETION ===");
-    info!("⏱️ Sum command completed in {:.2}s for user {} ({})", 
+    info!("⏱️ Rank command completed in {:.2}s for user {} ({})", 
           total_time.as_secs_f64(), msg.author.name, msg.author.id);
     debug!("📊 === FINAL COMMAND STATISTICS ===");
     debug!("📊 Total execution time: {:.2}s", total_time.as_secs_f64());
@@ -409,7 +462,7 @@ pub async fn sum(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
            msg.author.id, msg.channel_id, command_uuid);
     
     // Final comprehensive logging summary
-    log::info!("🎯 === SUM COMMAND COMPLETION SUMMARY ===");
+    log::info!("🎯 === RANK COMMAND COMPLETION SUMMARY ===");
     log::info!("🎯 Command UUID: {}", command_uuid);
     log::info!("🎯 Total execution time: {:.2}s", total_time.as_secs_f64());
     log::info!("🎯 Content type: {}", if is_youtube { "YouTube" } else { "Webpage" });
@@ -465,20 +518,24 @@ pub async fn sum(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
     log::info!("🎯 Status: SUCCESS");
     
     Ok(())
-}
+} 
 
-// Load summarization system prompt with multi-path fallback (like lm command)
-// Loads summarization_prompt.txt from multiple locations, returns prompt string or fallback
-async fn load_summarization_prompt() -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+// Load ranking analysis system prompt with multi-path fallback
+// Loads ranking_analysis_prompt.txt from multiple locations, returns prompt string or fallback
+async fn load_ranking_analysis_prompt() -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let prompt_paths = [
-        "summarization_prompt.txt",
-        "../summarization_prompt.txt",
-        "../../summarization_prompt.txt",
-        "src/summarization_prompt.txt",
-        "example_summarization_prompt.txt",
-        "../example_summarization_prompt.txt",
-        "../../example_summarization_prompt.txt",
-        "src/example_summarization_prompt.txt",
+        "rank_system_prompt.txt",
+        "ranking_analysis_prompt.txt",
+        "../rank_system_prompt.txt",
+        "../ranking_analysis_prompt.txt",
+        "../../rank_system_prompt.txt",
+        "../../ranking_analysis_prompt.txt",
+        "src/rank_system_prompt.txt",
+        "src/ranking_analysis_prompt.txt",
+        "example_ranking_analysis_prompt.txt",
+        "../example_ranking_analysis_prompt.txt",
+        "../../example_ranking_analysis_prompt.txt",
+        "src/example_ranking_analysis_prompt.txt",
     ];
     
     for path in &prompt_paths {
@@ -486,7 +543,7 @@ async fn load_summarization_prompt() -> Result<String, Box<dyn std::error::Error
             Ok(content) => {
                 // Remove BOM if present
                 let content = content.strip_prefix('\u{feff}').unwrap_or(&content);
-                debug!("📄 Summarization prompt loaded from: {}", path);
+                debug!("📊 Qwen3 reranking prompt loaded from: {}", path);
                 return Ok(content.trim().to_string());
             }
             Err(_) => continue,
@@ -494,22 +551,22 @@ async fn load_summarization_prompt() -> Result<String, Box<dyn std::error::Error
     }
     
     // Fallback prompt if no file found
-    debug!("📄 Using built-in fallback summarization prompt");
-    Ok("You are an expert content summarizer. Create a comprehensive, well-structured summary of the provided content. Use clear formatting and highlight key points. Keep the summary informative but concise.".to_string())
+    debug!("📊 Using built-in fallback Qwen3 reranking prompt");
+    Ok("You are a Qwen3 Reranking model (qwen3-reranker-4b) specialized in content analysis and ranking. Your task is to evaluate and rank content across multiple dimensions: Content Quality (1-10), Relevance (1-10), Engagement Potential (1-10), Educational Value (1-10), and Technical Excellence (1-10). Provide detailed analysis with specific examples, strengths, areas for improvement, and an overall recommendation.".to_string())
 }
 
-// Load YouTube summarization system prompt with multi-path fallback
-// Loads youtube_summarization_prompt.txt from multiple locations, returns prompt string or fallback
-async fn load_youtube_summarization_prompt() -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+// Load YouTube ranking analysis system prompt with multi-path fallback
+// Loads youtube_ranking_analysis_prompt.txt from multiple locations, returns prompt string or fallback
+async fn load_youtube_ranking_analysis_prompt() -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let prompt_paths = [
-        "youtube_summarization_prompt.txt",
-        "../youtube_summarization_prompt.txt",
-        "../../youtube_summarization_prompt.txt",
-        "src/youtube_summarization_prompt.txt",
-        "example_youtube_summarization_prompt.txt",
-        "../example_youtube_summarization_prompt.txt",
-        "../../example_youtube_summarization_prompt.txt",
-        "src/example_youtube_summarization_prompt.txt",
+        "youtube_ranking_analysis_prompt.txt",
+        "../youtube_ranking_analysis_prompt.txt",
+        "../../youtube_ranking_analysis_prompt.txt",
+        "src/youtube_ranking_analysis_prompt.txt",
+        "example_youtube_ranking_analysis_prompt.txt",
+        "../example_youtube_ranking_analysis_prompt.txt",
+        "../../example_youtube_ranking_analysis_prompt.txt",
+        "src/example_youtube_ranking_analysis_prompt.txt",
     ];
     
     for path in &prompt_paths {
@@ -517,7 +574,7 @@ async fn load_youtube_summarization_prompt() -> Result<String, Box<dyn std::erro
             Ok(content) => {
                 // Remove BOM if present
                 let content = content.strip_prefix('\u{feff}').unwrap_or(&content);
-                debug!("📺 YouTube summarization prompt loaded from: {}", path);
+                debug!("📺 YouTube ranking analysis prompt loaded from: {}", path);
                 return Ok(content.trim().to_string());
             }
             Err(_) => continue,
@@ -525,8 +582,8 @@ async fn load_youtube_summarization_prompt() -> Result<String, Box<dyn std::erro
     }
     
     // Fallback prompt if no file found
-    debug!("📺 Using built-in fallback YouTube summarization prompt");
-    Ok("You are an expert at summarizing YouTube video content. Focus on key points, main themes, and important takeaways. Structure your summary with clear sections and highlight the most valuable information for viewers.".to_string())
+    debug!("📺 Using built-in fallback YouTube ranking analysis prompt");
+    Ok("You are an expert YouTube content analyst and evaluator. Analyze the provided YouTube video content and rank different aspects including educational value, entertainment quality, production value, accuracy, engagement potential, and overall viewer satisfaction. Provide detailed ratings (1-10 scale) and explanations for each aspect, along with specific examples from the content. Use clear formatting and provide actionable insights for content creators and viewers.".to_string())
 }
 
 // Enhanced YouTube transcript fetcher using yt-dlp with detailed logging
@@ -580,7 +637,7 @@ async fn fetch_youtube_transcript(url: &str) -> Result<String, Box<dyn std::erro
             debug!("🔍 yt-dlp PATH error type: {:?}", std::any::type_name_of_val(&e));
             trace!("🔍 yt-dlp PATH error: error_type={}, process_uuid={}", 
                    std::any::type_name_of_val(&e), process_uuid);
-            "yt-dlp is not installed. Please install yt-dlp to use YouTube summarization."
+            "yt-dlp is not installed. Please install yt-dlp to use YouTube ranking analysis."
         })?;
     
     debug!("📊 === YT-DLP VERSION CHECK RESULTS ===");
@@ -1042,7 +1099,7 @@ async fn fetch_youtube_transcript(url: &str) -> Result<String, Box<dyn std::erro
     
     // Return the path to the subtitle file for RAG processing
     Ok(vtt_file)
-}
+} 
 
 // Enhanced VTT cleaner
 // Removes timestamps, tags, and empty lines from VTT subtitle content
@@ -1410,935 +1467,715 @@ fn clean_html(html: &str) -> String {
     final_result
 }
 
-// Stream summary using SSE (like lm command approach)
-// Streams the AI's summary response, chunking and updating Discord messages as needed
-async fn stream_summary(
+// Simple and reliable thinking tag filter
+// Removes all <think>...</think> blocks from the content
+fn filter_thinking_tags(content: &str) -> String {
+    // Use pre-compiled regex to remove thinking tags and their content
+    let filtered = THINKING_TAG_REGEX.replace_all(content, "");
+    
+    // Clean up whitespace and empty lines
+    let lines: Vec<&str> = filtered
+        .lines()
+        .map(|line| line.trim())
+        .filter(|line| !line.is_empty())
+        .collect();
+    
+    lines.join("\n").trim().to_string()
+}
+
+// Simple processing function that just filters thinking tags
+// Returns filtered content or a message if only thinking content remains
+fn process_ranking_content(content: &str) -> String {
+    let filtered = filter_thinking_tags(content);
+    
+    // If we have filtered content, return it
+    if !filtered.trim().is_empty() {
+        return filtered;
+    }
+    
+    // If no content after filtering, return a message
+    "The AI response appears to contain only thinking content.".to_string()
+}
+
+// Helper function to update Discord message with new content for ranking
+// Handles chunking and message creation if content exceeds Discord's limit
+#[allow(unused_variables)]
+async fn update_discord_message(
+    state: &mut MessageState,
+    new_content: &str,
+    ctx: &Context,
+    config: &LMConfig,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    println!("[DEBUG][RANKING_UPDATE] Updating Discord message with {} chars", new_content.len());
+    
+    println!("[DEBUG][RANKING_UPDATE] New content to add: '{}' ({} chars)", new_content, new_content.len());
+    
+    // First, add the new content to the state
+    if state.current_content.is_empty() {
+        println!("[DEBUG][RANKING_UPDATE] State content was empty, setting to new content");
+        state.current_content = new_content.to_string();
+    } else {
+        println!("[DEBUG][RANKING_UPDATE] State content was not empty, appending new content");
+        state.current_content.push_str(new_content);
+    }
+    
+    println!("[DEBUG][RANKING_UPDATE] State content after adding: '{}' ({} chars)", state.current_content, state.current_content.len());
+    
+    // Then create the formatted content for Discord
+    let potential_content = format!("📊 **Ranking Analysis (Part {}):**\n\n{}", 
+        state.message_index, state.current_content);
+    
+    println!("[DEBUG][RANKING_UPDATE] Formatted content for Discord: '{}' ({} chars)", potential_content, potential_content.len());
+
+    // Check if we need to create a new message
+    if potential_content.len() > state.char_limit {
+        println!("[DEBUG][RANKING_UPDATE] Content exceeds limit ({} > {}), creating new message", 
+            potential_content.len(), state.char_limit);
+        
+        // Finalize current message
+        let final_content = format!("📊 **Ranking Analysis (Part {}):**\n\n{}", 
+            state.message_index, state.current_content);
+        let edit_result = state.current_message.edit(&ctx.http, |m| {
+            m.content(final_content)
+        }).await;
+        if let Err(e) = edit_result {
+            eprintln!("[ERROR][RANKING_UPDATE] Failed to finalize message part {}: {}", state.message_index, e);
+        } else {
+            println!("[DEBUG][RANKING_UPDATE] Finalized message part {}", state.message_index);
+        }
+
+        // Create new message
+        state.message_index += 1;
+        // Reset current_content for the new message
+        state.current_content = new_content.to_string();
+        let new_msg_content = format!("📊 **Ranking Analysis (Part {}):**\n\n{}", 
+            state.message_index, state.current_content);
+        let send_result = state.current_message.channel_id.send_message(&ctx.http, |m| {
+            m.content(new_msg_content)
+        }).await;
+        match send_result {
+            Ok(new_message) => {
+                println!("[DEBUG][RANKING_UPDATE] Created new message part {}", state.message_index);
+                state.current_message = new_message;
+            }
+            Err(e) => {
+                eprintln!("[ERROR][RANKING_UPDATE] Failed to create new message part {}: {}", state.message_index, e);
+            }
+        }
+    } else {
+        // Update current message
+        println!("[DEBUG][RANKING_UPDATE] Updating existing message part {}", state.message_index);
+        let edit_result = state.current_message.edit(&ctx.http, |m| {
+            m.content(&potential_content)
+        }).await;
+        if let Err(e) = edit_result {
+            eprintln!("[ERROR][RANKING_UPDATE] Failed to update existing message part {}: {}", state.message_index, e);
+        }
+    }
+
+    Ok(())
+}
+
+// Helper function to finalize message content at the end of streaming for ranking
+// Ensures all remaining content is posted and marks the message as complete
+#[allow(unused_variables)]
+async fn finalize_message_content(
+    state: &mut MessageState,
+    remaining_content: &str,
+    ctx: &Context,
+    config: &LMConfig,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    println!("[DEBUG][RANKING_FINALIZE] Finalizing message with {} chars", remaining_content.len());
+    println!("[DEBUG][RANKING_FINALIZE] Current state content: {} chars", state.current_content.len());
+    
+    // Check for zero content error condition - this should catch cases where API returned content but it wasn't streamed properly
+    if remaining_content.is_empty() && state.current_content.trim().is_empty() {
+        eprintln!("[DEBUG][RANKING_FINALIZE] ERROR: Attempting to finalize message with 0 total characters");
+        eprintln!("[DEBUG][RANKING_FINALIZE] Remaining content: '{}' ({} chars)", remaining_content, remaining_content.len());
+        eprintln!("[DEBUG][RANKING_FINALIZE] State content: '{}' ({} chars)", state.current_content, state.current_content.len());
+        eprintln!("[DEBUG][RANKING_FINALIZE] This indicates either:");
+        eprintln!("[DEBUG][RANKING_FINALIZE] 1. No content was received from the API");
+        eprintln!("[DEBUG][RANKING_FINALIZE] 2. Content was received but not properly streamed to Discord");
+        eprintln!("[DEBUG][RANKING_FINALIZE] 3. The update_discord_message function failed to populate current_content");
+        return Err("Cannot finalize message with 0 characters - this indicates no content was received from the API or streaming failed".into());
+    }
+    
+    // Add any remaining content if provided
+    if !remaining_content.trim().is_empty() {
+        update_discord_message(state, remaining_content, ctx, config).await?;
+    }
+    
+    // Check if we have any content to finalize (either from remaining_content or existing state)
+    if state.current_content.trim().is_empty() {
+        println!("[DEBUG][RANKING_FINALIZE] No content to finalize");
+        return Ok(());
+    }
+    
+    // Mark the final message as complete
+    let final_display = if state.message_index == 1 {
+        format!("📊 **Ranking Analysis Complete**\n\n{}", state.current_content)
+    } else {
+        format!("📊 **Ranking Analysis Complete (Part {}/{})**\n\n{}", 
+            state.message_index, state.message_index, state.current_content)
+    };
+
+    println!("[DEBUG][RANKING_FINALIZE] Marking message as complete - Part {}", state.message_index);
+    let edit_result = state.current_message.edit(&ctx.http, |m| {
+        m.content(final_display)
+    }).await;
+    if let Err(e) = edit_result {
+        eprintln!("[ERROR][RANKING_FINALIZE] Failed to finalize Discord message part {}: {}", state.message_index, e);
+    }
+
+    Ok(())
+}
+
+// Main streaming function that handles real-time response with Discord message editing
+// Streams the AI's ranking analysis response, filtering <think> tags in real time
+// Handles chunking, message updates, and finalization
+async fn stream_ranking_analysis(
     content: &str,
     url: &str,
     config: &LMConfig,
-    msg: &mut Message,
+    initial_msg: &mut Message,
     ctx: &Context,
     is_youtube: bool,
     file_path: Option<&str>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    
-    let stream_uuid = Uuid::new_v4();
-    
-    info!("🤖 === AI SUMMARIZATION STREAMING STARTED ===");
-    info!("🆔 Stream UUID: {}", stream_uuid);
-    info!("🌐 URL: {}", url);
-    info!("📺 Content type: {}", if is_youtube { "YouTube" } else { "Webpage" });
-    info!("📄 Content length: {} characters", content.len());
-    
-    debug!("🔧 === STREAM SUMMARY INITIALIZATION ===");
-    debug!("🔧 Stream UUID: {}", stream_uuid);
-    debug!("🔧 URL length: {} characters", url.len());
-    debug!("🔧 Content length: {} characters", content.len());
-    debug!("🔧 Is YouTube: {}", is_youtube);
-    debug!("🔧 File path: {:?}", file_path);
-    debug!("🔧 Model: {}", config.default_reason_model);
-    debug!("🔧 Base URL: {}", config.base_url);
-    debug!("🔧 Temperature: {}", config.default_temperature);
-    debug!("🔧 Max tokens: {}", config.default_max_tokens);
-    trace!("🔍 Stream summary started: content_length={}, url={}, is_youtube={}, model={}, stream_uuid={}", 
-           content.len(), url, is_youtube, config.default_reason_model, stream_uuid);
-    
-    debug!("🤖 Preparing AI request...");
-    trace!("🔍 Stream summary started: content_length={}, url={}, is_youtube={}, model={}, stream_uuid={}", 
-           content.len(), url, is_youtube, config.default_reason_model, stream_uuid);    
-    
-    // Load appropriate system prompt from files
-    debug!("📄 === SYSTEM PROMPT LOADING ===");
-    debug!("📄 Loading system prompt for content type: {}", if is_youtube { "YouTube" } else { "Webpage" });
-    trace!("🔍 Loading system prompt: is_youtube={}, stream_uuid={}", is_youtube, stream_uuid);
-    
-    let system_prompt = if is_youtube {
-        debug!("📺 Loading YouTube summarization prompt...");
-        match load_youtube_summarization_prompt().await {
-            Ok(prompt) => {
-                debug!("✅ YouTube summarization prompt loaded: {} characters", prompt.len());
-                trace!("🔍 YouTube prompt loaded: length={}, stream_uuid={}", prompt.len(), stream_uuid);
-                prompt
-            },
-            Err(e) => {
-                error!("❌ Failed to load YouTube summarization prompt: {}", e);
-                debug!("🔍 YouTube prompt error: {:?}", e);
-                trace!("🔍 YouTube prompt error: error_type={}, stream_uuid={}", 
-                       std::any::type_name_of_val(&e), stream_uuid);
-                return Err(e);
-            }
-        }
-    } else {
-        debug!("📄 Loading general summarization prompt...");
-        match load_summarization_prompt().await {
-            Ok(prompt) => {
-                debug!("✅ General summarization prompt loaded: {} characters", prompt.len());
-                trace!("🔍 General prompt loaded: length={}, stream_uuid={}", prompt.len(), stream_uuid);
-                prompt
-            },
-            Err(e) => {
-                error!("❌ Failed to load general summarization prompt: {}", e);
-                debug!("🔍 General prompt error: {:?}", e);
-                trace!("🔍 General prompt error: error_type={}, stream_uuid={}", 
-                       std::any::type_name_of_val(&e), stream_uuid);
-                return Err(e);
-            }
-        }
-    };
-    
-    debug!("📄 System prompt loaded successfully: {} characters", system_prompt.len());
-    debug!("📄 System prompt preview: {}", &system_prompt[..std::cmp::min(200, system_prompt.len())]);
-    trace!("🔍 System prompt loaded: length={}, stream_uuid={}", system_prompt.len(), stream_uuid);
-    
-    // FIXED: Properly handle content processing for YouTube vs webpage
-    debug!("🔧 === CONTENT PROCESSING ===");
-    debug!("🔧 Processing content for AI request...");
-    
-    let (user_prompt, content_to_process) = if file_path.is_some() {
-        // Use RAG document processing with the file (YouTube subtitle or HTML)
-        let file_path = file_path.unwrap();
-        debug!("📁 === RAG DOCUMENT PROCESSING ===");
-        debug!("📁 Using RAG document processing for file: {}", file_path);
-        debug!("📁 Content type: {}", if is_youtube { "YouTube subtitle" } else { "HTML webpage" });
-        trace!("🔍 RAG document processing: file_path={}, content_type={}, stream_uuid={}", 
-               file_path, if is_youtube { "youtube" } else { "webpage" }, stream_uuid);
-        
-        // Enhanced logging for RAG processing
-        log::info!("📁 === RAG PROCESSING STARTED ===");
-        log::info!("📁 File path: {}", file_path);
-        log::info!("📁 Content type: {}", if is_youtube { "YouTube subtitle" } else { "HTML webpage" });
-        log::info!("📁 File exists: {}", std::path::Path::new(file_path).exists());
-        log::info!("📁 Stream UUID: {}", stream_uuid);
-        
-        // Read the file content
-        debug!("📖 === FILE READING FOR RAG ===");
-        debug!("📖 Reading file for RAG processing: {}", file_path);
-        let file_content = match fs::read_to_string(file_path) {
-            Ok(content) => {
-                debug!("✅ File read successfully: {} characters", content.len());
-                debug!("📖 File content preview: {}", &content[..std::cmp::min(200, content.len())]);
-                trace!("🔍 File read success: path={}, length={}, stream_uuid={}", file_path, content.len(), stream_uuid);
-                
-                // Enhanced logging for file reading success
-                log::info!("📖 === FILE READ SUCCESS ===");
-                log::info!("📖 File path: {}", file_path);
-                log::info!("📖 File size: {} characters", content.len());
-                log::info!("📖 File size in bytes: {} bytes", content.as_bytes().len());
-                log::info!("📖 Content preview: {}", &content[..std::cmp::min(500, content.len())]);
-                log::info!("📖 Content type indicators:");
-                log::info!("📖   - Contains HTML tags: {}", content.contains("<html"));
-                log::info!("📖   - Contains VTT timestamps: {}", content.contains("-->"));
-                log::info!("📖   - Contains script tags: {}", content.contains("<script"));
-                log::info!("📖   - Contains style tags: {}", content.contains("<style"));
-                
-                content
-            },
-            Err(e) => {
-                error!("❌ === FILE READ ERROR ===");
-                error!("❌ Failed to read file: {}", e);
-                debug!("🔍 File read error: path={}, error={}", file_path, e);
-                debug!("🔍 File read error type: {:?}", std::any::type_name_of_val(&e));
-                trace!("🔍 File read error: path={}, error_type={}, stream_uuid={}", 
-                       file_path, std::any::type_name_of_val(&e), stream_uuid);
-                return Err(format!("Failed to read file: {}", e).into());
-            }
-        };
-        
-        // Clean the content based on file type
-        let cleaned_content = if is_youtube {
-            debug!("🧹 === VTT CLEANING FOR RAG ===");
-            debug!("🧹 Cleaning VTT content for RAG processing...");
-            trace!("🔍 VTT cleaning for RAG: original_length={}, stream_uuid={}", file_content.len(), stream_uuid);
-            
-            let cleaned = clean_vtt_content(&file_content);
-            
-            debug!("✅ VTT content cleaned for RAG: {} characters", cleaned.len());
-            debug!("🧹 Content preview: {}", &cleaned[..std::cmp::min(200, cleaned.len())]);
-            debug!("🧹 Cleaning ratio: {:.2}%", (cleaned.len() as f64 / file_content.len() as f64) * 100.0);
-            trace!("🔍 VTT cleaning for RAG completed: original_length={}, cleaned_length={}, stream_uuid={}", 
-                   file_content.len(), cleaned.len(), stream_uuid);
-            
-            // Enhanced logging for VTT cleaning
-            log::info!("🧹 === VTT CLEANING COMPLETED ===");
-            log::info!("🧹 Original size: {} characters", file_content.len());
-            log::info!("🧹 Cleaned size: {} characters", cleaned.len());
-            log::info!("🧹 Reduction: {:.2}%", (cleaned.len() as f64 / file_content.len() as f64) * 100.0);
-            log::info!("🧹 Cleaned preview: {}", &cleaned[..std::cmp::min(400, cleaned.len())]);
-            
-            cleaned
-        } else {
-            debug!("🧹 === HTML CLEANING FOR RAG ===");
-            debug!("🧹 Cleaning HTML content for RAG processing...");
-            trace!("🔍 HTML cleaning for RAG: original_length={}, stream_uuid={}", file_content.len(), stream_uuid);
-            
-            let cleaned = clean_html(&file_content);
-            
-            debug!("✅ HTML content cleaned for RAG: {} characters", cleaned.len());
-            debug!("🧹 Content preview: {}", &cleaned[..std::cmp::min(200, cleaned.len())]);
-            debug!("🧹 Cleaning ratio: {:.2}%", (cleaned.len() as f64 / file_content.len() as f64) * 100.0);
-            trace!("🔍 HTML cleaning for RAG completed: original_length={}, cleaned_length={}, stream_uuid={}", 
-                   file_content.len(), cleaned.len(), stream_uuid);
-            
-            // Enhanced logging for HTML cleaning
-            log::info!("🧹 === HTML CLEANING COMPLETED ===");
-            log::info!("🧹 Original size: {} characters", file_content.len());
-            log::info!("🧹 Cleaned size: {} characters", cleaned.len());
-            log::info!("🧹 Reduction: {:.2}%", (cleaned.len() as f64 / file_content.len() as f64) * 100.0);
-            log::info!("🧹 Cleaned preview: {}", &cleaned[..std::cmp::min(400, cleaned.len())]);
-            log::info!("🧹 Word count: {} words", cleaned.split_whitespace().count());
-            
-            cleaned
-        };
-        
-        // Verify we have actual content
-        if cleaned_content.trim().is_empty() {
-            error!("❌ === EMPTY CLEANED CONTENT ERROR ===");
-            error!("❌ Cleaned content is empty");
-            debug!("🔍 Cleaned content empty: original_length={}, cleaned_length={}", file_content.len(), cleaned_content.len());
-            trace!("🔍 Cleaned content empty: stream_uuid={}", stream_uuid);
-            return Err("File contains no readable content after cleaning".into());
-        }
-        
-        let prompt = format!(
-            "Please analyze and summarize this {} from {}:\n\n{}",
-            if is_youtube { "YouTube video subtitle file" } else { "webpage HTML content" },
-            url, cleaned_content
-        );
-        
-        debug!("📝 === USER PROMPT CREATION FOR RAG ===");
-        debug!("📝 Created user prompt with {} content: {} characters", 
-               if is_youtube { "subtitle" } else { "HTML" }, prompt.len());
-        debug!("📝 Prompt preview: {}", &prompt[..std::cmp::min(300, prompt.len())]);
-        trace!("🔍 User prompt created: prompt_length={}, cleaned_content_length={}, content_type={}, stream_uuid={}", 
-               prompt.len(), cleaned_content.len(), if is_youtube { "youtube" } else { "webpage" }, stream_uuid);
-        
-        (prompt, cleaned_content)
-    } else {
-        // For webpages or fallback, use the original content
-        debug!("📄 === WEBPAGE CONTENT PROCESSING ===");
-        debug!("📄 Using webpage content processing");
-        trace!("🔍 Webpage content processing: content_length={}, stream_uuid={}", content.len(), stream_uuid);
-        
-        // Truncate content to prevent context overflow
-        let max_content_length = 20000;
-        debug!("📏 === CONTENT TRUNCATION CHECK ===");
-        debug!("📏 Checking content length: {} characters", content.len());
-        debug!("📏 Max content length: {} characters", max_content_length);
-        debug!("📏 Needs truncation: {}", content.len() > max_content_length);
-        trace!("🔍 Content truncation check: content_length={}, max_length={}, stream_uuid={}", 
-               content.len(), max_content_length, stream_uuid);
-        
-        let truncated_content = if content.len() > max_content_length {
-            let truncated = format!("{} [Content truncated due to length]", &content[0..max_content_length]);
-            debug!("📏 Content truncated: {} -> {} characters", content.len(), truncated.len());
-            debug!("📏 Truncation reduction: {:.2}%", (truncated.len() as f64 / content.len() as f64) * 100.0);
-            trace!("🔍 Content truncated: original_length={}, truncated_length={}, stream_uuid={}", 
-                   content.len(), truncated.len(), stream_uuid);
-            truncated
-        } else {
-            debug!("📏 Content length is within limits, no truncation needed");
-            trace!("🔍 Content within limits: length={}, stream_uuid={}", content.len(), stream_uuid);
-            content.to_string()
-        };
-        
-        let prompt = format!(
-            "Please summarize this {} from {}:\n\n{}",
-            if is_youtube { "YouTube video transcript" } else { "webpage content" },
-            url,
-            truncated_content
-        );
-        
-        debug!("📝 === USER PROMPT CREATION FOR WEBPAGE ===");
-        debug!("📝 Created user prompt with webpage content: {} characters", prompt.len());
-        debug!("📝 Prompt preview: {}", &prompt[..std::cmp::min(300, prompt.len())]);
-        trace!("🔍 User prompt created: prompt_length={}, truncated_content_length={}, stream_uuid={}", 
-               prompt.len(), truncated_content.len(), stream_uuid);
-        
-        (prompt, truncated_content)
-    };
-    
-    debug!("📝 === PROMPT SUMMARY ===");
-    debug!("📝 System prompt length: {} characters", system_prompt.len());
-    debug!("📝 User prompt length: {} characters", user_prompt.len());
-    debug!("📝 Content to process length: {} characters", content_to_process.len());
-    debug!("📝 Total prompt length: {} characters", system_prompt.len() + user_prompt.len());
-    trace!("🔍 Prompt details: system_length={}, user_length={}, content_length={}, url_length={}, stream_uuid={}", 
-           system_prompt.len(), user_prompt.len(), content_to_process.len(), url.len(), stream_uuid);
-    
-    let chunk_size = 8000;
-    let mut chunk_summaries = Vec::new();
-    let request_payload;
-    
-    debug!("📄 === CHUNKING DECISION ===");
-    debug!("📄 Content length: {} characters", content_to_process.len());
-    debug!("📄 Chunk size: {} characters", chunk_size);
-    debug!("📄 Needs chunking: {}", content_to_process.len() > chunk_size);
-    trace!("🔍 Chunking decision: content_length={}, chunk_size={}, needs_chunking={}, stream_uuid={}", 
-           content_to_process.len(), chunk_size, content_to_process.len() > chunk_size, stream_uuid);
-    
-    if content_to_process.len() > chunk_size {
-        info!("📄 === RAG SUMMARIZATION STARTED ===");
-        info!("📄 Content too long ({} chars), using map-reduce RAG summarization", content_to_process.len());
-        debug!("📄 Starting RAG summarization with chunking...");
-        trace!("🔍 RAG summarization started: content_length={}, chunk_size={}, stream_uuid={}", 
-               content_to_process.len(), chunk_size, stream_uuid);
-        
-        // Enhanced logging for chunking process
-        log::info!("📄 === CHUNKING PROCESS STARTED ===");
-        log::info!("📄 Content length: {} characters", content_to_process.len());
-        log::info!("📄 Chunk size: {} characters", chunk_size);
-        log::info!("📄 Estimated chunks: {}", (content_to_process.len() + chunk_size - 1) / chunk_size);
-        log::info!("📄 Content type: {}", if is_youtube { "YouTube" } else { "Webpage" });
-        log::info!("📄 Processing method: Map-reduce RAG summarization");
-        
-        // FIXED: Proper character-based chunking of the actual content
-        debug!("📄 === CONTENT CHUNKING ===");
-        debug!("📄 Splitting content into chunks using character-based splitting...");
-        
-        // Use character-based splitting to avoid breaking UTF-8 characters
-        let mut chunks = Vec::new();
-        let mut current_chunk = String::new();
-        
-        for word in content_to_process.split_whitespace() {
-            if current_chunk.len() + word.len() + 1 > chunk_size && !current_chunk.is_empty() {
-                chunks.push(current_chunk.trim().to_string());
-                current_chunk = String::new();
-            }
-            
-            if !current_chunk.is_empty() {
-                current_chunk.push(' ');
-            }
-            current_chunk.push_str(word);
-        }
-        
-        // Add the last chunk if it's not empty
-        if !current_chunk.is_empty() {
-            chunks.push(current_chunk.trim().to_string());
-        }
-        
-        debug!("📄 Split content into {} chunks", chunks.len());
-        debug!("📄 Chunk sizes: {:?}", chunks.iter().map(|c| c.len()).collect::<Vec<_>>());
-        trace!("🔍 Content chunked: total_chunks={}, stream_uuid={}", chunks.len(), stream_uuid);
-        
-        for (i, chunk) in chunks.iter().enumerate() {
-            info!("🤖 === CHUNK {} PROCESSING ===", i+1);
-            info!("🤖 Summarizing chunk {} of {} ({} chars)", i+1, chunks.len(), chunk.len());
-            debug!("🤖 Chunk {} preview: {}", i+1, &chunk[..std::cmp::min(100, chunk.len())]);
-            trace!("🔍 Chunk {} processing: chunk_length={}, stream_uuid={}", i+1, chunk.len(), stream_uuid);
-            
-            // FIXED: Create a more specific prompt for each chunk with actual content
-            let chunk_prompt = format!(
-                "Create a detailed summary of this content chunk from {}. Focus on key points, topics, and important information:\n\n{}",
-                if is_youtube { "a YouTube video" } else { "a webpage" },
-                chunk
-            );
-            
-            debug!("📝 === CHUNK PROMPT CREATION ===");
-            debug!("📝 Created chunk prompt: {} characters", chunk_prompt.len());
-            debug!("📝 Chunk prompt preview: {}", &chunk_prompt[..std::cmp::min(200, chunk_prompt.len())]);
-            trace!("🔍 Chunk prompt created: chunk={}, prompt_length={}, stream_uuid={}", 
-                   i+1, chunk_prompt.len(), stream_uuid);
-            
-            let chunk_messages = vec![
-                ChatMessage { 
-                    role: "system".to_string(), 
-                    content: "You are an expert content summarizer. Create comprehensive summaries that capture all important details, key points, and main topics from the provided content. Aim for summaries that are informative and detailed while remaining concise.".to_string() 
-                },
-                ChatMessage { 
-                    role: "user".to_string(), 
-                    content: chunk_prompt.clone() 
-                }
-            ];
-            
-            debug!("🤖 === CHUNK LLM REQUEST ===");
-            debug!("🤖 Sending chunk {} to LLM with {} characters", i+1, chunk.len());
-            debug!("🤖 Using model: {}", config.default_reason_model);
-            debug!("🤖 Max tokens: 500");
-            trace!("🔍 Chunk {} LLM request: chunk_length={}, prompt_length={}, model={}, stream_uuid={}", 
-                   i+1, chunk.len(), chunk_prompt.len(), config.default_reason_model, stream_uuid);
-            
-            // Use reasoning model for chunk summaries
-            let chunk_summary = match chat_completion(chunk_messages, &config.default_reason_model, config, Some(500)).await {
-                Ok(summary) => {
-                    debug!("✅ Chunk {} summary received: {} characters", i+1, summary.len());
-                    debug!("📝 Chunk {} summary preview: {}", i+1, &summary[..std::cmp::min(200, summary.len())]);
-                    trace!("🔍 Chunk {} summary completed: summary_length={}, stream_uuid={}", 
-                           i+1, summary.len(), stream_uuid);
-                    summary
-                },
-                Err(e) => {
-                    error!("❌ === CHUNK {} LLM ERROR ===", i+1);
-                    error!("❌ Failed to get summary for chunk {}: {}", i+1, e);
-                    debug!("🔍 Chunk {} LLM error: {:?}", i+1, e);
-                    debug!("🔍 Chunk {} LLM error type: {:?}", i+1, std::any::type_name_of_val(&e));
-                    trace!("🔍 Chunk {} LLM error: error_type={}, stream_uuid={}", 
-                           i+1, std::any::type_name_of_val(&e), stream_uuid);
-                    return Err(e);
-                }
-            };
-            
-            // Check if the model returned a fallback message
-            debug!("🔍 === CHUNK SUMMARY VALIDATION ===");
-            debug!("🔍 Checking chunk {} summary for fallback messages...", i+1);
-            debug!("🔍 Contains 'Search functionality is not available': {}", chunk_summary.contains("Search functionality is not available"));
-            debug!("🔍 Contains 'fallback': {}", chunk_summary.contains("fallback"));
-            
-            if chunk_summary.contains("Search functionality is not available") || chunk_summary.contains("fallback") {
-                warn!("⚠️ === CHUNK {} FALLBACK DETECTED ===", i+1);
-                warn!("⚠️ Model {} appears to be a search model, not suitable for summarization", config.default_reason_model);
-                debug!("🔍 Chunk {} returned search model response: {}", i+1, chunk_summary);
-                debug!("🔍 Using direct content approach for this chunk");
-                // Use a more direct approach for this chunk
-                let direct_summary = format!("Content chunk {}: {}", i+1, chunk);
-                                chunk_summaries.push(direct_summary.clone());
-                trace!("🔍 Chunk {} fallback used: direct_summary_length={}, stream_uuid={}",        
-                       i+1, direct_summary.len(), stream_uuid);
-            } else {
-                                chunk_summaries.push(chunk_summary.clone());
-                trace!("🔍 Chunk {} summary added: summary_length={}, stream_uuid={}",
-                       i+1, chunk_summary.len(), stream_uuid);
-            }
-        }
-        
-        // FIXED: Combine chunk summaries for final prompt with better structure
-        debug!("📝 === CHUNK SUMMARIES COMBINATION ===");
-        debug!("📝 Combining {} chunk summaries...", chunk_summaries.len());
-        let combined = chunk_summaries.join("\n\n---\n\n");
-        debug!("📝 Combined chunk summaries: {} characters", combined.len());
-        debug!("📝 Combined summaries preview: {}", &combined[..std::cmp::min(300, combined.len())]);
-        trace!("🔍 Chunk summaries combined: combined_length={}, chunk_count={}, stream_uuid={}", 
-               combined.len(), chunk_summaries.len(), stream_uuid);
-        
-        let final_user_prompt = format!(
-            "Create a comprehensive, well-structured summary of this {} from {}. Use the following detailed chunk summaries to build a complete overview that covers all major topics, key points, and important information:\n\n{}\n\nPlease organize the summary with clear sections and highlight the most important takeaways.",
-            if is_youtube { "YouTube video" } else { "webpage" },
-            url, combined
-        );
-        
-        debug!("📝 === FINAL RAG PROMPT CREATION ===");
-        debug!("📝 Created final RAG prompt: {} characters", final_user_prompt.len());
-        debug!("📝 Final prompt preview: {}", &final_user_prompt[..std::cmp::min(300, final_user_prompt.len())]);
-        trace!("🔍 Final RAG prompt created: final_prompt_length={}, stream_uuid={}", final_user_prompt.len(), stream_uuid);
-        
-        let final_messages = vec![
-            ChatMessage { role: "system".to_string(), content: system_prompt.clone() },
-            ChatMessage { role: "user".to_string(), content: final_user_prompt.clone() }
-        ];
-        
-        debug!("📝 Final RAG prompt created: {} characters", final_user_prompt.len());
-        debug!("📝 Final message count: {}", final_messages.len());
-        trace!("🔍 Final RAG prompt created: final_prompt_length={}, message_count={}, stream_uuid={}", 
-               final_user_prompt.len(), final_messages.len(), stream_uuid);
-        
-        request_payload = serde_json::json!(
-            {
-                "model": config.default_reason_model,
-                "messages": final_messages,
-                "temperature": config.default_temperature,
-                "max_tokens": config.default_max_tokens,
-                "stream": true
-            }
-        );
-    } else {
-        info!("📄 === DIRECT SUMMARIZATION ===");
-        info!("📄 Content length ({}) is within limits, using direct summarization", content_to_process.len());
-        debug!("📄 Using direct summarization approach for {}", if is_youtube { "YouTube" } else { "webpage" });
-        trace!("🔍 Direct summarization: content_length={}, chunk_size={}, content_type={}, stream_uuid={}", 
-               content_to_process.len(), chunk_size, if is_youtube { "youtube" } else { "webpage" }, stream_uuid);
-        
-        let messages = vec![
-            ChatMessage {
-                role: "system".to_string(),
-                content: system_prompt,
-            },
-            ChatMessage {
-                role: "user".to_string(),
-                content: user_prompt,
-            },
-        ];
-        
-        debug!("📝 === DIRECT PROMPT CREATION ===");
-        debug!("📝 Created direct summarization messages for {}: {} messages", if is_youtube { "YouTube" } else { "webpage" }, messages.len());
-        debug!("📝 System message length: {} characters", messages[0].content.len());
-        debug!("📝 User message length: {} characters", messages[1].content.len());
-        debug!("📝 Total message length: {} characters", messages[0].content.len() + messages[1].content.len());
-        trace!("🔍 Direct summarization: message_count={}, system_length={}, user_length={}, content_type={}, stream_uuid={}", 
-               messages.len(), messages[0].content.len(), messages[1].content.len(), if is_youtube { "youtube" } else { "webpage" }, stream_uuid);
-        
-        request_payload = serde_json::json!(
-            {
-                "model": config.default_reason_model,
-                "messages": messages,
-                "temperature": config.default_temperature,
-                "max_tokens": config.default_max_tokens,
-                "stream": true
-            }
-        );
-    }
-    
-    // Create reqwest client
-    debug!("🔧 === HTTP CLIENT CREATION ===");
-    debug!("🔧 Creating HTTP client for streaming request...");
-    trace!("🔍 HTTP client creation started: stream_uuid={}", stream_uuid);
+) -> Result<StreamingStats, Box<dyn std::error::Error + Send + Sync>> {
+    println!("[DEBUG][RANKING] === STARTING RANKING STREAM RESPONSE ===");
+    println!("[DEBUG][RANKING] URL: {}", url);
+    println!("[DEBUG][RANKING] Content length: {} characters", content.len());
+    println!("[DEBUG][RANKING] Is YouTube: {}", is_youtube);
+    println!("[DEBUG][RANKING] File path: {:?}", file_path);
+    println!("[DEBUG][RANKING] Base URL: {}", config.base_url);
+    println!("[DEBUG][RANKING] Timeout: {} seconds", config.timeout);
     
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(60))
         .build()?;
+    println!("[DEBUG][RANKING] HTTP client created");
     
-    debug!("✅ HTTP client created successfully");
-    debug!("🔧 Timeout: 60 seconds");
-    trace!("🔍 HTTP client created: timeout=60s, stream_uuid={}", stream_uuid);
+    // Load appropriate system prompt
+    let system_prompt = if is_youtube {
+        match load_youtube_ranking_analysis_prompt().await {
+            Ok(prompt) => prompt,
+            Err(e) => {
+                eprintln!("Failed to load YouTube ranking analysis prompt: {}", e);
+                return Err(e);
+            }
+        }
+    } else {
+        match load_ranking_analysis_prompt().await {
+            Ok(prompt) => prompt,
+            Err(e) => {
+                eprintln!("Failed to load ranking analysis prompt: {}", e);
+                return Err(e);
+            }
+        }
+    };
     
-    // Send streaming request
+    // Process content based on file path
+    let (user_prompt, _content_to_process) = if let Some(path) = file_path {
+        // Read and process file content
+        let file_content = fs::read_to_string(path)?;
+        let cleaned_content = if is_youtube {
+            clean_vtt_content(&file_content)
+        } else {
+            clean_html(&file_content)
+        };
+        
+        let prompt = format!(
+            "Please analyze and rank this {} from {}:\n\n{}",
+            if is_youtube { "YouTube video subtitle file" } else { "webpage HTML content" },
+            url, cleaned_content
+        );
+        
+        (prompt, cleaned_content)
+    } else {
+        // Use direct content
+        let max_content_length = 20000;
+        let truncated_content = if content.len() > max_content_length {
+            format!("{} [Content truncated due to length]", &content[0..max_content_length])
+        } else {
+            content.to_string()
+        };
+        
+        let prompt = format!(
+            "Please analyze and rank this {} from {}:\n\n{}",
+            if is_youtube { "YouTube video transcript" } else { "webpage content" },
+            url, truncated_content
+        );
+        
+        (prompt, truncated_content)
+    };
+    
+    // Build message list
+    let messages = vec![
+        ChatMessage { role: "system".to_string(), content: system_prompt },
+        ChatMessage { role: "user".to_string(), content: user_prompt },
+    ];
+    
+    // Check if the model supports streaming (reranker models typically don't)
+    let should_stream = !config.default_ranking_model.contains("reranker");
+    
+    let chat_request = ChatRequest {
+        model: config.default_ranking_model.clone(),
+        messages,
+        temperature: config.default_temperature,
+        max_tokens: config.default_max_tokens,
+        stream: should_stream,
+    };
+    
     let api_url = format!("{}/v1/chat/completions", config.base_url);
-    let payload_size = serde_json::to_string(&request_payload).unwrap_or_default().len();
+    println!("[DEBUG][RANKING] API URL: {}", api_url);
     
-    debug!("🚀 === STREAMING REQUEST PREPARATION ===");
-    debug!("🚀 API URL: {}", api_url);
-    debug!("🚀 Payload size: {} bytes", payload_size);
-    debug!("🚀 Model: {}", config.default_reason_model);
-    debug!("🚀 Temperature: {}", config.default_temperature);
-    debug!("🚀 Max tokens: {}", config.default_max_tokens);
-    debug!("🚀 Streaming: true");
-    trace!("🔍 API request preparation: url={}, payload_size={}, stream_uuid={}", api_url, payload_size, stream_uuid);
-    
-    debug!("🚀 Sending streaming request to LLM...");
-    trace!("🔍 Streaming request started: stream_uuid={}", stream_uuid);
-    
-    let mut response = client
-        .post(&api_url)
-        .json(&request_payload)
-        .send()
-        .await?;
-    
-    debug!("📡 === STREAMING RESPONSE RECEIVED ===");
-    debug!("📡 HTTP Response Status: {}", response.status());
-    debug!("📡 HTTP Response Status Code: {}", response.status().as_u16());
-    debug!("📡 HTTP Response Success: {}", response.status().is_success());
-    trace!("🔍 Streaming response received: status={}, success={}, stream_uuid={}", 
-           response.status(), response.status().is_success(), stream_uuid);
-    
-    if !response.status().is_success() {
-        error!("❌ === STREAMING API ERROR ===");
-        error!("❌ API request failed: HTTP {}", response.status());
-        debug!("🔍 API error details: status_code={}, status_text={}", response.status().as_u16(), response.status().as_str());
-        trace!("🔍 API request failed: status={}, status_code={}, stream_uuid={}", 
-               response.status(), response.status().as_u16(), stream_uuid);
-        return Err(format!("API returned error: {}", response.status()).into());
+    // Test basic connectivity
+    match client.get(&config.base_url).send().await {
+        Ok(response) => {
+            println!("[DEBUG][RANKING] Basic connectivity test successful - Status: {}", response.status());
+        }
+        Err(e) => {
+            println!("[DEBUG][RANKING] Basic connectivity test failed: {}", e);
+            return Err(format!("Cannot reach remote server {}: {}", config.base_url, e).into());
+        }
     }
     
-    debug!("✅ API request successful: HTTP {}", response.status());
-    trace!("🔍 API request successful: status={}, stream_uuid={}", response.status(), stream_uuid);
+    // Make API request (streaming or non-streaming)
+    let response = match client
+        .post(&api_url)
+        .json(&chat_request)
+        .send()
+        .await
+    {
+        Ok(resp) => {
+            println!("[DEBUG][RANKING] API request sent successfully - Status: {}", resp.status());
+            resp
+        }
+        Err(e) => {
+            println!("[DEBUG][RANKING] API request failed: {}", e);
+            return Err(format!("API request to {} failed: {}", api_url, e).into());
+        }
+    };
     
-    debug!("📡 === STREAMING PROCESSING ===");
-    debug!("📡 Starting to process streaming response...");
-    trace!("🔍 Streaming processing started: stream_uuid={}", stream_uuid);
-    
-    let mut accumulated = String::new();
-    let start_time = Instant::now();
-    let mut last_update = Instant::now();
-    let mut chunk_count = 0;
-    
-    debug!("📊 === STREAMING STATISTICS INITIALIZATION ===");
-    debug!("📊 Start time: {:?}", start_time);
-    debug!("📊 Last update time: {:?}", last_update);
-    debug!("📊 Initial chunk count: {}", chunk_count);
-    trace!("🔍 Streaming started: start_time={:?}, stream_uuid={}", start_time, stream_uuid);
-    
-    while let Some(chunk) = response.chunk().await? {
-        chunk_count += 1;
-        debug!("📡 === CHUNK {} RECEIVED ===", chunk_count);
-        debug!("📡 Received chunk {}: {} bytes", chunk_count, chunk.len());
-        trace!("🔍 Received chunk {}: size={} bytes, stream_uuid={}", chunk_count, chunk.len(), stream_uuid);
+    // Handle non-streaming response for reranker models
+    if !should_stream {
+        println!("[DEBUG][RANKING] Using non-streaming mode for reranker model");
+        let response_text = response.text().await?;
+        println!("[DEBUG][RANKING] Received non-streaming response: {} chars", response_text.len());
+        println!("[DEBUG][RANKING] Response preview: {}", &response_text[..std::cmp::min(200, response_text.len())]);
         
-        let chunk_str = String::from_utf8_lossy(&chunk);
-        debug!("📡 Chunk {} as string: {} characters", chunk_count, chunk_str.len());
-        debug!("📡 Chunk {} preview: {}", chunk_count, &chunk_str[..std::cmp::min(100, chunk_str.len())]);
+        // Parse the JSON response - handle both streaming and non-streaming formats
+        let mut raw_response = String::new();
         
-        for (line_num, line) in chunk_str.lines().enumerate() {
-            debug!("📝 === LINE {} PROCESSING ===", line_num + 1);
-            debug!("📝 Processing line: '{}'", line);
-            
-            if line.starts_with("data: ") {
-                let data = &line[6..];
-                debug!("📝 Found data line: {} characters", data.len());
-                debug!("📝 Data content: '{}'", data);
-                
-                if data == "[DONE]" {
-                    debug!("✅ === STREAM COMPLETION ===");
-                    debug!("✅ Received [DONE] signal, ending stream");
-                    trace!("🔍 Received [DONE] signal, ending stream: stream_uuid={}", stream_uuid);
-                    break;
+        if let Ok(chat_response) = serde_json::from_str::<ChatResponse>(&response_text) {
+            // Streaming format
+            for choice in chat_response.choices {
+                if let Some(delta) = choice.delta {
+                    if let Some(content) = delta.content {
+                        raw_response.push_str(&content);
+                    }
                 }
-                
-                match serde_json::from_str::<StreamResponse>(data) {
-                    Ok(stream_resp) => {
-                        debug!("✅ === STREAM RESPONSE PARSED ===");
-                        debug!("✅ Successfully parsed stream response");
-                        debug!("✅ Choices count: {}", stream_resp.choices.len());
-                        
-                        if let Some(choice) = stream_resp.choices.get(0) {
-                            if let Some(content) = &choice.delta.content {
-                                debug!("📝 === CONTENT CHUNK ADDED ===");
-                                debug!("📝 Adding content chunk: {} characters", content.len());
-                                debug!("📝 Content chunk: '{}'", content);
-                                accumulated.push_str(content);
-                                debug!("📝 Total accumulated: {} characters", accumulated.len());
-                                trace!("🔍 Added content chunk: length={}, total_accumulated={}, stream_uuid={}", 
-                                       content.len(), accumulated.len(), stream_uuid);
-                            }
-                            if choice.finish_reason.is_some() {
-                                debug!("✅ === STREAM FINISHED ===");
-                                debug!("✅ Received finish_reason: {:?}", choice.finish_reason);
-                                trace!("🔍 Received finish_reason: {:?}, ending stream: stream_uuid={}", 
-                                       choice.finish_reason, stream_uuid);
-                                break;
+            }
+        } else {
+            // Non-streaming format - try to extract content directly
+            println!("[DEBUG][RANKING] Trying non-streaming format parsing");
+            if let Ok(json_value) = serde_json::from_str::<serde_json::Value>(&response_text) {
+                if let Some(choices) = json_value.get("choices").and_then(|c| c.as_array()) {
+                    for choice in choices {
+                        if let Some(message) = choice.get("message") {
+                            if let Some(content) = message.get("content").and_then(|c| c.as_str()) {
+                                raw_response.push_str(content);
                             }
                         }
                     }
-                    Err(e) => {
-                        debug!("❌ === STREAM PARSE ERROR ===");
-                        debug!("❌ Failed to parse stream response: {}", e);
-                        debug!("❌ Raw data: '{}'", data);
-                        trace!("🔍 Failed to parse stream response: error={}, data={}, stream_uuid={}", 
-                               e, data, stream_uuid);
+                }
+            }
+        }
+        
+        if raw_response.is_empty() {
+            return Err("API returned empty response".into());
+        }
+        
+        // Continue with processing and streaming to Discord
+        println!("[DEBUG][RANKING] === PROCESSING NON-STREAMING RESPONSE ===");
+        
+        // Apply thinking tag filtering to the complete response
+        let filtered_response = filter_thinking_tags(&raw_response);
+        println!("[DEBUG][RANKING] Filtered response length: {} chars", filtered_response.len());
+        
+        // Apply ranking content processing
+        let processed_response = process_ranking_content(&filtered_response);
+        println!("[DEBUG][RANKING] Processed response length: {} chars", processed_response.len());
+        
+        if processed_response.is_empty() {
+            println!("[DEBUG][RANKING] Processed response is empty, sending fallback message");
+            let _ = initial_msg.edit(&ctx.http, |m| {
+                m.content("📊 **Ranking Analysis Complete**\n\nThe AI completed its ranking analysis, but the response appears to contain only thinking content.")
+            }).await;
+            
+            let stats = StreamingStats {
+                total_characters: raw_response.len(),
+                message_count: 1,
+                filtered_characters: raw_response.len() - filtered_response.len(),
+            };
+            return Ok(stats);
+        }
+        
+        let mut message_state = MessageState {
+            current_content: String::new(),
+            current_message: initial_msg.clone(),
+            message_index: 1,
+            char_limit: config.max_discord_message_length - config.response_format_padding,
+        };
+        
+        // Stream the processed response to Discord in chunks
+        let chunk_size = 100;
+        let mut chars_processed = 0;
+        
+        while chars_processed < processed_response.len() {
+            let end_pos = std::cmp::min(chars_processed + chunk_size, processed_response.len());
+            let chunk = &processed_response[chars_processed..end_pos];
+            
+            if let Err(e) = update_discord_message(&mut message_state, chunk, ctx, config).await {
+                eprintln!("[DEBUG][RANKING] Failed to update Discord message: {}", e);
+                return Err(e);
+            }
+            
+            chars_processed = end_pos;
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        }
+        
+        // Finalize the message
+        finalize_message_content(&mut message_state, "", ctx, config).await?;
+        
+        let stats = StreamingStats {
+            total_characters: raw_response.len(),
+            message_count: message_state.message_index,
+            filtered_characters: raw_response.len() - filtered_response.len(),
+        };
+        return Ok(stats);
+    }
+    
+    if !response.status().is_success() {
+        let status = response.status();
+        let error_text = response.text().await.unwrap_or_else(|_| "Unable to read error response".to_string());
+        println!("[DEBUG][RANKING] API returned error status {}: {}", status, error_text);
+        return Err(format!("Streaming API request failed: HTTP {} - {}", status, error_text).into());
+    }
+    
+    println!("[DEBUG][RANKING] === BUFFERING COMPLETE RESPONSE ===");
+    let mut stream = response.bytes_stream();
+    
+    let mut raw_response = String::new();
+    let mut chunk_count = 0;
+    let mut line_buffer = String::new();
+    let mut received_any_content = false;
+    let mut stream_complete = false;
+    
+    println!("[DEBUG][RANKING] Starting to buffer response from API...");
+    
+    // STEP 1: Buffer the complete response from the API
+    while let Some(chunk) = stream.next().await {
+        if stream_complete {
+            println!("[DEBUG][RANKING] Stream marked as complete, stopping buffering");
+            break;
+        }
+        
+        match chunk {
+            Ok(bytes) => {
+                chunk_count += 1;
+                if chunk_count == 1 {
+                    println!("[DEBUG][RANKING] Received first chunk ({} bytes)", bytes.len());
+                } else if chunk_count % 10 == 0 {
+                    println!("[DEBUG][RANKING] Buffered {} chunks, total response: {} chars", chunk_count, raw_response.len());
+                }
+                
+                line_buffer.push_str(&String::from_utf8_lossy(&bytes));
+                
+                while let Some(i) = line_buffer.find('\n') {
+                    let line = line_buffer.drain(..=i).collect::<String>();
+                    let line = line.trim();
+                    
+                    if let Some(json_str) = line.strip_prefix("data: ") {
+                        if json_str.trim() == "[DONE]" {
+                            println!("[DEBUG][RANKING] Received [DONE] signal, marking stream complete");
+                            stream_complete = true;
+                            break;
+                        }
+                        
+                        if let Ok(response_chunk) = serde_json::from_str::<ChatResponse>(json_str) {
+                            for choice in response_chunk.choices {
+                                if let Some(finish_reason) = choice.finish_reason {
+                                    if finish_reason == "stop" {
+                                        println!("[DEBUG][RANKING] Received finish_reason=stop, marking stream complete");
+                                        stream_complete = true;
+                                        break;
+                                    }
+                                }
+                                
+                                if let Some(delta) = choice.delta {
+                                    if let Some(content) = delta.content {
+                                        received_any_content = true;
+                                        raw_response.push_str(&content);
+                                        println!("[DEBUG][RANKING] Added content chunk: '{}' (total: {} chars)", 
+                                            content, raw_response.len());
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
-            } else {
-                debug!("📝 Line does not start with 'data: ', skipping");
-                trace!("🔍 Skipped non-data line: line={}, stream_uuid={}", line, stream_uuid);
+                
+                if stream_complete {
+                    println!("[DEBUG][RANKING] Breaking out of chunk processing loop");
+                    break;
+                }
+            }
+            Err(e) => {
+                eprintln!("[DEBUG][RANKING] Stream error: {}", e);
+                return Err(e.into());
             }
         }
+    }
+    
+    println!("[DEBUG][RANKING] === BUFFERING COMPLETE ===");
+    println!("[DEBUG][RANKING] Buffered {} chunks, total response: {} chars", chunk_count, raw_response.len());
+    
+    if !received_any_content {
+        eprintln!("[DEBUG][RANKING] No content received from API stream");
+        return Err("No content received from API stream".into());
+    }
+    
+    if raw_response.is_empty() {
+        eprintln!("[DEBUG][RANKING] ERROR: API returned 0 characters in response");
+        return Err("API returned 0 characters in response - this indicates a problem with the API or model".into());
+    }
+    
+    // STEP 2: Process the buffered content and stream to Discord
+    println!("[DEBUG][RANKING] === PROCESSING AND STREAMING TO DISCORD ===");
+    
+    // Apply thinking tag filtering to the complete response
+    let filtered_response = filter_thinking_tags(&raw_response);
+    println!("[DEBUG][RANKING] Filtered response length: {} chars", filtered_response.len());
+    
+    // Apply ranking content processing
+    let processed_response = process_ranking_content(&filtered_response);
+    println!("[DEBUG][RANKING] Processed response length: {} chars", processed_response.len());
+    
+    if processed_response.is_empty() {
+        println!("[DEBUG][RANKING] Processed response is empty, sending fallback message");
+        let _ = initial_msg.edit(&ctx.http, |m| {
+            m.content("📊 **Ranking Analysis Complete**\n\nThe AI completed its ranking analysis, but the response appears to contain only thinking content.")
+        }).await;
         
-        // Periodic update to Discord every 5 seconds
-        if last_update.elapsed() > Duration::from_secs(5) {
-            let elapsed = start_time.elapsed().as_secs();
-            debug!("⏰ === PERIODIC DISCORD UPDATE ===");
-            debug!("⏰ Periodic Discord update: {} seconds elapsed", elapsed);
-            debug!("⏰ Accumulated content: {} characters", accumulated.len());
-            trace!("🔍 Periodic Discord update: elapsed_seconds={}, accumulated_length={}, stream_uuid={}", 
-                   elapsed, accumulated.len(), stream_uuid);
-            
-            msg.edit(ctx, |m| m.content(format!("🤖 Generating summary... ({}s)", elapsed))).await?;
-            last_update = Instant::now();
-            debug!("✅ Discord message updated successfully");
+        let stats = StreamingStats {
+            total_characters: raw_response.len(),
+            message_count: 1,
+            filtered_characters: raw_response.len() - filtered_response.len(),
+        };
+        return Ok(stats);
+    }
+    
+    let mut message_state = MessageState {
+        current_content: String::new(),
+        current_message: initial_msg.clone(),
+        message_index: 1,
+        char_limit: config.max_discord_message_length - config.response_format_padding,
+    };
+    println!("[DEBUG][RANKING] Message state initialized - Char limit: {}", message_state.char_limit);
+    
+    // Split the processed response into chunks for Discord streaming
+    let chunk_size = 100; // Characters per Discord update
+    let mut chars_processed = 0;
+    
+    while chars_processed < processed_response.len() {
+        let end_pos = std::cmp::min(chars_processed + chunk_size, processed_response.len());
+        let chunk = &processed_response[chars_processed..end_pos];
+        
+        println!("[DEBUG][RANKING] Streaming chunk {} chars to Discord", chunk.len());
+        
+        if let Err(e) = update_discord_message(&mut message_state, chunk, ctx, config).await {
+            eprintln!("[DEBUG][RANKING] Failed to update Discord message: {}", e);
+            return Err(e);
         }
+        
+        chars_processed = end_pos;
+        
+        // Small delay to make streaming visible
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
     }
     
-    debug!("📊 === STREAMING COMPLETED ===");
-    debug!("📊 Total chunks received: {}", chunk_count);
-    debug!("📊 Total streaming time: {:.2}s", start_time.elapsed().as_secs_f64());
-    debug!("📊 Final accumulated content: {} characters", accumulated.len());
-    trace!("🔍 Streaming completed: chunk_count={}, total_time={:.2}s, final_length={}, stream_uuid={}", 
-           chunk_count, start_time.elapsed().as_secs_f64(), accumulated.len(), stream_uuid);
+    // Finalize the message
+    println!("[DEBUG][RANKING] === FINALIZING DISCORD MESSAGE ===");
     
-    // Strip <think> sections from full accumulated response (normal for reasoning models)
-    debug!("🧹 === THINKING TAG REMOVAL ===");
-    debug!("🧹 Removing <think> tags from accumulated content...");
-    let before_stripping = accumulated.len();
-    
-    let re = Regex::new(r"(?s)<think>.*?</think>").unwrap();
-    let stripped = re.replace_all(&accumulated, "").to_string();
-    
-    debug!("✅ === THINKING TAG REMOVAL COMPLETED ===");
-    debug!("✅ Thinking tag removal completed");
-    debug!("📊 Before stripping: {} characters", before_stripping);
-    debug!("📊 After stripping: {} characters", stripped.len());
-    debug!("📊 Stripping reduction: {:.2}%", (stripped.len() as f64 / before_stripping as f64) * 100.0);
-    debug!("📊 Content preview: {}", &stripped[..std::cmp::min(300, stripped.len())]);
-    trace!("🔍 Content processing: original_accumulated={}, stripped_length={}, chunk_count={}, stream_uuid={}", 
-           accumulated.len(), stripped.len(), chunk_count, stream_uuid);
-    
-    // Check if the model returned a fallback message
-    debug!("🔍 === FALLBACK MESSAGE CHECK ===");
-    debug!("🔍 Checking for fallback messages in final response...");
-    debug!("🔍 Contains 'Search functionality is not available': {}", stripped.contains("Search functionality is not available"));
-    debug!("🔍 Contains 'fallback': {}", stripped.contains("fallback"));
-    
-    if stripped.contains("Search functionality is not available") || stripped.contains("fallback") {
-        warn!("⚠️ === FALLBACK MESSAGE DETECTED ===");
-        warn!("⚠️ Model {} returned fallback message, indicating it's not suitable for summarization", config.default_reason_model);
-        debug!("🔍 Final response contains fallback message: {}", stripped);
-        trace!("🔍 Fallback message detected: model={}, stream_uuid={}", config.default_reason_model, stream_uuid);
-        
-        // Provide a user-friendly error message
-        let error_message = format!(
-            "❌ **Summarization Failed**\n\n**Issue:** The AI model `{}` appears to be a search/retrieval model, not suitable for content summarization.\n\n**Solution:** Please update your `lmapiconf.txt` to use a chat/completion model instead of a search model.\n\n**Recommended models:**\n• `llama3.2:3b`\n• `llama3.2:7b`\n• `qwen2.5:4b`\n• `qwen2.5:7b`\n• `mistral:7b`\n\n*Source: <{}>*",
-            config.default_reason_model, url
-        );
-        
-        debug!("📝 === FALLBACK ERROR MESSAGE ===");
-        debug!("📝 Sending fallback error message to Discord...");
-        msg.edit(ctx, |m| m.content(&error_message)).await?;
-        debug!("✅ Fallback error message sent successfully");
-        trace!("🔍 Fallback error message sent: stream_uuid={}", stream_uuid);
-        return Ok(());
+    if processed_response.is_empty() {
+        eprintln!("[DEBUG][RANKING] ERROR: Cannot finalize - no content was processed from API");
+        return Err("No content was processed from API - cannot finalize empty message".into());
     }
     
-    // Check if we got meaningful content
-    debug!("🔍 === CONTENT VALIDATION ===");
-    debug!("🔍 Validating final content...");
-    debug!("🔍 Content length: {} characters", stripped.len());
-    debug!("🔍 Content is empty: {}", stripped.trim().is_empty());
-    debug!("🔍 Content is too short: {}", stripped.len() < 50);
-    
-    if stripped.trim().is_empty() || stripped.len() < 50 {
-        error!("❌ === INSUFFICIENT CONTENT ERROR ===");
-        error!("❌ LLM returned insufficient content: {} characters", stripped.len());
-        debug!("🔍 Insufficient content: length={}, content='{}'", stripped.len(), stripped);
-        trace!("🔍 Insufficient content: length={}, stream_uuid={}", stripped.len(), stream_uuid);
-        
-        let error_message = format!(
-            "❌ **Summarization Failed**\n\n**Issue:** The AI model returned insufficient content ({} characters).\n\n**Possible causes:**\n• Model is not properly configured for summarization\n• Content was too long or complex\n• API connection issues\n\n*Source: <{}>*",
-            stripped.len(), url
-        );
-        
-        debug!("📝 === INSUFFICIENT CONTENT ERROR MESSAGE ===");
-        debug!("📝 Sending insufficient content error message to Discord...");
-        msg.edit(ctx, |m| m.content(&error_message)).await?;
-        debug!("✅ Insufficient content error message sent successfully");
-        trace!("🔍 Insufficient content error message sent: stream_uuid={}", stream_uuid);
-        return Ok(());
+    if message_state.current_content.trim().is_empty() {
+        eprintln!("[DEBUG][RANKING] ERROR: Message state has no content despite processed response");
+        return Err("Message state has no content despite processed response - streaming to Discord failed".into());
     }
     
-    // Final update
-    debug!("📝 === FINAL MESSAGE CREATION ===");
-    debug!("📝 Creating final Discord message...");
-    
-    let final_message = format!(
-        "**{} Summary**\n\n{}\n\n*Source: <{}>*",
-        if is_youtube { "YouTube Video" } else { "Webpage" },
-        stripped.trim(),
-        url
-    );
-    
-    debug!("📝 Final message created: {} characters", final_message.len());
-    debug!("📝 Final message preview: {}", &final_message[..std::cmp::min(300, final_message.len())]);
-    trace!("🔍 Final message created: length={}, is_youtube={}, stream_uuid={}", 
-           final_message.len(), is_youtube, stream_uuid);
-    
-    // Split if too long
-    let max_length = config.max_discord_message_length - config.response_format_padding;
-    debug!("📏 === MESSAGE LENGTH CHECK ===");
-    debug!("📏 Final message length: {} characters", final_message.len());
-    debug!("📏 Max Discord message length: {}", config.max_discord_message_length);
-    debug!("📏 Response format padding: {}", config.response_format_padding);
-    debug!("📏 Effective max length: {} characters", max_length);
-    debug!("📏 Needs splitting: {}", final_message.len() > max_length);
-    trace!("🔍 Message length check: final_length={}, max_length={}, needs_splitting={}, stream_uuid={}", 
-           final_message.len(), max_length, final_message.len() > max_length, stream_uuid);
-    
-    if final_message.len() > max_length {
-        info!("📄 === MESSAGE SPLITTING ===");
-        info!("📄 Message too long, splitting into chunks...");
-        debug!("📄 Original message length: {} characters", final_message.len());
-        debug!("📄 Max chunk length: {} characters", max_length);
-        trace!("🔍 Message splitting started: original_length={}, max_chunk_length={}, stream_uuid={}", 
-               final_message.len(), max_length, stream_uuid);
-        
-        let chunks = split_message(&final_message, max_length);
-        debug!("📄 Split into {} chunks", chunks.len());
-        debug!("📄 Chunk sizes: {:?}", chunks.iter().map(|c| c.len()).collect::<Vec<_>>());
-        trace!("🔍 Message split completed: chunk_count={}, stream_uuid={}", chunks.len(), stream_uuid);
-        
-        for (i, chunk) in chunks.iter().enumerate() {
-            debug!("📤 === SENDING CHUNK {} ===", i+1);
-            debug!("📤 Sending chunk {}: {} characters", i+1, chunk.len());
-            trace!("🔍 Sending chunk {}: length={}, stream_uuid={}", i+1, chunk.len(), stream_uuid);
-            
-            if i == 0 {
-                debug!("📤 Sending first chunk via edit");
-                msg.edit(ctx, |m| m.content(chunk)).await?;
-                trace!("🔍 First chunk sent via edit: stream_uuid={}", stream_uuid);
-            } else {
-                debug!("📤 Sending additional chunk {} via new message", i+1);
-                msg.channel_id.say(ctx, chunk).await?;
-                trace!("🔍 Additional chunk {} sent via new message: stream_uuid={}", i+1, stream_uuid);
-            }
-            debug!("✅ Chunk {} sent successfully", i+1);
-        }
-    } else {
-        debug!("📤 === SENDING SINGLE MESSAGE ===");
-        debug!("📤 Sending single message: {} characters", final_message.len());
-        trace!("🔍 Sending single message: length={}, stream_uuid={}", final_message.len(), stream_uuid);
-        
-        msg.edit(ctx, |m| m.content(&final_message)).await?;
-        debug!("✅ Single message sent successfully");
-        trace!("🔍 Single message sent successfully: stream_uuid={}", stream_uuid);
+    if let Err(e) = finalize_message_content(&mut message_state, "", ctx, config).await {
+        eprintln!("[DEBUG][RANKING] Failed to finalize Discord message: {}", e);
+        return Err(e);
     }
     
-    info!("✅ === AI SUMMARIZATION STREAMING COMPLETED ===");
-    info!("✅ Stream summary completed successfully");
-    debug!("📊 Final statistics:");
-    debug!("📊   - Stream UUID: {}", stream_uuid);
-    debug!("📊   - Total chunks received: {}", chunk_count);
-    debug!("📊   - Total streaming time: {:.2}s", start_time.elapsed().as_secs_f64());
-    debug!("📊   - Final content length: {} characters", stripped.len());
-    debug!("📊   - Final message length: {} characters", final_message.len());
-    debug!("📊   - Content type: {}", if is_youtube { "YouTube" } else { "Webpage" });
-    trace!("🔍 Stream summary completed successfully: stream_uuid={}", stream_uuid);
+    let stats = StreamingStats {
+        total_characters: raw_response.len(),
+        message_count: message_state.message_index,
+        filtered_characters: raw_response.len() - filtered_response.len(),
+    };
     
-    Ok(())
+    println!("[DEBUG][RANKING] === RANKING STREAMING COMPLETED ===");
+    println!("[DEBUG][RANKING] Final stats - Total chars: {}, Messages: {}, Filtered chars: {}", 
+        stats.total_characters, stats.message_count, stats.filtered_characters);
+    Ok(stats)
 }
 
-// Split long messages into Discord-sized chunks
-// Used to avoid exceeding Discord's message length limit
+// Helper function to split messages for Discord's character limit
 fn split_message(content: &str, max_len: usize) -> Vec<String> {
-    let split_uuid = Uuid::new_v4();
+    let mut messages = Vec::new();
+    let mut current_message = String::new();
     
-    debug!("📄 === MESSAGE SPLITTING STARTED ===");
-    debug!("🆔 Split UUID: {}", split_uuid);
-    debug!("📄 Original content length: {} characters", content.len());
-    debug!("📄 Max chunk length: {} characters", max_len);
-    debug!("📄 Needs splitting: {}", content.len() > max_len);
-    trace!("🔍 Message splitting started: content_length={}, max_len={}, split_uuid={}", 
-           content.len(), max_len, split_uuid);
-    
-    let mut chunks = Vec::new();
-    let mut current = String::new();
-    let mut line_count = 0;
-    let mut chunk_count = 0;
-    
-    debug!("📝 === LINE PROCESSING ===");
-    debug!("📝 Processing content line by line...");
-    
-    for (line_num, line) in content.lines().enumerate() {
-        line_count += 1;
-        debug!("📝 === LINE {} PROCESSING ===", line_num + 1);
-        debug!("📝 Line {} length: {} characters", line_num + 1, line.len());
-        debug!("📝 Line {} content: '{}'", line_num + 1, line);
-        debug!("📝 Current chunk length: {} characters", current.len());
-        debug!("📝 Would exceed limit: {}", current.len() + line.len() + 1 > max_len);
-        
-        if current.len() + line.len() + 1 > max_len && !current.is_empty() {
-            chunk_count += 1;
-            debug!("📄 === CHUNK {} CREATED ===", chunk_count);
-            debug!("📄 Creating chunk {}: {} characters", chunk_count, current.len());
-            debug!("📄 Chunk {} content: '{}'", chunk_count, current.trim());
-            chunks.push(current.trim().to_string());
-            trace!("🔍 Chunk {} created: length={}, split_uuid={}", chunk_count, current.len(), split_uuid);
-            current = String::new();
-            debug!("📄 Reset current chunk for next content");
+    for line in content.lines() {
+        if current_message.len() + line.len() + 1 > max_len {
+            if !current_message.is_empty() {
+                messages.push(current_message.trim().to_string());
+                current_message = String::new();
+            }
+            
+            // If a single line is too long, split it
+            if line.len() > max_len {
+                let mut remaining = line;
+                while remaining.len() > max_len {
+                    let split_point = remaining[..max_len].rfind(' ').unwrap_or(max_len);
+                    messages.push(remaining[..split_point].to_string());
+                    remaining = &remaining[split_point..];
+                }
+                if !remaining.is_empty() {
+                    current_message.push_str(remaining);
+                    current_message.push('\n');
+                }
+            } else {
+                current_message.push_str(line);
+                current_message.push('\n');
+            }
+        } else {
+            current_message.push_str(line);
+            current_message.push('\n');
         }
-        
-        if !current.is_empty() {
-            debug!("📝 Adding newline to current chunk");
-            current.push('\n');
-        }
-        
-        debug!("📝 Adding line {} to current chunk", line_num + 1);
-        current.push_str(line);
-        debug!("📝 Current chunk after adding line: {} characters", current.len());
-        trace!("🔍 Line {} processed: line_length={}, current_chunk_length={}, split_uuid={}", 
-               line_num + 1, line.len(), current.len(), split_uuid);
     }
     
-    if !current.is_empty() {
-        chunk_count += 1;
-        debug!("📄 === FINAL CHUNK {} CREATED ===", chunk_count);
-        debug!("📄 Creating final chunk {}: {} characters", chunk_count, current.len());
-        debug!("📄 Final chunk content: '{}'", current.trim());
-        chunks.push(current.trim().to_string());
-        trace!("🔍 Final chunk {} created: length={}, split_uuid={}", chunk_count, current.len(), split_uuid);
+    if !current_message.is_empty() {
+        messages.push(current_message.trim().to_string());
     }
     
-    debug!("✅ === MESSAGE SPLITTING COMPLETED ===");
-    debug!("✅ Message splitting completed successfully");
-    debug!("📊 Final statistics:");
-    debug!("📊   - Split UUID: {}", split_uuid);
-    debug!("📊   - Total lines processed: {}", line_count);
-    debug!("📊   - Total chunks created: {}", chunks.len());
-    debug!("📊   - Original content length: {} characters", content.len());
-    debug!("📊   - Total chunked content length: {} characters", chunks.iter().map(|c| c.len()).sum::<usize>());
-    debug!("📊   - Chunk sizes: {:?}", chunks.iter().map(|c| c.len()).collect::<Vec<_>>());
-    debug!("📊   - Efficiency: {:.2}%", (chunks.iter().map(|c| c.len()).sum::<usize>() as f64 / content.len() as f64) * 100.0);
-    
-    trace!("🔍 Message splitting completed: line_count={}, chunk_count={}, original_length={}, total_chunked_length={}, split_uuid={}", 
-           line_count, chunks.len(), content.len(), chunks.iter().map(|c| c.len()).sum::<usize>(), split_uuid);
-    
-    chunks
+    messages
 }
+
+
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_clean_vtt() {
-        let vtt = r#"WEBVTT
+        let vtt_content = r#"WEBVTT
 
-00:00:00.000 --> 00:00:03.000
-Hello world
+00:00:01.000 --> 00:00:04.000
+Hello world, this is a test
 
-00:00:03.000 --> 00:00:06.000
-This is a test"#;
+00:00:05.000 --> 00:00:08.000
+<c>This is some content</c>
+
+00:00:09.000 --> 00:00:12.000
+<v Speaker>This is spoken content</v>
+"#;
         
-        let cleaned = clean_vtt_content(vtt);
-        assert_eq!(cleaned, "Hello world This is a test");
+        let cleaned = clean_vtt_content(vtt_content);
+        assert!(!cleaned.contains("WEBVTT"));
+        assert!(!cleaned.contains("-->"));
+        assert!(!cleaned.contains("<c>"));
+        assert!(!cleaned.contains("</c>"));
+        assert!(!cleaned.contains("<v"));
+        assert!(!cleaned.contains("</v>"));
+        assert!(cleaned.contains("Hello world"));
+        assert!(cleaned.contains("This is some content"));
+        assert!(cleaned.contains("This is spoken content"));
     }
-    
+
     #[test]
     fn test_clean_html() {
-        let html = "<p>Hello <b>world</b></p><script>alert('test');</script>";
-        let cleaned = clean_html(html);
-        assert_eq!(cleaned, "Hello world");
-    }
-    
-    #[test]
-    fn test_webpage_content_processing() {
-        // Test that web page content is processed correctly
-        let test_content = "This is a test webpage content with some information about various topics. It contains multiple sentences and should be processed properly for summarization.";
+        let html_content = r#"<html><head><title>Test</title></head><body><script>alert('test');</script><style>body { color: red; }</style><p>This is <b>bold</b> text</p></body></html>"#;
         
-        // Simulate the content processing logic
-        let max_content_length = 20000;
-        let truncated_content = if test_content.len() > max_content_length {
-            format!("{} [Content truncated due to length]", &test_content[0..max_content_length])
-        } else {
-            test_content.to_string()
-        };
-        
-        // Verify content is not truncated
-        assert_eq!(truncated_content, test_content);
-        
-        // Test chunking logic
-        let chunk_size = 8000;
-        let mut chunks = Vec::new();
-        let mut current_chunk = String::new();
-        
-        for word in truncated_content.split_whitespace() {
-            if current_chunk.len() + word.len() + 1 > chunk_size && !current_chunk.is_empty() {
-                chunks.push(current_chunk.trim().to_string());
-                current_chunk = String::new();
-            }
-            
-            if !current_chunk.is_empty() {
-                current_chunk.push(' ');
-            }
-            current_chunk.push_str(word);
-        }
-        
-        if !current_chunk.is_empty() {
-            chunks.push(current_chunk.trim().to_string());
-        }
-        
-        // Verify chunking works correctly
-        assert_eq!(chunks.len(), 1); // Should fit in one chunk
-        assert_eq!(chunks[0], test_content);
-    }
-    
-    #[test]
-    fn test_html_file_processing() {
-        // Test HTML cleaning functionality
-        let test_html = r#"<html><head><title>Test Page</title></head><body><h1>Hello World</h1><p>This is a <b>test</b> paragraph.</p><script>alert('test');</script><style>body { color: red; }</style></body></html>"#;
-        
-        let cleaned = clean_html(test_html);
-        
-        // Should contain the text content but not HTML tags, scripts, or styles
-        assert!(cleaned.contains("Hello World"));
-        assert!(cleaned.contains("This is a test paragraph"));
+        let cleaned = clean_html(html_content);
         assert!(!cleaned.contains("<script>"));
         assert!(!cleaned.contains("<style>"));
         assert!(!cleaned.contains("<html>"));
+        assert!(!cleaned.contains("<p>"));
         assert!(!cleaned.contains("<b>"));
+        assert!(!cleaned.contains("</b>"));
+        assert!(cleaned.contains("This is bold text"));
     }
-} 
+
+    #[test]
+    fn test_webpage_content_processing() {
+        // Test that webpage content processing works correctly
+        let test_content = "This is a test webpage content with some text to analyze and rank.";
+        let test_url = "https://example.com";
+        
+        // Test content truncation
+        let long_content = "A".repeat(25000);
+        let truncated = if long_content.len() > 20000 {
+            format!("{} [Content truncated due to length]", &long_content[0..20000])
+        } else {
+            long_content.clone()
+        };
+        
+        assert!(truncated.len() <= 20000 + 30); // 30 chars for truncation message
+        assert!(truncated.contains("[Content truncated due to length]"));
+        
+        // Test normal content
+        let normal_content = "Normal length content";
+        let normal_truncated = if normal_content.len() > 20000 {
+            format!("{} [Content truncated due to length]", &normal_content[0..20000])
+        } else {
+            normal_content.clone()
+        };
+        
+        assert_eq!(normal_truncated, normal_content);
+    }
+
+    #[test]
+    fn test_html_file_processing() {
+        // Test HTML file processing functionality
+        let test_html = r#"<html><head><title>Test Page</title></head><body><h1>Test Content</h1><p>This is a test paragraph with <b>bold</b> text and <i>italic</i> text.</p><script>console.log('test');</script><style>body { font-family: Arial; }</style></body></html>"#;
+        
+        let cleaned = clean_html(test_html);
+        
+        // Should remove HTML tags
+        assert!(!cleaned.contains("<html>"));
+        assert!(!cleaned.contains("<head>"));
+        assert!(!cleaned.contains("<body>"));
+        assert!(!cleaned.contains("<h1>"));
+        assert!(!cleaned.contains("<p>"));
+        assert!(!cleaned.contains("<b>"));
+        assert!(!cleaned.contains("<i>"));
+        assert!(!cleaned.contains("<script>"));
+        assert!(!cleaned.contains("<style>"));
+        
+        // Should preserve text content
+        assert!(cleaned.contains("Test Content"));
+        assert!(cleaned.contains("This is a test paragraph"));
+        assert!(cleaned.contains("bold"));
+        assert!(cleaned.contains("italic"));
+        
+        // Should not contain script or style content
+        assert!(!cleaned.contains("console.log"));
+        assert!(!cleaned.contains("font-family"));
+    }
+}

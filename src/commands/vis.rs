@@ -374,6 +374,7 @@ pub async fn handle_vision_request(
     println!("[VISION]   - Base URL: {}", config.base_url);
     println!("[VISION]   - Default Model: {}", config.default_model);
     println!("[VISION]   - Default Reason Model: {}", config.default_reason_model);
+    println!("[VISION]   - Default Ranking Model: {}", config.default_ranking_model);
     println!("[VISION]   - Default Vision Model: {}", config.default_vision_model);
     println!("[VISION]   - Temperature: {}", config.default_temperature);
     println!("[VISION]   - Max Tokens: {}", config.default_max_tokens);

@@ -1029,8 +1029,8 @@ pub async fn lm(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
         match crate::commands::search::test_api_connectivity(&config).await {
             Ok(success_message) => {
                 println!("[DEBUG][LM] Connectivity test successful");
-                let final_message = format!("**Connectivity Test Results**\n\n{:?}\n\n**Configuration:**\n- Base URL: {}\n- Default Model: {}\n- Default Reason Model: {}\n- Timeout: {}s\n- Max Tokens: {}\n- Temperature: {}\n- Vision Model: {}\n",
-                    success_message, config.base_url, config.default_model, config.default_reason_model, config.timeout, config.default_max_tokens, config.default_temperature, config.default_vision_model
+                let final_message = format!("**Connectivity Test Results**\n\n{:?}\n\n**Configuration:**\n- Base URL: {}\n- Default Model: {}\n- Default Reason Model: {}\n- Default Ranking Model: {}\n- Timeout: {}s\n- Max Tokens: {}\n- Temperature: {}\n- Vision Model: {}\n",
+                    success_message, config.base_url, config.default_model, config.default_reason_model, config.default_ranking_model, config.timeout, config.default_max_tokens, config.default_temperature, config.default_vision_model
                 );
                 
                 if let Err(e) = test_msg.edit(&ctx.http, |m| {
@@ -1073,7 +1073,22 @@ pub async fn lm(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
         
         if had_context {
             println!("[DEBUG][LM] Context cleared successfully");
-            msg.reply(ctx, "**LM Chat Context Cleared** ✅\nYour conversation history has been reset (250 user messages + 250 assistant messages).").await?;
+            
+            // Save the cleared context state to disk immediately
+            {
+                let data = ctx.data.read().await;
+                let lm_contexts = data.get::<crate::LmContextMap>().cloned().unwrap_or_default();
+                let reason_contexts = data.get::<crate::ReasonContextMap>().cloned().unwrap_or_default();
+                let global_lm_context = data.get::<crate::GlobalLmContextMap>().cloned().unwrap_or_else(|| crate::UserContext::new());
+                
+                if let Err(e) = crate::save_contexts_to_disk(&lm_contexts, &reason_contexts, &global_lm_context).await {
+                    eprintln!("Failed to save cleared context to disk: {}", e);
+                } else {
+                    println!("[DEBUG][LM] Cleared context state saved to disk");
+                }
+            }
+            
+            msg.reply(ctx, "**LM Chat Context Cleared** ✅\nYour conversation history has been reset and saved. The next message will start a brand new context.").await?;
         } else {
             println!("[DEBUG][LM] No context to clear");
             msg.reply(ctx, "**No LM Context Found** ℹ️\nYou don't have any active conversation history to clear.").await?;
@@ -1096,7 +1111,22 @@ pub async fn lm(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
         
         if had_context {
             println!("[DEBUG][LM] Global context cleared successfully");
-            msg.reply(ctx, "**Global LM Chat Context Cleared** ✅\nThe shared conversation history has been reset (250 user messages + 250 assistant messages).").await?;
+            
+            // Save the cleared context state to disk immediately
+            {
+                let data = ctx.data.read().await;
+                let lm_contexts = data.get::<crate::LmContextMap>().cloned().unwrap_or_default();
+                let reason_contexts = data.get::<crate::ReasonContextMap>().cloned().unwrap_or_default();
+                let global_lm_context = data.get::<crate::GlobalLmContextMap>().cloned().unwrap_or_else(|| crate::UserContext::new());
+                
+                if let Err(e) = crate::save_contexts_to_disk(&lm_contexts, &reason_contexts, &global_lm_context).await {
+                    eprintln!("Failed to save cleared global context to disk: {}", e);
+                } else {
+                    println!("[DEBUG][LM] Cleared global context state saved to disk");
+                }
+            }
+            
+            msg.reply(ctx, "**Global LM Chat Context Cleared** ✅\nThe shared conversation history has been reset and saved. The next message will start a brand new shared context.").await?;
         } else {
             println!("[DEBUG][LM] No global context to clear");
             msg.reply(ctx, "**No Global LM Context Found** ℹ️\nThere's no active shared conversation history to clear.").await?;
@@ -1222,7 +1252,21 @@ pub async fn clearcontext(ctx: &Context, msg: &Message, _args: Args) -> CommandR
     println!("[clearcontext] Cleared context for user {} (had_context={})", user_id, had_context);
     
     if had_context {
-        msg.reply(ctx, "**LM Chat Context Cleared** ✅\nYour conversation history with the AI has been fully reset (250 user messages + 250 assistant messages). The next message you send will start a brand new context.").await?;
+        // Save the cleared context state to disk immediately
+        {
+            let data = ctx.data.read().await;
+            let lm_contexts = data.get::<crate::LmContextMap>().cloned().unwrap_or_default();
+            let reason_contexts = data.get::<crate::ReasonContextMap>().cloned().unwrap_or_default();
+            let global_lm_context = data.get::<crate::GlobalLmContextMap>().cloned().unwrap_or_else(|| crate::UserContext::new());
+            
+            if let Err(e) = crate::save_contexts_to_disk(&lm_contexts, &reason_contexts, &global_lm_context).await {
+                eprintln!("Failed to save cleared context to disk: {}", e);
+            } else {
+                println!("[clearcontext] Cleared context state saved to disk");
+            }
+        }
+        
+        msg.reply(ctx, "**LM Chat Context Cleared** ✅\nYour conversation history with the AI has been fully reset and saved. The next message you send will start a brand new context.").await?;
     } else {
         msg.reply(ctx, "**No Context Found** ℹ️\nYou don't have any active conversation history to clear. Start a conversation with `^lm <your message>`.\n\nIf you believe context is still being used, please report this as a bug.").await?;
     }

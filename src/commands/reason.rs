@@ -155,6 +155,8 @@ pub async fn reason(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
         
         let had_context = if let Some(context) = reason_map.get_mut(&msg.author.id) {
             let message_count = context.total_messages();
+            let context_info = context.get_context_info();
+            println!("[reason] Clearing context via --clear flag for user {}: {}", msg.author.id, context_info);
             context.clear();
             message_count > 0
         } else {
@@ -162,7 +164,7 @@ pub async fn reason(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
         };
         
         if had_context {
-            msg.reply(ctx, "**Reasoning Context Cleared** ✅\nYour reasoning conversation history has been reset (50 user messages + 50 assistant messages).").await?;
+            msg.reply(ctx, "**Reasoning Context Cleared** ✅\nYour reasoning conversation history has been reset. The next reasoning question you ask will start a brand new context.").await?;
         } else {
             msg.reply(ctx, "**No Reasoning Context Found** ℹ️\nYou don't have any active reasoning conversation history to clear.").await?;
         }
@@ -281,7 +283,14 @@ pub async fn clearreasoncontext(ctx: &Context, msg: &Message, _args: Args) -> Co
         let message_count = context.total_messages();
         let context_info = context.get_context_info();
         println!("[clearcontext] Clearing reason context for user {}: {}", user_id, context_info);
+        
+        // Clear the context completely
         context.clear();
+        
+        // Verify the context was cleared
+        let after_clear_info = context.get_context_info();
+        println!("[clearcontext] Context after clearing: {}", after_clear_info);
+        
         message_count > 0
     } else {
         false
@@ -290,7 +299,21 @@ pub async fn clearreasoncontext(ctx: &Context, msg: &Message, _args: Args) -> Co
     println!("[clearcontext] Cleared reason context for user {} (had_context={})", user_id, had_context);
     
     if had_context {
-        msg.reply(ctx, "**Reasoning Context Cleared** ✅\nYour reasoning conversation history has been fully reset (50 user messages + 50 assistant messages). The next reasoning question you ask will start a brand new context.").await?;
+        // Save the cleared context state to disk immediately
+        {
+            let data = ctx.data.read().await;
+            let lm_contexts = data.get::<crate::LmContextMap>().cloned().unwrap_or_default();
+            let reason_contexts = data.get::<crate::ReasonContextMap>().cloned().unwrap_or_default();
+            let global_lm_context = data.get::<crate::GlobalLmContextMap>().cloned().unwrap_or_else(|| crate::UserContext::new());
+            
+            if let Err(e) = crate::save_contexts_to_disk(&lm_contexts, &reason_contexts, &global_lm_context).await {
+                eprintln!("Failed to save cleared context to disk: {}", e);
+            } else {
+                println!("[clearcontext] Cleared context state saved to disk");
+            }
+        }
+        
+        msg.reply(ctx, "**Reasoning Context Cleared** ✅\nYour reasoning conversation history has been fully reset and saved. The next reasoning question you ask will start a brand new context.").await?;
     } else {
         msg.reply(ctx, "**No Reasoning Context Found** ℹ️\nYou don't have any active reasoning conversation history to clear. Start a reasoning conversation with `^reason <your question>`.\n\nIf you believe reasoning context is still being used, please report this as a bug.").await?;
     }
@@ -360,6 +383,7 @@ async fn load_reasoning_config() -> Result<LMConfig, Box<dyn std::error::Error +
         "LM_STUDIO_TIMEOUT", 
         "DEFAULT_MODEL",
         "DEFAULT_REASON_MODEL",
+        "DEFAULT_RANKING_MODEL",
         "DEFAULT_TEMPERATURE",
         "DEFAULT_MAX_TOKENS",
         "MAX_DISCORD_MESSAGE_LENGTH",
@@ -385,6 +409,8 @@ async fn load_reasoning_config() -> Result<LMConfig, Box<dyn std::error::Error +
             .ok_or("DEFAULT_MODEL not found")?.clone(),
         default_reason_model: config_map.get("DEFAULT_REASON_MODEL")
             .ok_or("DEFAULT_REASON_MODEL not found")?.clone(),
+        default_ranking_model: config_map.get("DEFAULT_RANKING_MODEL")
+            .ok_or("DEFAULT_RANKING_MODEL not found")?.clone(),
         default_temperature: config_map.get("DEFAULT_TEMPERATURE")
             .ok_or("DEFAULT_TEMPERATURE not found")?
             .parse()
@@ -515,10 +541,10 @@ async fn stream_reasoning_response(
     println!("[DEBUG][REASONING] Model: {}", model);
     println!("[DEBUG][REASONING] Messages count: {}", messages.len());
     println!("[DEBUG][REASONING] Base URL: {}", config.base_url);
-    println!("[DEBUG][REASONING] Timeout: {} seconds", config.timeout);
+    println!("[DEBUG][REASONING] Config timeout: {} seconds, Using: 180 seconds for reasoning operations", config.timeout);
     
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(60))
+        .timeout(std::time::Duration::from_secs(180)) // 3 minutes for reasoning operations
         .build()?;
     println!("[DEBUG][REASONING] HTTP client created");
         
@@ -1084,7 +1110,7 @@ async fn stream_reasoning_search_response(
     initial_msg: &mut Message,
 ) -> Result<StreamingStats, Box<dyn std::error::Error + Send + Sync>> {
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(config.timeout * 3))
+        .timeout(std::time::Duration::from_secs(180)) // 3 minutes for reasoning search operations
         .build()?;
         
     let chat_request = ChatRequest {
@@ -1308,7 +1334,7 @@ async fn chat_completion_reasoning(
     max_tokens: Option<i32>,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(60)) // Use 60-second timeout for consistency
+        .timeout(std::time::Duration::from_secs(180)) // 3 minutes for reasoning completion operations
         .build()?;
         
     let chat_request = ChatRequest {

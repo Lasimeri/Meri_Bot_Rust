@@ -21,6 +21,7 @@ pub struct LMConfig {
     pub timeout: u64,
     pub default_model: String,
     pub default_reason_model: String,
+    pub default_ranking_model: String,
     pub default_temperature: f32,
     pub default_max_tokens: i32,
     pub max_discord_message_length: usize,
@@ -99,6 +100,10 @@ pub async fn load_lm_config() -> Result<LMConfig, Box<dyn std::error::Error + Se
         .ok_or("DEFAULT_REASON_MODEL not found in lmapiconf.txt")?
         .clone();
     
+    let default_ranking_model = config_map.get("DEFAULT_RANKING_MODEL")
+        .ok_or("DEFAULT_RANKING_MODEL not found in lmapiconf.txt")?
+        .clone();
+    
     let default_vision_model = config_map.get("DEFAULT_VISION_MODEL")
         .ok_or("DEFAULT_VISION_MODEL not found in lmapiconf.txt")?
         .clone();
@@ -128,6 +133,7 @@ pub async fn load_lm_config() -> Result<LMConfig, Box<dyn std::error::Error + Se
         timeout,
         default_model,
         default_reason_model,
+        default_ranking_model,
         default_temperature,
         default_max_tokens,
         max_discord_message_length,
