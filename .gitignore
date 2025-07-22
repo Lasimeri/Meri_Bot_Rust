@@ -241,3 +241,6 @@ serpapi.txt
 log.txt
 src/terminal_manager.rs
 src/terminal.rs
+ANTI_PROPAGANDA_FIX.md
+COMPILATION_FIXES.md
+CONTEXT_PERSISTENCE_FIX.md
