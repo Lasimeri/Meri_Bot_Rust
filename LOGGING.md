@@ -33,13 +33,13 @@ The Meri Bot Rust includes a comprehensive logging system that provides complete
 The logging system is configured via the `RUST_LOG` environment variable in `botconfig.txt`:
 
 ```
-RUST_LOG=trace
+RUST_LOG=info
 ```
 
 **Recommended Settings:**
-- `trace` - Full visibility for development and debugging
+- `info` - Standard operational logging (default)
 - `debug` - Detailed logging for production monitoring
-- `info` - Standard operational logging
+- `trace` - Full visibility for development and debugging (can be enabled in `src/main.rs`)
 - `warn` - Only warnings and errors
 - `error` - Only error conditions
 
@@ -47,6 +47,22 @@ RUST_LOG=trace
 - **Primary**: `log.txt` in the project root directory
 - **Automatic Creation**: Log file is created automatically on first run
 - **Persistent**: Logs are preserved across bot restarts
+
+### Enabling Trace Logging
+To enable trace logging for detailed debugging:
+
+1. **Edit `src/main.rs`** (around line 810):
+   ```rust
+   // Change from:
+   std::env::set_var("RUST_LOG", "info");
+   
+   // To:
+   std::env::set_var("RUST_LOG", "trace");
+   ```
+
+2. **Recompile and restart** the bot
+3. **Check `log.txt`** for detailed trace-level logs
+4. **Remember to disable** trace logging in production for performance
 
 ## 📋 Command-Specific Logging
 

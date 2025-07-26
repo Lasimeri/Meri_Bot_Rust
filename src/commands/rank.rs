@@ -11,6 +11,17 @@
 // - Multi-path config and prompt loading
 // - Robust error handling and logging
 // - Thinking tag filtering and buffered streaming (like reason.rs)
+// - MODULAR SYSTEM: Flag-based analysis types (usability, quality, accessibility, etc.)
+//
+// Supported Flags:
+//   - ^rank <url> (default comprehensive analysis)
+//   - ^rank -usability <url> (usability-focused analysis)
+//   - ^rank -quality <url> (content quality analysis)
+//   - ^rank -accessibility <url> (accessibility analysis)
+//   - ^rank -seo <url> (SEO analysis)
+//   - ^rank -performance <url> (performance analysis)
+//   - ^rank -security <url> (security analysis)
+//   - ^rank -comprehensive <url> (comprehensive analysis)
 //
 // Used by: main.rs (command registration), search.rs (for config)
 
@@ -38,6 +49,103 @@ static THINKING_TAG_REGEX: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"(?s)<think>.*?</think>").unwrap()
 });
 
+// ============================================================================
+// MODULAR RANKING SYSTEM STRUCTURES
+// ============================================================================
+
+/// Enumeration of available ranking analysis types
+#[derive(Debug, Clone, PartialEq)]
+pub enum RankingMode {
+    Comprehensive,  // Default comprehensive analysis
+    Usability,      // Usability-focused analysis
+    Quality,        // Content quality analysis
+    Accessibility,  // Accessibility analysis
+    SEO,           // SEO analysis
+    Performance,   // Performance analysis
+    Security,      // Security analysis
+    Educational,   // Educational value analysis
+    Entertainment, // Entertainment value analysis
+    Technical,     // Technical analysis
+}
+
+impl RankingMode {
+    /// Get the flag string for this mode
+    pub fn flag(&self) -> &'static str {
+        match self {
+            RankingMode::Comprehensive => "-comprehensive",
+            RankingMode::Usability => "-usability",
+            RankingMode::Quality => "-quality",
+            RankingMode::Accessibility => "-accessibility",
+            RankingMode::SEO => "-seo",
+            RankingMode::Performance => "-performance",
+            RankingMode::Security => "-security",
+            RankingMode::Educational => "-educational",
+            RankingMode::Entertainment => "-entertainment",
+            RankingMode::Technical => "-technical",
+        }
+    }
+
+    /// Get the display name for this mode
+    pub fn display_name(&self) -> &'static str {
+        match self {
+            RankingMode::Comprehensive => "Comprehensive Analysis",
+            RankingMode::Usability => "Usability Analysis",
+            RankingMode::Quality => "Content Quality Analysis",
+            RankingMode::Accessibility => "Accessibility Analysis",
+            RankingMode::SEO => "SEO Analysis",
+            RankingMode::Performance => "Performance Analysis",
+            RankingMode::Security => "Security Analysis",
+            RankingMode::Educational => "Educational Value Analysis",
+            RankingMode::Entertainment => "Entertainment Value Analysis",
+            RankingMode::Technical => "Technical Analysis",
+        }
+    }
+
+    /// Get the short description for this mode
+    pub fn description(&self) -> &'static str {
+        match self {
+            RankingMode::Comprehensive => "Complete analysis covering all aspects",
+            RankingMode::Usability => "Focus on user experience and ease of use",
+            RankingMode::Quality => "Content quality, accuracy, and value assessment",
+            RankingMode::Accessibility => "Accessibility compliance and inclusive design",
+            RankingMode::SEO => "Search engine optimization and discoverability",
+            RankingMode::Performance => "Speed, efficiency, and technical performance",
+            RankingMode::Security => "Security vulnerabilities and best practices",
+            RankingMode::Educational => "Educational value and learning potential",
+            RankingMode::Entertainment => "Entertainment value and engagement",
+            RankingMode::Technical => "Technical implementation and architecture",
+        }
+    }
+
+    /// Get all available modes
+    pub fn all_modes() -> Vec<RankingMode> {
+        vec![
+            RankingMode::Comprehensive,
+            RankingMode::Usability,
+            RankingMode::Quality,
+            RankingMode::Accessibility,
+            RankingMode::SEO,
+            RankingMode::Performance,
+            RankingMode::Security,
+            RankingMode::Educational,
+            RankingMode::Entertainment,
+            RankingMode::Technical,
+        ]
+    }
+}
+
+/// Structure to hold parsed command arguments
+#[derive(Debug)]
+pub struct RankCommandArgs {
+    pub mode: RankingMode,
+    pub url: String,
+    pub original_input: String,
+}
+
+// ============================================================================
+// EXISTING STRUCTURES
+// ============================================================================
+
 // Structures for streaming API responses
 // Used to parse streaming JSON chunks from the AI API
 #[derive(Deserialize)]
@@ -64,6 +172,8 @@ struct ChatRequest {
     temperature: f32,           // Sampling temperature
     max_tokens: i32,            // Max tokens to generate
     stream: bool,               // Whether to stream output
+    #[serde(skip_serializing_if = "Option::is_none")]
+    seed: Option<i64>,          // Optional seed for reproducible responses
 }
 
 // Structure to track streaming statistics for ranking
@@ -100,12 +210,242 @@ struct StreamDelta {
     content: Option<String>,    // Content chunk
 }
 
+// ============================================================================
+// COMMAND PARSING FUNCTIONS
+// ============================================================================
+
+/// Parse command arguments to extract ranking mode and URL
+fn parse_rank_command(input: &str) -> Result<RankCommandArgs, String> {
+    let input = input.trim();
+    
+    if input.is_empty() {
+        return Err("No input provided".to_string());
+    }
+
+    // Check for help flag first
+    if input == "-h" || input == "--help" || input == "help" {
+        return Err("HELP_REQUESTED".to_string());
+    }
+
+    // Split input into words
+    let words: Vec<&str> = input.split_whitespace().collect();
+    
+    if words.is_empty() {
+        return Err("No arguments provided".to_string());
+    }
+
+    // Check if first word is a flag
+    if words[0].starts_with('-') {
+        // Flag-based mode
+        let mode = match words[0] {
+            "-usability" => RankingMode::Usability,
+            "-quality" => RankingMode::Quality,
+            "-accessibility" => RankingMode::Accessibility,
+            "-seo" => RankingMode::SEO,
+            "-performance" => RankingMode::Performance,
+            "-security" => RankingMode::Security,
+            "-educational" => RankingMode::Educational,
+            "-entertainment" => RankingMode::Entertainment,
+            "-technical" => RankingMode::Technical,
+            "-comprehensive" => RankingMode::Comprehensive,
+            _ => return Err(format!("Unknown flag: {}. Use -h for help.", words[0])),
+        };
+
+        // Check if we have a URL after the flag
+        if words.len() < 2 {
+            return Err(format!("Missing URL after flag {}. Usage: ^rank {} <url>", words[0], words[0]));
+        }
+
+        let url = words[1..].join(" ");
+        Ok(RankCommandArgs {
+            mode,
+            url,
+            original_input: input.to_string(),
+        })
+    } else {
+        // No flag provided, use comprehensive mode
+        let url = words.join(" ");
+        Ok(RankCommandArgs {
+            mode: RankingMode::Comprehensive,
+            url,
+            original_input: input.to_string(),
+        })
+    }
+}
+
+/// Generate help message for rank command
+fn generate_rank_help() -> String {
+    let mut help = String::new();
+    help.push_str("**📊 Rank Command - Content Analysis & Ranking**\n\n");
+    help.push_str("Analyze and rank webpages and YouTube videos with AI-powered insights.\n\n");
+    
+    help.push_str("**Usage:**\n");
+    help.push_str("• `^rank <url>` - Comprehensive analysis (default)\n");
+    help.push_str("• `^rank -<mode> <url>` - Specific analysis mode\n\n");
+    
+    help.push_str("**Available Analysis Modes:**\n");
+    for mode in RankingMode::all_modes() {
+        help.push_str(&format!("• `{}` - {}\n", mode.flag(), mode.description()));
+    }
+    
+    help.push_str("\n**Examples:**\n");
+    help.push_str("• `^rank https://example.com` - Comprehensive analysis\n");
+    help.push_str("• `^rank -usability https://example.com` - Usability focus\n");
+    help.push_str("• `^rank -quality https://youtube.com/watch?v=...` - Content quality\n");
+    help.push_str("• `^rank -accessibility https://example.com` - Accessibility analysis\n");
+    
+    help.push_str("\n**Supported Content:**\n");
+    help.push_str("• Webpages (HTML content)\n");
+    help.push_str("• YouTube videos (transcript analysis)\n");
+    
+    help
+}
+
+// ============================================================================
+// MODULAR PROMPT LOADING FUNCTIONS
+// ============================================================================
+
+/// Load system prompt for specific ranking mode
+async fn load_ranking_mode_prompt(mode: &RankingMode, is_youtube: bool) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let base_filename = match mode {
+        RankingMode::Comprehensive => "rank_comprehensive_prompt",
+        RankingMode::Usability => "rank_usability_prompt",
+        RankingMode::Quality => "rank_quality_prompt",
+        RankingMode::Accessibility => "rank_accessibility_prompt",
+        RankingMode::SEO => "rank_seo_prompt",
+        RankingMode::Performance => "rank_performance_prompt",
+        RankingMode::Security => "rank_security_prompt",
+        RankingMode::Educational => "rank_educational_prompt",
+        RankingMode::Entertainment => "rank_entertainment_prompt",
+        RankingMode::Technical => "rank_technical_prompt",
+    };
+
+    let youtube_suffix = if is_youtube { "_youtube" } else { "" };
+    let filename = format!("{}{}.txt", base_filename, youtube_suffix);
+    
+    let prompt_paths = [
+        filename.as_str(),
+        &format!("../{}", filename),
+        &format!("../../{}", filename),
+        &format!("src/{}", filename),
+        &format!("example_{}", filename),
+        &format!("../example_{}", filename),
+        &format!("../../example_{}", filename),
+        &format!("src/example_{}", filename),
+    ];
+
+    // Try to load mode-specific prompt
+    for path in &prompt_paths {
+        match fs::read_to_string(path) {
+            Ok(content) => {
+                let content = content.strip_prefix('\u{feff}').unwrap_or(&content);
+                debug!("📊 Loaded {} prompt from: {}", mode.display_name(), path);
+                return Ok(content.trim().to_string());
+            }
+            Err(_) => continue,
+        }
+    }
+
+    // Fallback to generic mode prompt (without youtube suffix)
+    let generic_filename = format!("{}.txt", base_filename);
+    let generic_paths = [
+        generic_filename.as_str(),
+        &format!("../{}", generic_filename),
+        &format!("../../{}", generic_filename),
+        &format!("src/{}", generic_filename),
+        &format!("example_{}", generic_filename),
+        &format!("../example_{}", generic_filename),
+        &format!("../../example_{}", generic_filename),
+        &format!("src/example_{}", generic_filename),
+    ];
+
+    for path in &generic_paths {
+        match fs::read_to_string(path) {
+            Ok(content) => {
+                let content = content.strip_prefix('\u{feff}').unwrap_or(&content);
+                debug!("📊 Loaded generic {} prompt from: {}", mode.display_name(), path);
+                return Ok(content.trim().to_string());
+            }
+            Err(_) => continue,
+        }
+    }
+
+    // Final fallback to built-in prompts
+    debug!("📊 Using built-in fallback prompt for {}", mode.display_name());
+    Ok(generate_fallback_prompt(mode, is_youtube))
+}
+
+/// Generate fallback prompt for a specific mode
+fn generate_fallback_prompt(mode: &RankingMode, is_youtube: bool) -> String {
+    let content_type = if is_youtube { "YouTube video" } else { "webpage" };
+    
+    match mode {
+        RankingMode::Comprehensive => {
+            format!("You are an expert content analyst and evaluator. Analyze the provided {} content and provide a comprehensive ranking across multiple dimensions: Content Quality (1-10), Relevance (1-10), Engagement Potential (1-10), Educational Value (1-10), Technical Excellence (1-10), Usability (1-10), Accessibility (1-10), and SEO Optimization (1-10). Provide detailed analysis with specific examples, strengths, areas for improvement, and an overall recommendation. Use clear formatting and provide actionable insights.", content_type)
+        },
+        RankingMode::Usability => {
+            format!("You are a usability expert and UX analyst. Analyze the provided {} content focusing specifically on usability aspects: User Interface Design (1-10), Navigation Ease (1-10), Information Architecture (1-10), User Flow (1-10), Mobile Responsiveness (1-10), Loading Speed (1-10), and Overall User Experience (1-10). Provide detailed usability analysis with specific examples, user journey insights, and actionable recommendations for improvement.", content_type)
+        },
+        RankingMode::Quality => {
+            format!("You are a content quality specialist. Analyze the provided {} content focusing on quality metrics: Content Accuracy (1-10), Writing Quality (1-10), Information Depth (1-10), Originality (1-10), Relevance (1-10), Completeness (1-10), and Overall Value (1-10). Provide detailed quality analysis with specific examples, identify strengths and weaknesses, and suggest improvements for content enhancement.", content_type)
+        },
+        RankingMode::Accessibility => {
+            format!("You are an accessibility expert and inclusive design specialist. Analyze the provided {} content focusing on accessibility compliance: WCAG Compliance (1-10), Screen Reader Compatibility (1-10), Keyboard Navigation (1-10), Color Contrast (1-10), Text Readability (1-10), Alternative Text (1-10), and Overall Accessibility (1-10). Provide detailed accessibility analysis with specific compliance issues, inclusive design recommendations, and actionable improvements.", content_type)
+        },
+        RankingMode::SEO => {
+            format!("You are an SEO specialist and search engine optimization expert. Analyze the provided {} content focusing on SEO metrics: Keyword Optimization (1-10), Meta Tags (1-10), Content Structure (1-10), Internal Linking (1-10), Page Speed (1-10), Mobile Optimization (1-10), and Overall SEO Score (1-10). Provide detailed SEO analysis with specific optimization opportunities, ranking factors, and actionable recommendations for better search visibility.", content_type)
+        },
+        RankingMode::Performance => {
+            format!("You are a performance optimization expert. Analyze the provided {} content focusing on performance metrics: Loading Speed (1-10), Resource Optimization (1-10), Code Efficiency (1-10), Caching Strategy (1-10), Image Optimization (1-10), Server Response Time (1-10), and Overall Performance (1-10). Provide detailed performance analysis with specific bottlenecks, optimization opportunities, and actionable recommendations for better performance.", content_type)
+        },
+        RankingMode::Security => {
+            format!("You are a cybersecurity expert and security analyst. Analyze the provided {} content focusing on security aspects: Data Protection (1-10), Privacy Compliance (1-10), Secure Communication (1-10), Input Validation (1-10), Authentication Security (1-10), Vulnerability Assessment (1-10), and Overall Security Score (1-10). Provide detailed security analysis with specific vulnerabilities, compliance issues, and actionable security recommendations.", content_type)
+        },
+        RankingMode::Educational => {
+            format!("You are an educational content specialist and learning analyst. Analyze the provided {} content focusing on educational value: Learning Objectives (1-10), Content Clarity (1-10), Engagement Level (1-10), Knowledge Retention (1-10), Practical Application (1-10), Difficulty Level (1-10), and Overall Educational Value (1-10). Provide detailed educational analysis with specific learning insights, pedagogical recommendations, and suggestions for educational enhancement.", content_type)
+        },
+        RankingMode::Entertainment => {
+            format!("You are an entertainment content specialist and engagement analyst. Analyze the provided {} content focusing on entertainment value: Engagement Level (1-10), Content Appeal (1-10), Entertainment Quality (1-10), Audience Retention (1-10), Creative Elements (1-10), Production Value (1-10), and Overall Entertainment Score (1-10). Provide detailed entertainment analysis with specific engagement insights, audience appeal factors, and recommendations for enhanced entertainment value.", content_type)
+        },
+        RankingMode::Technical => {
+            format!("You are a technical architecture expert and systems analyst. Analyze the provided {} content focusing on technical aspects: Code Quality (1-10), Architecture Design (1-10), Scalability (1-10), Maintainability (1-10), Technology Stack (1-10), Best Practices (1-10), and Overall Technical Excellence (1-10). Provide detailed technical analysis with specific technical insights, architectural recommendations, and actionable improvements for technical excellence.", content_type)
+        },
+    }
+}
+
+// ============================================================================
+// LEGACY PROMPT FUNCTIONS (for backward compatibility)
+// ============================================================================
+
+/// Legacy function for backward compatibility
+async fn load_ranking_analysis_prompt() -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    load_ranking_mode_prompt(&RankingMode::Comprehensive, false).await
+}
+
+/// Legacy function for backward compatibility
+async fn load_youtube_ranking_analysis_prompt() -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    load_ranking_mode_prompt(&RankingMode::Comprehensive, true).await
+}
+
+// ... existing code ...
+
 #[command]
 #[aliases("rank", "analyze", "evaluate")]
 /// Main ^rank command handler
-/// Handles ranking and analysis of webpages and YouTube videos
+/// Handles ranking and analysis of webpages and YouTube videos with modular analysis modes
 /// Supports:
-///   - ^rank <url> (webpage or YouTube)
+///   - ^rank <url> (default comprehensive analysis)
+///   - ^rank -usability <url> (usability-focused analysis)
+///   - ^rank -quality <url> (content quality analysis)
+///   - ^rank -accessibility <url> (accessibility analysis)
+///   - ^rank -seo <url> (SEO analysis)
+///   - ^rank -performance <url> (performance analysis)
+///   - ^rank -security <url> (security analysis)
+///   - ^rank -educational <url> (educational value analysis)
+///   - ^rank -entertainment <url> (entertainment value analysis)
+///   - ^rank -technical <url> (technical analysis)
+///   - ^rank -comprehensive <url> (comprehensive analysis)
+///   - ^rank -h (help)
 pub async fn rank(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
     let start_time = std::time::Instant::now();
     let command_uuid = Uuid::new_v4();
@@ -136,13 +476,46 @@ pub async fn rank(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
     trace!("🔍 Command initialization details: uuid={}, author_id={}, channel_id={}, message_id={}", 
            command_uuid, msg.author.id, msg.channel_id, msg.id);
     
-    let url = args.message().trim();
+    // Parse command arguments
+    debug!("🔧 === COMMAND PARSING ===");
+    debug!("🔧 Parsing command arguments: '{}'", args.message());
+    trace!("🔍 Command parsing started: input={}, command_uuid={}", args.message(), command_uuid);
+    
+    let command_args = match parse_rank_command(args.message()) {
+        Ok(args) => {
+            debug!("✅ Command parsed successfully");
+            debug!("📊 Analysis mode: {}", args.mode.display_name());
+            debug!("🔗 URL: {}", args.url);
+            trace!("🔍 Command parsing success: mode={}, url={}, command_uuid={}", 
+                   args.mode.display_name(), args.url, command_uuid);
+            args
+        },
+        Err(e) => {
+            if e == "HELP_REQUESTED" {
+                debug!("📖 Help requested by user");
+                trace!("🔍 Help request: user_id={}, command_uuid={}", msg.author.id, command_uuid);
+                msg.reply(ctx, &generate_rank_help()).await?;
+                debug!("✅ Help message sent successfully");
+                return Ok(());
+            } else {
+                warn!("❌ === COMMAND PARSING ERROR ===");
+                warn!("❌ Failed to parse command: {}", e);
+                debug!("🔍 Command parsing error details: {}", e);
+                trace!("🔍 Command parsing error: error={}, command_uuid={}", e, command_uuid);
+                msg.reply(ctx, &format!("**Command Error:** {}\n\nUse `^rank -h` for help.", e)).await?;
+                debug!("✅ Command error message sent");
+                return Ok(());
+            }
+        }
+    };
+    
+    let url = &command_args.url;
     debug!("🔗 === URL PROCESSING ===");
-    debug!("🔗 Raw URL: '{}'", url);
+    debug!("🔗 Parsed URL: '{}'", url);
     debug!("🔗 URL length: {} characters", url.len());
     debug!("🔗 URL is empty: {}", url.is_empty());
-    trace!("🔍 URL processing: raw_length={}, trimmed_length={}, is_empty={}", 
-           args.message().len(), url.len(), url.is_empty());
+    trace!("🔍 URL processing: length={}, is_empty={}, command_uuid={}", 
+           url.len(), url.is_empty(), command_uuid);
     
     // Logging is now configured globally in main.rs to show all levels
     debug!("🔧 Logging configured for maximum debugging detail");
@@ -155,7 +528,7 @@ pub async fn rank(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
         debug!("🔍 Sending error message to user");
         trace!("🔍 Empty URL error: user_id={}, channel_id={}, command_uuid={}", 
                msg.author.id, msg.channel_id, command_uuid);
-        msg.reply(ctx, "Please provide a URL to rank and analyze!\n\n**Usage:** `^rank <url>`").await?;
+        msg.reply(ctx, "Please provide a URL to rank and analyze!\n\n**Usage:** `^rank <url>`\nUse `^rank -h` for help.").await?;
         debug!("✅ Error message sent successfully");
         return Ok(());
     }
@@ -184,7 +557,7 @@ pub async fn rank(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
     trace!("🔍 URL validation success: protocol={}, command_uuid={}", 
            if url.starts_with("https://") { "https" } else { "http" }, command_uuid);
     
-    // Load LM configuration from lmapiconf.txt BEFORE starting typing indicator
+    // Load LM configuration from lmapiconf.txt
     debug!("🔧 === CONFIGURATION LOADING ===");
     debug!("🔧 Loading LM configuration from lmapiconf.txt...");
     trace!("🔍 Configuration loading phase started: command_uuid={}", command_uuid);
@@ -219,15 +592,9 @@ pub async fn rank(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
     };
     
     debug!("🔧 Configuration loaded successfully, proceeding with next steps");
-    trace!("🔍 Configuration phase completed, moving to typing indicator: command_uuid={}", command_uuid);
+    trace!("🔍 Configuration phase completed: command_uuid={}", command_uuid);
     
-    // Start typing indicator AFTER config is loaded
-    debug!("⌨️ === TYPING INDICATOR ===");
-    debug!("⌨️ Starting typing indicator...");
-    trace!("🔍 Typing indicator request: channel_id={}, command_uuid={}", msg.channel_id.0, command_uuid);
-    let _typing = ctx.http.start_typing(msg.channel_id.0)?;
-    debug!("✅ Typing indicator started successfully");
-    trace!("🔍 Typing indicator phase completed: command_uuid={}", command_uuid);
+
     
     debug!("🔍 === URL TYPE DETECTION ===");
     debug!("🔍 Detecting URL type...");
@@ -239,13 +606,17 @@ pub async fn rank(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
            url.contains("youtube.com/"), url.contains("youtu.be/"), is_youtube, command_uuid);
     info!("🎯 === CONTENT TYPE DETECTED ===");
     info!("🎯 Processing {} URL: {}", if is_youtube { "YouTube" } else { "webpage" }, url);
+    info!("📊 Analysis mode: {}", command_args.mode.display_name());
     debug!("📊 URL type detection: YouTube = {}", is_youtube);
+    debug!("📊 Analysis mode: {}", command_args.mode.display_name());
     
     // Create response message
     debug!("💬 === DISCORD MESSAGE CREATION ===");
     debug!("💬 Creating initial Discord response message...");
     trace!("🔍 Discord message creation: author={}, channel={}, command_uuid={}", msg.author.name, msg.channel_id, command_uuid);
-    let mut response_msg = msg.reply(ctx, "🔄 Fetching content for ranking...").await?;
+    
+    let initial_message = format!("🔄 Fetching content for {} analysis...", command_args.mode.display_name());
+    let mut response_msg = msg.reply(ctx, &initial_message).await?;
     debug!("✅ Initial Discord message sent successfully");
     debug!("📝 Response message ID: {}", response_msg.id);
     debug!("📝 Response message channel ID: {}", response_msg.channel_id);
@@ -419,7 +790,7 @@ pub async fn rank(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
     let processing_start = std::time::Instant::now();
     debug!("⏱️ AI processing start time: {:?}", processing_start);
     
-    match stream_ranking_analysis(&content, url, &config, &mut response_msg, ctx, is_youtube, subtitle_file_path.as_deref()).await {
+    match stream_ranking_analysis(&content, url, &config, &mut response_msg, ctx, is_youtube, subtitle_file_path.as_deref(), &command_args.mode).await {
         Ok(stats) => {
             let processing_time = processing_start.elapsed();
             info!("✅ === AI RANKING ANALYSIS SUCCESS ===");
@@ -472,47 +843,19 @@ pub async fn rank(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
     log::info!("🎯 URL: {}", url);
     log::info!("🎯 Processing method: {}", if subtitle_file_path.is_some() { "RAG with file" } else { "Direct processing" });
     
-    // Clean up temporary files
+    // TEMPORARILY BYPASS CLEANUP - Keep temporary files for debugging
     if let Some(file_path) = subtitle_file_path {
-        // Log file path before cleanup
+        // Log file path
         log::info!("🎯 File path used: {}", file_path);
+        log::info!("🔄 === CLEANUP BYPASSED ===");
+        log::info!("🔄 Temporary file preserved for debugging: {}", file_path);
+        log::info!("🔄 File exists: {}", std::path::Path::new(&file_path).exists());
+        log::info!("🔄 Command UUID: {}", command_uuid);
+        log::info!("🔄 Status: Temporary file preserved (cleanup bypassed)");
         
-        debug!("🧹 === TEMPORARY FILE CLEANUP ===");
-        debug!("🧹 Cleaning up temporary file: {}", file_path);
-        
-        // Enhanced logging for cleanup process
-        log::info!("🧹 === TEMPORARY FILE CLEANUP STARTED ===");
-        log::info!("🧹 File path: {}", file_path);
-        log::info!("🧹 File exists: {}", std::path::Path::new(&file_path).exists());
-        log::info!("🧹 Command UUID: {}", command_uuid);
-        
-        match fs::remove_file(&file_path) {
-            Ok(_) => {
-                debug!("✅ Temporary file cleaned up successfully: {}", file_path);
-                trace!("🔍 File cleanup success: path={}, command_uuid={}", file_path, command_uuid);
-                
-                // Enhanced logging for successful cleanup
-                log::info!("✅ === TEMPORARY FILE CLEANUP SUCCESS ===");
-                log::info!("✅ File removed: {}", file_path);
-                log::info!("✅ File no longer exists: {}", !std::path::Path::new(&file_path).exists());
-            },
-            Err(e) => {
-                warn!("⚠️ Failed to clean up temporary file: {} - {}", file_path, e);
-                debug!("🔍 File cleanup error: path={}, error={}", file_path, e);
-                trace!("🔍 File cleanup error: path={}, error_type={}, command_uuid={}", 
-                       file_path, std::any::type_name_of_val(&e), command_uuid);
-                
-                // Enhanced logging for cleanup failure
-                log::error!("❌ === TEMPORARY FILE CLEANUP FAILED ===");
-                log::error!("❌ File path: {}", file_path);
-                log::error!("❌ Error: {}", e);
-                log::error!("❌ Error type: {}", std::any::type_name_of_val(&e));
-                log::error!("❌ File still exists: {}", std::path::Path::new(&file_path).exists());
-            }
-        }
-        
-        // Log cleanup status
-        log::info!("🎯 File cleaned up: {}", !std::path::Path::new(&file_path).exists());
+        debug!("🔄 === CLEANUP BYPASSED ===");
+        debug!("🔄 Preserving temporary file for debugging: {}", file_path);
+        trace!("🔍 Cleanup bypassed: path={}, command_uuid={}", file_path, command_uuid);
     }
     
     log::info!("🎯 Status: SUCCESS");
@@ -520,81 +863,35 @@ pub async fn rank(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
     Ok(())
 } 
 
-// Load ranking analysis system prompt with multi-path fallback
-// Loads ranking_analysis_prompt.txt from multiple locations, returns prompt string or fallback
-async fn load_ranking_analysis_prompt() -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    let prompt_paths = [
-        "rank_system_prompt.txt",
-        "ranking_analysis_prompt.txt",
-        "../rank_system_prompt.txt",
-        "../ranking_analysis_prompt.txt",
-        "../../rank_system_prompt.txt",
-        "../../ranking_analysis_prompt.txt",
-        "src/rank_system_prompt.txt",
-        "src/ranking_analysis_prompt.txt",
-        "example_ranking_analysis_prompt.txt",
-        "../example_ranking_analysis_prompt.txt",
-        "../../example_ranking_analysis_prompt.txt",
-        "src/example_ranking_analysis_prompt.txt",
-    ];
+
+
+// Generate cache key from YouTube URL for consistent caching
+fn generate_youtube_cache_key(url: &str) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
     
-    for path in &prompt_paths {
-        match fs::read_to_string(path) {
-            Ok(content) => {
-                // Remove BOM if present
-                let content = content.strip_prefix('\u{feff}').unwrap_or(&content);
-                debug!("📊 Qwen3 reranking prompt loaded from: {}", path);
-                return Ok(content.trim().to_string());
-            }
-            Err(_) => continue,
-        }
-    }
-    
-    // Fallback prompt if no file found
-    debug!("📊 Using built-in fallback Qwen3 reranking prompt");
-    Ok("You are a Qwen3 Reranking model (qwen3-reranker-4b) specialized in content analysis and ranking. Your task is to evaluate and rank content across multiple dimensions: Content Quality (1-10), Relevance (1-10), Engagement Potential (1-10), Educational Value (1-10), and Technical Excellence (1-10). Provide detailed analysis with specific examples, strengths, areas for improvement, and an overall recommendation.".to_string())
+    let mut hasher = DefaultHasher::new();
+    url.hash(&mut hasher);
+    format!("{:x}", hasher.finish())
 }
 
-// Load YouTube ranking analysis system prompt with multi-path fallback
-// Loads youtube_ranking_analysis_prompt.txt from multiple locations, returns prompt string or fallback
-async fn load_youtube_ranking_analysis_prompt() -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    let prompt_paths = [
-        "youtube_ranking_analysis_prompt.txt",
-        "../youtube_ranking_analysis_prompt.txt",
-        "../../youtube_ranking_analysis_prompt.txt",
-        "src/youtube_ranking_analysis_prompt.txt",
-        "example_youtube_ranking_analysis_prompt.txt",
-        "../example_youtube_ranking_analysis_prompt.txt",
-        "../../example_youtube_ranking_analysis_prompt.txt",
-        "src/example_youtube_ranking_analysis_prompt.txt",
-    ];
-    
-    for path in &prompt_paths {
-        match fs::read_to_string(path) {
-            Ok(content) => {
-                // Remove BOM if present
-                let content = content.strip_prefix('\u{feff}').unwrap_or(&content);
-                debug!("📺 YouTube ranking analysis prompt loaded from: {}", path);
-                return Ok(content.trim().to_string());
-            }
-            Err(_) => continue,
-        }
-    }
-    
-    // Fallback prompt if no file found
-    debug!("📺 Using built-in fallback YouTube ranking analysis prompt");
-    Ok("You are an expert YouTube content analyst and evaluator. Analyze the provided YouTube video content and rank different aspects including educational value, entertainment quality, production value, accuracy, engagement potential, and overall viewer satisfaction. Provide detailed ratings (1-10 scale) and explanations for each aspect, along with specific examples from the content. Use clear formatting and provide actionable insights for content creators and viewers.".to_string())
-}
-
-// Enhanced YouTube transcript fetcher using yt-dlp with detailed logging
+// Enhanced YouTube transcript fetcher using yt-dlp with detailed logging and caching
 // Downloads and cleans VTT subtitles for a given YouTube URL
 async fn fetch_youtube_transcript(url: &str) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    let temp_file = format!("yt_transcript_{}", Uuid::new_v4());
     let process_uuid = Uuid::new_v4();
     
     info!("🎥 === YOUTUBE TRANSCRIPT EXTRACTION STARTED ===");
     info!("🆔 Process UUID: {}", process_uuid);
     info!("📍 Target URL: {}", url);
+    
+    // TEMPORARILY BYPASS CACHING - Use direct yt_transcript files
+    let subtitles_dir = "subtitles";
+    info!("🔄 === CACHING BYPASSED ===");
+    info!("🔄 Using direct yt_transcript files for RAG processing");
+    debug!("🔄 Cache system temporarily disabled");
+    trace!("🔍 Cache bypass: process_uuid={}", process_uuid);
+    
+    let temp_file = format!("yt_transcript_{}", Uuid::new_v4());
     info!("📁 Temp file base: {}", temp_file);
     
     debug!("🔧 === YOUTUBE TRANSCRIPT INITIALIZATION ===");
@@ -1097,7 +1394,12 @@ async fn fetch_youtube_transcript(url: &str) -> Result<String, Box<dyn std::erro
     trace!("🔍 YouTube transcript extraction success: file_path={}, original_length={}, cleaned_length={}, process_uuid={}", 
            vtt_file, content.len(), cleaned.len(), process_uuid);
     
-    // Return the path to the subtitle file for RAG processing
+    // TEMPORARILY BYPASS CACHING - Return temporary file directly
+    info!("🔄 === RETURNING TEMPORARY FILE PATH ===");
+    info!("🔄 Returning temporary file path for RAG processing: {}", vtt_file);
+    debug!("📄 Temporary file path: {}", vtt_file);
+    trace!("🔍 Returning temporary path: temp={}, process_uuid={}", vtt_file, process_uuid);
+    
     Ok(vtt_file)
 } 
 
@@ -1505,6 +1807,7 @@ async fn update_discord_message(
     new_content: &str,
     ctx: &Context,
     config: &LMConfig,
+    ranking_mode: &RankingMode,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     println!("[DEBUG][RANKING_UPDATE] Updating Discord message with {} chars", new_content.len());
     
@@ -1522,8 +1825,8 @@ async fn update_discord_message(
     println!("[DEBUG][RANKING_UPDATE] State content after adding: '{}' ({} chars)", state.current_content, state.current_content.len());
     
     // Then create the formatted content for Discord
-    let potential_content = format!("📊 **Ranking Analysis (Part {}):**\n\n{}", 
-        state.message_index, state.current_content);
+    let potential_content = format!("📊 **{} (Part {}):**\n\n{}", 
+        ranking_mode.display_name(), state.message_index, state.current_content);
     
     println!("[DEBUG][RANKING_UPDATE] Formatted content for Discord: '{}' ({} chars)", potential_content, potential_content.len());
 
@@ -1533,8 +1836,8 @@ async fn update_discord_message(
             potential_content.len(), state.char_limit);
         
         // Finalize current message
-        let final_content = format!("📊 **Ranking Analysis (Part {}):**\n\n{}", 
-            state.message_index, state.current_content);
+        let final_content = format!("📊 **{} (Part {}):**\n\n{}", 
+            ranking_mode.display_name(), state.message_index, state.current_content);
         let edit_result = state.current_message.edit(&ctx.http, |m| {
             m.content(final_content)
         }).await;
@@ -1548,8 +1851,8 @@ async fn update_discord_message(
         state.message_index += 1;
         // Reset current_content for the new message
         state.current_content = new_content.to_string();
-        let new_msg_content = format!("📊 **Ranking Analysis (Part {}):**\n\n{}", 
-            state.message_index, state.current_content);
+        let new_msg_content = format!("📊 **{} (Part {}):**\n\n{}", 
+            ranking_mode.display_name(), state.message_index, state.current_content);
         let send_result = state.current_message.channel_id.send_message(&ctx.http, |m| {
             m.content(new_msg_content)
         }).await;
@@ -1584,6 +1887,7 @@ async fn finalize_message_content(
     remaining_content: &str,
     ctx: &Context,
     config: &LMConfig,
+    ranking_mode: &RankingMode,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     println!("[DEBUG][RANKING_FINALIZE] Finalizing message with {} chars", remaining_content.len());
     println!("[DEBUG][RANKING_FINALIZE] Current state content: {} chars", state.current_content.len());
@@ -1602,7 +1906,7 @@ async fn finalize_message_content(
     
     // Add any remaining content if provided
     if !remaining_content.trim().is_empty() {
-        update_discord_message(state, remaining_content, ctx, config).await?;
+        update_discord_message(state, remaining_content, ctx, config, ranking_mode).await?;
     }
     
     // Check if we have any content to finalize (either from remaining_content or existing state)
@@ -1613,10 +1917,10 @@ async fn finalize_message_content(
     
     // Mark the final message as complete
     let final_display = if state.message_index == 1 {
-        format!("📊 **Ranking Analysis Complete**\n\n{}", state.current_content)
+        format!("📊 **{} Complete**\n\n{}", ranking_mode.display_name(), state.current_content)
     } else {
-        format!("📊 **Ranking Analysis Complete (Part {}/{})**\n\n{}", 
-            state.message_index, state.message_index, state.current_content)
+        format!("📊 **{} Complete (Part {}/{})**\n\n{}", 
+            ranking_mode.display_name(), state.message_index, state.message_index, state.current_content)
     };
 
     println!("[DEBUG][RANKING_FINALIZE] Marking message as complete - Part {}", state.message_index);
@@ -1641,6 +1945,7 @@ async fn stream_ranking_analysis(
     ctx: &Context,
     is_youtube: bool,
     file_path: Option<&str>,
+    ranking_mode: &RankingMode,
 ) -> Result<StreamingStats, Box<dyn std::error::Error + Send + Sync>> {
     println!("[DEBUG][RANKING] === STARTING RANKING STREAM RESPONSE ===");
     println!("[DEBUG][RANKING] URL: {}", url);
@@ -1655,22 +1960,15 @@ async fn stream_ranking_analysis(
         .build()?;
     println!("[DEBUG][RANKING] HTTP client created");
     
-    // Load appropriate system prompt
-    let system_prompt = if is_youtube {
-        match load_youtube_ranking_analysis_prompt().await {
-            Ok(prompt) => prompt,
-            Err(e) => {
-                eprintln!("Failed to load YouTube ranking analysis prompt: {}", e);
-                return Err(e);
-            }
-        }
-    } else {
-        match load_ranking_analysis_prompt().await {
-            Ok(prompt) => prompt,
-            Err(e) => {
-                eprintln!("Failed to load ranking analysis prompt: {}", e);
-                return Err(e);
-            }
+    // Load appropriate system prompt for the ranking mode
+    let system_prompt = match load_ranking_mode_prompt(ranking_mode, is_youtube).await {
+        Ok(prompt) => {
+            println!("[DEBUG][RANKING] Loaded {} prompt for {} content", ranking_mode.display_name(), if is_youtube { "YouTube" } else { "webpage" });
+            prompt
+        },
+        Err(e) => {
+            eprintln!("Failed to load {} prompt: {}", ranking_mode.display_name(), e);
+            return Err(e);
         }
     };
     
@@ -1685,7 +1983,8 @@ async fn stream_ranking_analysis(
         };
         
         let prompt = format!(
-            "Please analyze and rank this {} from {}:\n\n{}",
+            "Please perform a {} on this {} from {}:\n\n{}",
+            ranking_mode.display_name(),
             if is_youtube { "YouTube video subtitle file" } else { "webpage HTML content" },
             url, cleaned_content
         );
@@ -1701,7 +2000,8 @@ async fn stream_ranking_analysis(
         };
         
         let prompt = format!(
-            "Please analyze and rank this {} from {}:\n\n{}",
+            "Please perform a {} on this {} from {}:\n\n{}",
+            ranking_mode.display_name(),
             if is_youtube { "YouTube video transcript" } else { "webpage content" },
             url, truncated_content
         );
@@ -1724,6 +2024,7 @@ async fn stream_ranking_analysis(
         temperature: config.default_temperature,
         max_tokens: config.default_max_tokens,
         stream: should_stream,
+        seed: config.default_seed,
     };
     
     let api_url = format!("{}/v1/chat/completions", config.base_url);
@@ -1836,7 +2137,7 @@ async fn stream_ranking_analysis(
             let end_pos = std::cmp::min(chars_processed + chunk_size, processed_response.len());
             let chunk = &processed_response[chars_processed..end_pos];
             
-            if let Err(e) = update_discord_message(&mut message_state, chunk, ctx, config).await {
+            if let Err(e) = update_discord_message(&mut message_state, chunk, ctx, config, ranking_mode).await {
                 eprintln!("[DEBUG][RANKING] Failed to update Discord message: {}", e);
                 return Err(e);
             }
@@ -1846,7 +2147,7 @@ async fn stream_ranking_analysis(
         }
         
         // Finalize the message
-        finalize_message_content(&mut message_state, "", ctx, config).await?;
+        finalize_message_content(&mut message_state, "", ctx, config, ranking_mode).await?;
         
         let stats = StreamingStats {
             total_characters: raw_response.len(),
@@ -1994,7 +2295,7 @@ async fn stream_ranking_analysis(
         
         println!("[DEBUG][RANKING] Streaming chunk {} chars to Discord", chunk.len());
         
-        if let Err(e) = update_discord_message(&mut message_state, chunk, ctx, config).await {
+        if let Err(e) = update_discord_message(&mut message_state, chunk, ctx, config, ranking_mode).await {
             eprintln!("[DEBUG][RANKING] Failed to update Discord message: {}", e);
             return Err(e);
         }
@@ -2018,7 +2319,7 @@ async fn stream_ranking_analysis(
         return Err("Message state has no content despite processed response - streaming to Discord failed".into());
     }
     
-    if let Err(e) = finalize_message_content(&mut message_state, "", ctx, config).await {
+    if let Err(e) = finalize_message_content(&mut message_state, "", ctx, config, ranking_mode).await {
         eprintln!("[DEBUG][RANKING] Failed to finalize Discord message: {}", e);
         return Err(e);
     }
@@ -2144,7 +2445,7 @@ Hello world, this is a test
         let normal_truncated = if normal_content.len() > 20000 {
             format!("{} [Content truncated due to length]", &normal_content[0..20000])
         } else {
-            normal_content.clone()
+            normal_content.to_string()
         };
         
         assert_eq!(normal_truncated, normal_content);

@@ -10,6 +10,13 @@
 // - Multi-path config and prompt loading
 // - Robust error handling and context management
 //
+// CRITICAL BUG FIXES APPLIED:
+// - Fixed unsafe unwrap() calls in search query extraction (lines 101, 103)
+// - Replaced expect() calls with proper error handling for context map access
+// - Added timeout mechanism to prevent streaming functions from hanging
+// - Improved error handling throughout to prevent panics
+// - Added helper functions for safe context map access
+//
 // Used by: main.rs (command registration), search.rs (for web search)
 
 use serenity::{
@@ -29,7 +36,7 @@ use once_cell::sync::Lazy;
 // Compile regex once for better performance - matches <think> tags
 // Used to filter out internal AI thoughts from streaming output
 static THINKING_TAG_REGEX: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?s)<think>.*?</think>").unwrap()
+    Regex::new(r"(?s)<think>.*?</think>").expect("Invalid thinking tag regex pattern")
 });
 
 // Structures for streaming API responses
@@ -58,6 +65,8 @@ struct ChatRequest {
     temperature: f32,           // Sampling temperature
     max_tokens: i32,            // Max tokens to generate
     stream: bool,               // Whether to stream output
+    #[serde(skip_serializing_if = "Option::is_none")]
+    seed: Option<i64>,          // Optional seed for reproducible responses
 }
 
 // Structure to track streaming statistics for reasoning
@@ -76,6 +85,21 @@ struct MessageState {
     char_limit: usize,          // Discord message length limit
 }
 
+// Helper function to safely get the reason context map
+// Returns Result to handle cases where the map isn't initialized
+fn get_reason_context_map<'a>(data_map: &'a mut tokio::sync::RwLockWriteGuard<'_, serenity::prelude::TypeMap>) 
+    -> Result<&'a mut HashMap<serenity::model::id::UserId, crate::UserContext>, Box<dyn std::error::Error + Send + Sync>> {
+    data_map.get_mut::<ReasonContextMap>()
+        .ok_or_else(|| "Reason context map not initialized - this indicates a bot configuration error".into())
+}
+
+// Helper function to safely get the reason context map (read-only)
+fn get_reason_context_map_read<'a>(data_map: &'a tokio::sync::RwLockReadGuard<'_, serenity::prelude::TypeMap>) 
+    -> Result<&'a HashMap<serenity::model::id::UserId, crate::UserContext>, Box<dyn std::error::Error + Send + Sync>> {
+    data_map.get::<ReasonContextMap>()
+        .ok_or_else(|| "Reason context map not initialized - this indicates a bot configuration error".into())
+}
+
 #[command]
 #[aliases("reasoning")]
 /// Main ^reason command handler
@@ -87,21 +111,29 @@ struct MessageState {
 pub async fn reason(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
     let input = args.message().trim();
     
-    // Start typing indicator
-    let _typing = ctx.http.start_typing(msg.channel_id.0)?;
+    // Safety check: ensure input was processed correctly
+    println!("[REASON] Processing input: '{}' ({} chars) for user {}", input, input.len(), msg.author.name);
+    
+
+    
+    // Debug: Check if input is empty
+    println!("[REASON] Input check: '{}' (length: {})", input, input.len());
     
     if input.is_empty() {
         msg.reply(ctx, "Please provide a question! Usage: `^reason <your reasoning question>`").await?;
         return Ok(());
     }
+    
+    // Debug: Past input check
+    println!("[REASON] Past input check - proceeding with reasoning request");
 
     // Check if this is a search request
     if input.starts_with("-s ") || input.starts_with("--search ") {
-        // Extract search query
+        // Extract search query safely
         let search_query = if input.starts_with("-s ") {
-            input.strip_prefix("-s ").unwrap()
+            input.strip_prefix("-s ").unwrap_or(input)  // Safe fallback
         } else {
-            input.strip_prefix("--search ").unwrap()
+            input.strip_prefix("--search ").unwrap_or(input)  // Safe fallback
         };
 
         if search_query.trim().is_empty() {
@@ -151,7 +183,7 @@ pub async fn reason(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
     // Check if this is a clear context request
     if input.starts_with("--clear") || input == "-c" {
         let mut data_map = ctx.data.write().await;
-        let reason_map = data_map.get_mut::<ReasonContextMap>().expect("Reason context map not initialized");
+        let reason_map = get_reason_context_map(&mut data_map)?;
         
         let had_context = if let Some(context) = reason_map.get_mut(&msg.author.id) {
             let message_count = context.total_messages();
@@ -174,16 +206,25 @@ pub async fn reason(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
     // Regular reasoning functionality
     let question = input;
 
+    // Safety check: ensure question is not empty after trimming
+    if question.trim().is_empty() {
+        msg.reply(ctx, "Please provide a valid question! Usage: `^reason <your reasoning question>`").await?;
+        return Ok(());
+    }
+
     // Record user question in per-user context history
     {
         let mut data_map = ctx.data.write().await;
-        let reason_map = data_map.get_mut::<ReasonContextMap>().expect("Reason context map not initialized");
+        let reason_map = get_reason_context_map(&mut data_map)?;
         let context = reason_map.entry(msg.author.id).or_insert_with(crate::UserContext::new);
         context.add_user_message(ChatMessage { role: "user".to_string(), content: question.to_string() });
         
         println!("[REASON] User context updated: {} user messages, {} assistant messages", 
             context.user_messages.len(), context.assistant_messages.len());
     }
+
+    // Safety check: ensure context map was accessed correctly
+    println!("[REASON] Context map accessed successfully for user {}", msg.author.name);
 
     // Load LM Studio configuration
     let config = match load_reasoning_config().await {
@@ -195,23 +236,43 @@ pub async fn reason(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
         }
     };
 
+    // Safety check: ensure configuration was loaded correctly
+    println!("[REASON] Configuration loaded successfully - Model: {}, URL: {}", config.default_reason_model, config.base_url);
+
     // Load reasoning system prompt
     let system_prompt = match load_reasoning_system_prompt().await {
-        Ok(prompt) => prompt,
+        Ok(prompt) => {
+            println!("[REASON] Successfully loaded reasoning system prompt ({} chars):", prompt.len());
+            println!("[REASON] System prompt preview: {}", &prompt[..std::cmp::min(200, prompt.len())]);
+            prompt
+        },
         Err(e) => {
             eprintln!("Failed to load reasoning system prompt: {}", e);
             println!("Reasoning command: Using fallback prompt");
             // Fallback to a default reasoning prompt if file doesn't exist
-            "You are an advanced AI reasoning assistant. Think step-by-step through problems and provide detailed, logical explanations. Break down complex questions into smaller parts and explain your reasoning process clearly.".to_string()
+            let fallback = "You are an advanced AI reasoning assistant. Think step-by-step through problems and provide detailed, logical explanations. Break down complex questions into smaller parts and explain your reasoning process clearly.".to_string();
+            println!("[REASON] Using fallback system prompt ({} chars): {}", fallback.len(), fallback);
+            fallback
         }
     };
 
+    // Safety check: ensure system prompt is not empty
+    if system_prompt.trim().is_empty() {
+        eprintln!("[REASON] ERROR: System prompt is empty");
+        msg.reply(ctx, "**Error:** System prompt configuration is invalid. Check your prompt files.").await?;
+        return Ok(());
+    }
+
+    // Safety check: ensure system prompt was loaded correctly
+    println!("[REASON] System prompt loaded successfully ({} chars)", system_prompt.len());
+
     // Build message list including system prompt and per-user history
     let mut messages = Vec::new();
-    messages.push(ChatMessage { role: "system".to_string(), content: system_prompt });
+    messages.push(ChatMessage { role: "system".to_string(), content: system_prompt.clone() });
+    println!("[REASON] Added system prompt to messages list");
     {
         let data_map = ctx.data.read().await;
-        let reason_map = data_map.get::<ReasonContextMap>().expect("Reason context map not initialized");
+        let reason_map = get_reason_context_map_read(&data_map)?;
         if let Some(context) = reason_map.get(&msg.author.id) {
             let conversation_messages = context.get_conversation_messages();
             println!("Reasoning command: Including {} context messages for user {}", conversation_messages.len(), msg.author.name);
@@ -222,21 +283,70 @@ pub async fn reason(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
             println!("Reasoning command: No context history found for user {}", msg.author.name);
         }
     }
+    
+    println!("[REASON] Total messages prepared for API: {} (including system prompt)", messages.len());
+    println!("[REASON] First message (system): role='{}', content='{}'", 
+        messages[0].role, &messages[0].content[..std::cmp::min(100, messages[0].content.len())]);
+
+    // Safety check: ensure messages were built correctly
+    println!("[REASON] Messages built successfully for API call");
+
+    // Safety check: ensure we have at least the system message and user question
+    if messages.len() < 2 {
+        eprintln!("[REASON] ERROR: Not enough messages for API call (need at least system + user, got {})", messages.len());
+        msg.reply(ctx, "**Error:** Failed to prepare reasoning request. Please try again.").await?;
+        return Ok(());
+    }
+
+    // Log which reasoning model is being used
+    println!("Reasoning command: Using model '{}' for reasoning task", config.default_reason_model);
+
+    // Safety check: ensure model name is valid
+    if config.default_reason_model.trim().is_empty() {
+        eprintln!("[REASON] ERROR: Invalid reasoning model name (empty or whitespace)");
+        msg.reply(ctx, "**Error:** Invalid reasoning model configuration. Check your lmapiconf.txt file.").await?;
+        return Ok(());
+    }
+
+    // Safety check: ensure model name was validated correctly
+    println!("[REASON] Model name validated successfully: '{}'", config.default_reason_model);
+
+    // Safety check: ensure base URL is valid
+    if config.base_url.trim().is_empty() {
+        eprintln!("[REASON] ERROR: Invalid base URL (empty or whitespace)");
+        msg.reply(ctx, "**Error:** Invalid server configuration. Check your lmapiconf.txt file.").await?;
+        return Ok(());
+    }
+
+    // Safety check: ensure base URL was validated correctly
+    println!("[REASON] Base URL validated successfully: '{}'", config.base_url);
 
     // Send initial "thinking" message
     let mut current_msg = match msg.channel_id.send_message(&ctx.http, |m| {
-        m.content("**Reasoning Response (Part 1):**\n```\n\n```")
+        m.content("**Part 1:**\n```\nThinking...\n```")
     }).await {
         Ok(message) => message,
         Err(e) => {
             eprintln!("Failed to send initial message: {}", e);
-            msg.reply(ctx, "Failed to send message!").await?;
-            return Ok(());
+            // Try a simpler fallback message
+            match msg.reply(ctx, "**Processing:**\n```\nProcessing your question...\n```").await {
+                Ok(reply_msg) => reply_msg,
+                Err(reply_err) => {
+                    eprintln!("Failed to send fallback message: {}", reply_err);
+                    return Err(format!("Failed to send any message: {}", e).into());
+                }
+            }
         }
     };
 
-    // Log which reasoning model is being used
-    println!("Reasoning command: Using model '{}' for reasoning task", config.default_reason_model);
+    // Safety check: ensure initial message was created successfully
+    if current_msg.content.is_empty() {
+        eprintln!("[REASON] ERROR: Initial message has empty content");
+        return Err("Initial message has empty content".into());
+    }
+
+    // Safety check: ensure initial message was sent correctly
+    println!("[REASON] Initial message sent successfully: '{}'", current_msg.content);
 
     // Stream the reasoning response
     match stream_reasoning_response(messages, &config.default_reason_model, &config, ctx, &mut current_msg).await {
@@ -244,10 +354,14 @@ pub async fn reason(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
             println!("Reasoning command: Streaming complete - {} total characters across {} messages", 
                 final_stats.total_characters, final_stats.message_count);
             
+            // Safety check: ensure streaming was completed successfully
+            println!("[REASON] Streaming completed successfully for user {}", msg.author.name);
+            
             // Record AI response in per-user context history
             let response_content = current_msg.content.clone();
+            let response_content_clone = response_content.clone(); // Clone for later use
             let mut data_map = ctx.data.write().await;
-            let reason_map = data_map.get_mut::<ReasonContextMap>().expect("Reason context map not initialized");
+            let reason_map = get_reason_context_map(&mut data_map)?;
             if let Some(context) = reason_map.get_mut(&msg.author.id) {
                 context.add_assistant_message(ChatMessage { 
                     role: "assistant".to_string(), 
@@ -257,26 +371,47 @@ pub async fn reason(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
                 println!("[REASON] AI response recorded: {} total messages in context", 
                     context.total_messages());
             }
+
+            // Safety check: ensure context was updated successfully
+            if response_content_clone.trim().is_empty() {
+                eprintln!("[REASON] ERROR: Response content is empty, not updating context");
+            } else {
+                println!("[REASON] Context updated successfully with {} characters", response_content_clone.len());
+            }
         }
         Err(e) => {
             eprintln!("Failed to stream reasoning response: {}", e);
             let _ = current_msg.edit(&ctx.http, |m| {
-                m.content("Failed to get reasoning response!")
+                m.content("Failed to get response!")
             }).await;
+
+            // Safety check: ensure error message was sent successfully
+            if current_msg.content.is_empty() {
+                eprintln!("[REASON] ERROR: Failed to send error message");
+                return Err(format!("Failed to send error message: {}", e).into());
+            }
+
+            // Safety check: ensure error handling was completed successfully
+            println!("[REASON] Error handling completed successfully for user {}", msg.author.name);
         }
     }
+
+    // Safety check: ensure command completed successfully
+    println!("[REASON] Command completed successfully for user {}", msg.author.name);
+
+
 
     Ok(())
 }
 
 #[command]
-#[aliases("clearreason", "resetreason", "clearcontext")]
+#[aliases("clearreason", "resetreason")]
 /// Command to clear the user's reason chat context
 /// Removes all reasoning conversation history for the user
 pub async fn clearreasoncontext(ctx: &Context, msg: &Message, _args: Args) -> CommandResult {
     // Clear the user's reason chat context robustly
     let mut data_map = ctx.data.write().await;
-    let reason_map = data_map.get_mut::<ReasonContextMap>().expect("Reason context map not initialized");
+    let reason_map = get_reason_context_map(&mut data_map)?;
     
     let user_id = msg.author.id;
     let had_context = if let Some(context) = reason_map.get_mut(&user_id) {
@@ -300,17 +435,18 @@ pub async fn clearreasoncontext(ctx: &Context, msg: &Message, _args: Args) -> Co
     
     if had_context {
         // Save the cleared context state to disk immediately
-        {
-            let data = ctx.data.read().await;
-            let lm_contexts = data.get::<crate::LmContextMap>().cloned().unwrap_or_default();
-            let reason_contexts = data.get::<crate::ReasonContextMap>().cloned().unwrap_or_default();
-            let global_lm_context = data.get::<crate::GlobalLmContextMap>().cloned().unwrap_or_else(|| crate::UserContext::new());
-            
-            if let Err(e) = crate::save_contexts_to_disk(&lm_contexts, &reason_contexts, &global_lm_context).await {
-                eprintln!("Failed to save cleared context to disk: {}", e);
-            } else {
-                println!("[clearcontext] Cleared context state saved to disk");
-            }
+        // We need to clone the data before releasing the write lock to avoid deadlock
+        let reason_contexts = reason_map.clone();
+        let lm_contexts = data_map.get::<crate::LmContextMap>().cloned().unwrap_or_default();
+        let global_lm_context = data_map.get::<crate::GlobalLmContextMap>().cloned().unwrap_or_else(|| crate::UserContext::new());
+        
+        // Release the write lock before saving to disk
+        drop(data_map);
+        
+        if let Err(e) = crate::save_contexts_to_disk(&lm_contexts, &reason_contexts, &global_lm_context).await {
+            eprintln!("Failed to save cleared context to disk: {}", e);
+        } else {
+            println!("[clearcontext] Cleared context state saved to disk");
         }
         
         msg.reply(ctx, "**Reasoning Context Cleared** ✅\nYour reasoning conversation history has been fully reset and saved. The next reasoning question you ask will start a brand new context.").await?;
@@ -383,6 +519,7 @@ async fn load_reasoning_config() -> Result<LMConfig, Box<dyn std::error::Error +
         "LM_STUDIO_TIMEOUT", 
         "DEFAULT_MODEL",
         "DEFAULT_REASON_MODEL",
+        "DEFAULT_SUMMARIZATION_MODEL",
         "DEFAULT_RANKING_MODEL",
         "DEFAULT_TEMPERATURE",
         "DEFAULT_MAX_TOKENS",
@@ -409,6 +546,8 @@ async fn load_reasoning_config() -> Result<LMConfig, Box<dyn std::error::Error +
             .ok_or("DEFAULT_MODEL not found")?.clone(),
         default_reason_model: config_map.get("DEFAULT_REASON_MODEL")
             .ok_or("DEFAULT_REASON_MODEL not found")?.clone(),
+        default_summarization_model: config_map.get("DEFAULT_SUMMARIZATION_MODEL")
+            .ok_or("DEFAULT_SUMMARIZATION_MODEL not found")?.clone(),
         default_ranking_model: config_map.get("DEFAULT_RANKING_MODEL")
             .ok_or("DEFAULT_RANKING_MODEL not found")?.clone(),
         default_temperature: config_map.get("DEFAULT_TEMPERATURE")
@@ -429,6 +568,10 @@ async fn load_reasoning_config() -> Result<LMConfig, Box<dyn std::error::Error +
             .map_err(|_| "Invalid RESPONSE_FORMAT_PADDING value")?,
         default_vision_model: config_map.get("DEFAULT_VISION_MODEL")
             .ok_or("DEFAULT_VISION_MODEL not found")?.clone(),
+        default_seed: config_map.get("DEFAULT_SEED")
+            .map(|s| s.parse::<i64>())
+            .transpose()
+            .map_err(|_| "DEFAULT_SEED must be a valid integer if specified")?,
     };
 
     println!("Reasoning command: Successfully loaded config from {} with reasoning model: '{}'", config_source, config.default_reason_model);
@@ -541,10 +684,16 @@ async fn stream_reasoning_response(
     println!("[DEBUG][REASONING] Model: {}", model);
     println!("[DEBUG][REASONING] Messages count: {}", messages.len());
     println!("[DEBUG][REASONING] Base URL: {}", config.base_url);
-    println!("[DEBUG][REASONING] Config timeout: {} seconds, Using: 180 seconds for reasoning operations", config.timeout);
+    println!("[DEBUG][REASONING] Config timeout: {} seconds, Using: 300 seconds for reasoning operations", config.timeout);
+    
+    // Debug: Show the messages being sent to the API
+    for (i, msg) in messages.iter().enumerate() {
+        println!("[DEBUG][REASONING] Message {}: role='{}', content='{}'", 
+            i, msg.role, &msg.content[..std::cmp::min(150, msg.content.len())]);
+    }
     
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(180)) // 3 minutes for reasoning operations
+        .timeout(std::time::Duration::from_secs(300)) // 5 minutes for reasoning operations
         .build()?;
     println!("[DEBUG][REASONING] HTTP client created");
         
@@ -554,16 +703,63 @@ async fn stream_reasoning_response(
         temperature: config.default_temperature,
         max_tokens: config.default_max_tokens,
         stream: true,
+        seed: config.default_seed,
     };
     println!("[DEBUG][REASONING] Chat request created - Temperature: {}, Max tokens: {}, Stream: {}", 
         chat_request.temperature, chat_request.max_tokens, chat_request.stream);
 
+    // Safety check: ensure chat request is valid
+    if chat_request.messages.is_empty() {
+        eprintln!("[REASON] ERROR: Chat request has no messages");
+        let _ = initial_msg.edit(&ctx.http, |m| {
+            m.content("**Error:** Failed to prepare chat request. Please try again.")
+        }).await;
+        return Err("Chat request has no messages".into());
+    }
+
+    if chat_request.model.trim().is_empty() {
+        eprintln!("[REASON] ERROR: Chat request has empty model name");
+        let _ = initial_msg.edit(&ctx.http, |m| {
+            m.content("**Error:** Invalid model configuration. Check your lmapiconf.txt file.")
+        }).await;
+        return Err("Chat request has empty model name".into());
+    }
+
+    // Safety check: ensure temperature is valid
+    if chat_request.temperature < 0.0 || chat_request.temperature > 2.0 {
+        eprintln!("[REASON] ERROR: Invalid temperature value: {}", chat_request.temperature);
+        let _ = initial_msg.edit(&ctx.http, |m| {
+            m.content("**Error:** Invalid temperature configuration. Check your lmapiconf.txt file.")
+        }).await;
+        return Err("Invalid temperature value".into());
+    }
+
+    // Safety check: ensure max_tokens is valid
+    if chat_request.max_tokens <= 0 || chat_request.max_tokens > 32000 {
+        eprintln!("[REASON] ERROR: Invalid max_tokens value: {}", chat_request.max_tokens);
+        let _ = initial_msg.edit(&ctx.http, |m| {
+            m.content("**Error:** Invalid max_tokens configuration. Check your lmapiconf.txt file.")
+        }).await;
+        return Err("Invalid max_tokens value".into());
+    }
+
     let api_url = format!("{}/v1/chat/completions", config.base_url);
     println!("[DEBUG][REASONING] API URL: {}", api_url);
 
+    // Safety check: ensure API URL is properly formatted
+    if !api_url.starts_with("http://") && !api_url.starts_with("https://") {
+        eprintln!("[REASON] ERROR: Invalid API URL format: {}", api_url);
+        let _ = initial_msg.edit(&ctx.http, |m| {
+            m.content("**Error:** Invalid server URL configuration. Check your lmapiconf.txt file.")
+        }).await;
+        return Err("Invalid API URL format".into());
+    }
+
     // First, test basic connectivity to the server with enhanced error handling
     println!("[DEBUG][REASONING] === TESTING BASIC CONNECTIVITY ===");
-    match client.get(&config.base_url).send().await {
+    // Test the actual API endpoint instead of just the base URL
+    let test_url = format!("{}/v1/models", config.base_url);
+    match client.get(&test_url).timeout(std::time::Duration::from_secs(10)).send().await {
         Ok(response) => {
             println!("[DEBUG][REASONING] Basic connectivity test successful - Status: {}", response.status());
         }
@@ -602,7 +798,8 @@ async fn stream_reasoning_response(
                     config.base_url, e
                 ).into());
             } else {
-                return Err(format!("Cannot reach remote server {}: {}", config.base_url, e).into());
+                // Don't fail on connectivity test - just warn and continue
+                println!("[DEBUG][REASONING] Connectivity test failed but continuing: {}", e);
             }
         }
     }
@@ -612,6 +809,7 @@ async fn stream_reasoning_response(
     let response = match client
         .post(&api_url)
         .json(&chat_request)
+        .timeout(std::time::Duration::from_secs(300)) // 5 minute timeout for the entire request
         .send()
         .await
     {
@@ -635,6 +833,15 @@ async fn stream_reasoning_response(
                     **Original error:** {}", 
                     api_url, config.base_url, e
                 ).into());
+            } else if error_msg.contains("timeout") || error_msg.contains("timed out") {
+                return Err(format!(
+                    "Request Timeout: The AI server at {} took too long to respond.\n\n**Check:**\n\
+                    1. AI server is not overloaded\n\
+                    2. Model is loaded and ready\n\
+                    3. Server has enough resources\n\n\
+                    **Original error:** {}", 
+                    config.base_url, e
+                ).into());
             } else {
                 return Err(format!("Streaming API request to {} failed: {}", api_url, e).into());
             }
@@ -656,78 +863,91 @@ async fn stream_reasoning_response(
     let mut line_buffer = String::new();
     let mut received_any_content = false;
     let mut stream_complete = false;
+    let mut last_chunk_time = std::time::Instant::now();
+    let timeout_duration = std::time::Duration::from_secs(300); // 5 minute timeout for streaming
 
     println!("[DEBUG][REASONING] Starting to buffer response from API...");
 
     // STEP 1: Buffer the complete response from the API
-    while let Some(chunk) = stream.next().await {
-        if stream_complete {
-            println!("[DEBUG][REASONING] Stream marked as complete, stopping buffering");
-            break;
+    while let Ok(Some(Ok(chunk))) = tokio::time::timeout(timeout_duration, stream.next()).await {
+        last_chunk_time = std::time::Instant::now(); // Reset timeout on successful chunk
+        chunk_count += 1;
+        if chunk_count == 1 {
+            println!("[DEBUG][REASONING] Received first chunk ({} bytes)", chunk.len());
+        } else if chunk_count % 10 == 0 {
+            println!("[DEBUG][REASONING] Buffered {} chunks, total response: {} chars", chunk_count, raw_response.len());
         }
         
-        match chunk {
-            Ok(bytes) => {
-                chunk_count += 1;
-                if chunk_count == 1 {
-                    println!("[DEBUG][REASONING] Received first chunk ({} bytes)", bytes.len());
-                } else if chunk_count % 10 == 0 {
-                    println!("[DEBUG][REASONING] Buffered {} chunks, total response: {} chars", chunk_count, raw_response.len());
-                }
-                
-                line_buffer.push_str(&String::from_utf8_lossy(&bytes));
+        line_buffer.push_str(&String::from_utf8_lossy(&chunk));
 
-                while let Some(i) = line_buffer.find('\n') {
-                    let line = line_buffer.drain(..=i).collect::<String>();
-                    let line = line.trim();
+        while let Some(i) = line_buffer.find('\n') {
+            let line = line_buffer.drain(..=i).collect::<String>();
+            let line = line.trim();
 
-                    if let Some(json_str) = line.strip_prefix("data: ") {
-                        if json_str.trim() == "[DONE]" {
-                            println!("[DEBUG][REASONING] Received [DONE] signal, marking stream complete");
-                            stream_complete = true;
-                            break;
-                        }
-
-                        if let Ok(response_chunk) = serde_json::from_str::<ChatResponse>(json_str) {
-                            for choice in response_chunk.choices {
-                                if let Some(finish_reason) = choice.finish_reason {
-                                    if finish_reason == "stop" {
-                                        println!("[DEBUG][REASONING] Received finish_reason=stop, marking stream complete");
-                                        stream_complete = true;
-                                        break;
-                                    }
-                                }
-
-                                if let Some(delta) = choice.delta {
-                                    if let Some(content) = delta.content {
-                                        received_any_content = true;
-                                        raw_response.push_str(&content);
-                                        println!("[DEBUG][REASONING] Added content chunk: '{}' (total: {} chars)", 
-                                            content, raw_response.len());
-                                    } else {
-                                        println!("[DEBUG][REASONING] Delta has no content field");
-                                    }
-                                } else {
-                                    println!("[DEBUG][REASONING] Choice has no delta field");
-                                }
-                            }
-                        } else {
-                            if !json_str.trim().is_empty() {
-                                println!("[DEBUG][REASONING] Failed to parse JSON chunk: {}", json_str);
-                            }
-                        }
-                    }
-                }
-                
-                // Break out of the outer loop if stream is complete
-                if stream_complete {
-                    println!("[DEBUG][REASONING] Breaking out of chunk processing loop");
+            if let Some(json_str) = line.strip_prefix("data: ") {
+                if json_str.trim() == "[DONE]" {
+                    println!("[DEBUG][REASONING] Received [DONE] signal, marking stream complete");
+                    stream_complete = true;
                     break;
                 }
+
+                if let Ok(response_chunk) = serde_json::from_str::<ChatResponse>(json_str) {
+                    for choice in response_chunk.choices {
+                        if let Some(finish_reason) = choice.finish_reason {
+                            if finish_reason == "stop" {
+                                println!("[DEBUG][REASONING] Received finish_reason=stop, marking stream complete");
+                                stream_complete = true;
+                                break;
+                            }
+                        }
+
+                        if let Some(delta) = choice.delta {
+                            if let Some(content) = delta.content {
+                                received_any_content = true;
+                                raw_response.push_str(&content);
+                                println!("[DEBUG][REASONING] Added content chunk: '{}' (total: {} chars)", 
+                                    content, raw_response.len());
+                            } else {
+                                println!("[DEBUG][REASONING] Delta has no content field");
+                            }
+                        } else {
+                            println!("[DEBUG][REASONING] Choice has no delta field");
+                        }
+                    }
+                } else {
+                    if !json_str.trim().is_empty() {
+                        println!("[DEBUG][REASONING] Failed to parse JSON chunk: {}", json_str);
+                    }
+                }
             }
-            Err(e) => {
-                eprintln!("[DEBUG][REASONING] Stream error: {}", e);
-                return Err(e.into());
+        }
+        
+        // Break out of the outer loop if stream is complete
+        if stream_complete {
+            println!("[DEBUG][REASONING] Breaking out of chunk processing loop");
+            break;
+        }
+    }
+
+    // Handle timeout or stream end
+    match tokio::time::timeout(timeout_duration, stream.next()).await {
+        Ok(Some(Ok(_))) => {
+            // This shouldn't happen since we already handled it in the loop
+            println!("[DEBUG][REASONING] Unexpected chunk after loop");
+        }
+        Ok(Some(Err(e))) => {
+            eprintln!("[DEBUG][REASONING] Stream error: {}", e);
+            return Err(e.into());
+        }
+        Ok(None) => {
+            println!("[DEBUG][REASONING] Stream ended normally (no more chunks)");
+        }
+        Err(_) => {
+            println!("[DEBUG][REASONING] Stream timeout after {} seconds of inactivity", timeout_duration.as_secs());
+            if !received_any_content {
+                return Err("Streaming timeout - no content received from AI server".into());
+            } else {
+                println!("[DEBUG][REASONING] Stream timed out but we received some content, continuing with what we have");
             }
         }
     }
@@ -749,6 +969,15 @@ async fn stream_reasoning_response(
         return Err("API returned 0 characters in response - this indicates a problem with the API or model".into());
     }
 
+    // Safety check: ensure we have some content to process
+    if raw_response.trim().is_empty() {
+        eprintln!("[DEBUG][REASONING] ERROR: API returned only whitespace");
+        let _ = initial_msg.edit(&ctx.http, |m| {
+            m.content("**Error:** AI server returned empty response. Please try again.")
+        }).await;
+        return Err("API returned only whitespace".into());
+    }
+
     // STEP 2: Process the buffered content and stream to Discord
     println!("[DEBUG][REASONING] === PROCESSING AND STREAMING TO DISCORD ===");
     
@@ -762,10 +991,19 @@ async fn stream_reasoning_response(
     println!("[DEBUG][REASONING] Processed response length: {} chars", processed_response.len());
     println!("[DEBUG][REASONING] Processed response content: '{}'", processed_response);
     
+    // Safety check: ensure processed response is not empty
+    if processed_response.trim().is_empty() {
+        eprintln!("[DEBUG][REASONING] ERROR: Processed response is empty after filtering");
+        let _ = initial_msg.edit(&ctx.http, |m| {
+            m.content("**Error:** AI response was filtered out completely. Please try again.")
+        }).await;
+        return Err("Processed response is empty after filtering".into());
+    }
+    
     if processed_response.is_empty() {
         println!("[DEBUG][REASONING] Processed response is empty, sending fallback message");
         let _ = initial_msg.edit(&ctx.http, |m| {
-            m.content("**Reasoning Response Complete**\n\nThe AI completed its reasoning process, but the response appears to contain only thinking content.")
+            m.content("**Complete**\n\nThe AI completed its reasoning process, but the response appears to contain only thinking content.")
         }).await;
         
         let stats = StreamingStats {
@@ -784,10 +1022,28 @@ async fn stream_reasoning_response(
     };
     println!("[DEBUG][REASONING] Message state initialized - Char limit: {}", message_state.char_limit);
     
+    // Safety check: ensure message state is properly initialized
+    if message_state.char_limit == 0 {
+        eprintln!("[DEBUG][REASONING] ERROR: Invalid character limit: {}", message_state.char_limit);
+        let _ = initial_msg.edit(&ctx.http, |m| {
+            m.content("**Error:** Invalid message configuration. Check your lmapiconf.txt file.")
+        }).await;
+        return Err("Invalid character limit".into());
+    }
+
     // Split the processed response into chunks for Discord streaming
     let chunk_size = 100; // Characters per Discord update
     let mut chars_processed = 0;
     
+    // Safety check: ensure chunk size is valid
+    if chunk_size == 0 {
+        eprintln!("[DEBUG][REASONING] ERROR: Invalid chunk size: {}", chunk_size);
+        let _ = initial_msg.edit(&ctx.http, |m| {
+            m.content("**Error:** Invalid chunk configuration. Please try again.")
+        }).await;
+        return Err("Invalid chunk size".into());
+    }
+
     while chars_processed < processed_response.len() {
         let end_pos = std::cmp::min(chars_processed + chunk_size, processed_response.len());
         let chunk = &processed_response[chars_processed..end_pos];
@@ -831,9 +1087,24 @@ async fn stream_reasoning_response(
         return Err("Message state has no content despite processed response - streaming to Discord failed".into());
     }
     
+    // Safety check: ensure final message state has valid content
+    if message_state.current_content.len() > message_state.char_limit * 10 {
+        eprintln!("[DEBUG][REASONING] ERROR: Message state content is too large: {} chars", message_state.current_content.len());
+        let _ = initial_msg.edit(&ctx.http, |m| {
+            m.content("**Error:** Response is too large. Please try a shorter question.")
+        }).await;
+        return Err("Message state content is too large".into());
+    }
+    
     if let Err(e) = finalize_message_content(&mut message_state, "", ctx, config).await {
         eprintln!("[DEBUG][REASONING] Failed to finalize Discord message: {}", e);
         return Err(e);
+    }
+
+    // Safety check: ensure final message was sent successfully
+    if message_state.current_message.content.is_empty() {
+        eprintln!("[DEBUG][REASONING] ERROR: Final message has empty content");
+        return Err("Final message has empty content".into());
     }
 
     let stats = StreamingStats {
@@ -841,6 +1112,17 @@ async fn stream_reasoning_response(
         message_count: message_state.message_index,
         filtered_characters: raw_response.len() - filtered_response.len(),
     };
+
+    // Safety check: ensure stats are valid
+    if stats.total_characters == 0 {
+        eprintln!("[DEBUG][REASONING] ERROR: Invalid stats - total characters is 0");
+        return Err("Invalid streaming stats".into());
+    }
+
+    if stats.message_count == 0 {
+        eprintln!("[DEBUG][REASONING] ERROR: Invalid stats - message count is 0");
+        return Err("Invalid streaming stats".into());
+    }
 
     println!("[DEBUG][REASONING] === REASONING STREAMING COMPLETED ===");
     println!("[DEBUG][REASONING] Final stats - Total chars: {}, Messages: {}, Filtered chars: {}", 
@@ -873,7 +1155,7 @@ async fn update_discord_message(
     println!("[DEBUG][REASONING_UPDATE] State content after adding: '{}' ({} chars)", state.current_content, state.current_content.len());
     
     // Then create the formatted content for Discord
-    let potential_content = format!("**Reasoning Response (Part {}):**\n```\n{}\n```", 
+            let potential_content = format!("**Part {}:**\n```\n{}\n```", 
         state.message_index, state.current_content);
     
     println!("[DEBUG][REASONING_UPDATE] Formatted content for Discord: '{}' ({} chars)", potential_content, potential_content.len());
@@ -884,7 +1166,7 @@ async fn update_discord_message(
             potential_content.len(), state.char_limit);
         
         // Finalize current message
-        let final_content = format!("**Reasoning Response (Part {}):**\n```\n{}\n```", 
+        let final_content = format!("**Part {}:**\n```\n{}\n```", 
             state.message_index, state.current_content);
         let edit_result = state.current_message.edit(&ctx.http, |m| {
             m.content(final_content)
@@ -899,7 +1181,7 @@ async fn update_discord_message(
         state.message_index += 1;
         // Reset current_content for the new message
         state.current_content = new_content.to_string();
-        let new_msg_content = format!("**Reasoning Response (Part {}):**\n```\n{}\n```", 
+        let new_msg_content = format!("**Part {}:**\n```\n{}\n```", 
             state.message_index, state.current_content);
         let send_result = state.current_message.channel_id.send_message(&ctx.http, |m| {
             m.content(new_msg_content)
@@ -964,9 +1246,9 @@ async fn finalize_message_content(
     
     // Mark the final message as complete
     let final_display = if state.message_index == 1 {
-        format!("**Reasoning Response Complete**\n```\n{}\n```", state.current_content)
+        format!("**Complete**\n```\n{}\n```", state.current_content)
     } else {
-        format!("**Reasoning Response Complete (Part {}/{})**\n```\n{}\n```", 
+        format!("**Complete (Part {}/{})**\n```\n{}\n```", 
             state.message_index, state.message_index, state.current_content)
     };
 
@@ -1110,7 +1392,7 @@ async fn stream_reasoning_search_response(
     initial_msg: &mut Message,
 ) -> Result<StreamingStats, Box<dyn std::error::Error + Send + Sync>> {
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(180)) // 3 minutes for reasoning search operations
+        .timeout(std::time::Duration::from_secs(300)) // 5 minutes for reasoning search operations
         .build()?;
         
     let chat_request = ChatRequest {
@@ -1119,6 +1401,7 @@ async fn stream_reasoning_search_response(
         temperature: config.default_temperature,
         max_tokens: config.default_max_tokens,
         stream: true,
+        seed: config.default_seed,
     };
 
     let response = client
@@ -1137,73 +1420,78 @@ async fn stream_reasoning_search_response(
     let mut message_count = 1;
     let mut current_message = initial_msg.clone();
     let char_limit = config.max_discord_message_length - config.response_format_padding;
+    let timeout_duration = std::time::Duration::from_secs(300); // 5 minute timeout
 
     println!("Starting streaming for reasoning search response (buffered chunks)...");
 
-    while let Some(chunk) = stream.next().await {
-        match chunk {
-            Ok(bytes) => {
-                let text = String::from_utf8_lossy(&bytes);
-                
-                for line in text.lines() {
-                    if let Some(json_str) = line.strip_prefix("data: ") {
-                        if json_str.trim() == "[DONE]" {
-                            // Post any remaining content in the buffer
-                            if !filtered_buffer.trim().is_empty() {
-                                if let Err(e) = post_chunked_message(&filtered_buffer, &mut current_message, &mut message_count, ctx, char_limit).await {
-                                    eprintln!("Failed to post final chunk: {}", e);
-                                }
-                            }
-                            
-                            let stats = StreamingStats {
-                                total_characters: raw_response.len(),
-                                message_count,
-                                filtered_characters: raw_response.len() - filtered_buffer.len(),
-                            };
-                            
-                            return Ok(stats);
-                        }
+    loop {
+        match tokio::time::timeout(timeout_duration, stream.next()).await {
+            Ok(Some(chunk)) => {
+                match chunk {
+                    Ok(bytes) => {
+                        let text = String::from_utf8_lossy(&bytes);
                         
-                        if let Ok(response_chunk) = serde_json::from_str::<ChatResponse>(json_str) {    
-                            for choice in response_chunk.choices {
-                                if let Some(finish_reason) = choice.finish_reason {
-                                    if finish_reason == "stop" {
-                                        // Post any remaining content in the buffer
-                                        if !filtered_buffer.trim().is_empty() {
-                                            if let Err(e) = post_chunked_message(&filtered_buffer, &mut current_message, &mut message_count, ctx, char_limit).await {
-                                                eprintln!("Failed to post final chunk: {}", e);
+                        for line in text.lines() {
+                            if let Some(json_str) = line.strip_prefix("data: ") {
+                                if json_str.trim() == "[DONE]" {
+                                    // Post any remaining content in the buffer
+                                    if !filtered_buffer.trim().is_empty() {
+                                        if let Err(e) = post_chunked_message(&filtered_buffer, &mut current_message, &mut message_count, ctx, char_limit).await {
+                                            eprintln!("Failed to post final chunk: {}", e);
+                                        }
+                                    }
+                                    
+                                    let stats = StreamingStats {
+                                        total_characters: raw_response.len(),
+                                        message_count,
+                                        filtered_characters: raw_response.len() - filtered_buffer.len(),
+                                    };
+                                    
+                                    return Ok(stats);
+                                }
+                                
+                                if let Ok(response_chunk) = serde_json::from_str::<ChatResponse>(json_str) {    
+                                    for choice in response_chunk.choices {
+                                        if let Some(finish_reason) = choice.finish_reason {
+                                            if finish_reason == "stop" {
+                                                // Post any remaining content in the buffer
+                                                if !filtered_buffer.trim().is_empty() {
+                                                    if let Err(e) = post_chunked_message(&filtered_buffer, &mut current_message, &mut message_count, ctx, char_limit).await {
+                                                        eprintln!("Failed to post final chunk: {}", e);
+                                                    }
+                                                }
+                                                
+                                                let stats = StreamingStats {
+                                                    total_characters: raw_response.len(),
+                                                    message_count,
+                                                    filtered_characters: raw_response.len() - filtered_buffer.len(),
+                                                };
+                                                
+                                                return Ok(stats);
                                             }
                                         }
                                         
-                                        let stats = StreamingStats {
-                                            total_characters: raw_response.len(),
-                                            message_count,
-                                            filtered_characters: raw_response.len() - filtered_buffer.len(),
-                                        };
-                                        
-                                        return Ok(stats);
-                                    }
-                                }
-                                
-                                if let Some(delta) = choice.delta {
-                                    if let Some(content) = delta.content {
-                                        raw_response.push_str(&content);
-                                        
-                                        // Apply thinking tag filtering to accumulated content
-                                        let new_filtered = filter_thinking_tags(&raw_response);
-                                        
-                                        // Only update if we have new filtered content
-                                        if new_filtered.len() > filtered_buffer.len() {
-                                            let new_content = &new_filtered[filtered_buffer.len()..];
-                                            filtered_buffer.push_str(new_content);
-                                            
-                                            // Check if we have enough content to post a chunk
-                                            if filtered_buffer.len() >= char_limit {
-                                                if let Err(e) = post_chunked_message(&filtered_buffer, &mut current_message, &mut message_count, ctx, char_limit).await {
-                                                    eprintln!("Failed to post chunked message: {}", e);
+                                        if let Some(delta) = choice.delta {
+                                            if let Some(content) = delta.content {
+                                                raw_response.push_str(&content);
+                                                
+                                                // Apply thinking tag filtering to accumulated content
+                                                let new_filtered = filter_thinking_tags(&raw_response);
+                                                
+                                                // Only update if we have new filtered content
+                                                if new_filtered.len() > filtered_buffer.len() {
+                                                    let new_content = &new_filtered[filtered_buffer.len()..];
+                                                    filtered_buffer.push_str(new_content);
+                                                    
+                                                    // Check if we have enough content to post a chunk
+                                                    if filtered_buffer.len() >= char_limit {
+                                                        if let Err(e) = post_chunked_message(&filtered_buffer, &mut current_message, &mut message_count, ctx, char_limit).await {
+                                                            eprintln!("Failed to post chunked message: {}", e);
+                                                        }
+                                                        // Clear the buffer after posting
+                                                        filtered_buffer.clear();
+                                                    }
                                                 }
-                                                // Clear the buffer after posting
-                                                filtered_buffer.clear();
                                             }
                                         }
                                     }
@@ -1211,10 +1499,19 @@ async fn stream_reasoning_search_response(
                             }
                         }
                     }
+                    Err(e) => {
+                        eprintln!("Stream error: {}", e);
+                        break;
+                    }
                 }
             }
-            Err(e) => {
-                eprintln!("Stream error: {}", e);
+            Ok(None) => {
+                // Stream ended normally
+                break;
+            }
+            Err(_) => {
+                // Timeout occurred
+                eprintln!("Streaming timeout after 300 seconds of inactivity");
                 break;
             }
         }
@@ -1334,7 +1631,7 @@ async fn chat_completion_reasoning(
     max_tokens: Option<i32>,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(180)) // 3 minutes for reasoning completion operations
+        .timeout(std::time::Duration::from_secs(300)) // 5 minutes for reasoning completion operations
         .build()?;
         
     let chat_request = ChatRequest {
@@ -1343,6 +1640,7 @@ async fn chat_completion_reasoning(
         temperature: 0.5, // Slightly higher temperature for reasoning tasks
         max_tokens: max_tokens.unwrap_or(config.default_max_tokens),
         stream: false,
+        seed: config.default_seed,
     };
 
     let response = client

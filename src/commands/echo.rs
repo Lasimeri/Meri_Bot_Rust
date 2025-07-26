@@ -19,7 +19,7 @@ use serenity::{
 /// Supports:
 ///   - ^echo <text>
 pub async fn echo(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
-    let _typing = ctx.http.start_typing(msg.channel_id.0)?;
+
     let text = args.message();
     // If no text is provided, reply with usage guidance
     if text.is_empty() {

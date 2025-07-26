@@ -21,6 +21,7 @@ pub async fn help(ctx: &Context, msg: &Message) -> CommandResult {
 **🧠 AI & Language Model Commands:**
 • `^lm <prompt>` - AI chat with personal context
 • `<@Bot> <prompt>` - AI chat with global shared context
+• `^lm --seed <number> <prompt>` - Reproducible AI responses
 • `^lm -v <prompt>` - Vision analysis (attach image)
 • `^lm -s <query>` - AI-enhanced web search
 • `^lm --test` - Test API connectivity
@@ -38,6 +39,7 @@ pub async fn help(ctx: &Context, msg: &Message) -> CommandResult {
 **💡 Usage Examples:**
 • `^lm What is the weather like?` - Personal AI chat
 • `<@Bot> Tell me a joke` - Shared AI chat
+• `^lm --seed 42 What is the meaning of life?` - Reproducible AI response
 • `^lm -v Describe this image` - Vision analysis
 • `^reason Analyze this problem: 2+2=?` - Reasoning
 • `^sum Summarize this text: [your text]` - Summarization
@@ -69,6 +71,11 @@ pub async fn lmhelp(ctx: &Context, msg: &Message) -> CommandResult {
 **📝 Basic AI Chat:**
 • `^lm <prompt>` - Start a personal AI conversation
 • `<@Bot> <prompt>` - Start a shared AI conversation (global context)
+
+**🎲 Reproducible Responses:**
+• `^lm --seed <number> <prompt>` - Get deterministic AI responses
+• Perfect for testing, debugging, and reproducible experiments
+• Same input + same seed = same output every time
 
 **🖼️ Vision Analysis:**
 • `^lm -v <prompt>` - Analyze attached images
@@ -105,6 +112,7 @@ pub async fn lmhelp(ctx: &Context, msg: &Message) -> CommandResult {
 ```
 ^lm Hello! How are you today?
 <@Bot> What were we just talking about?
+^lm --seed 42 What is the meaning of life?
 ^lm -v Describe this image in detail
 ^lm -s latest AI developments
 ^lm --clear

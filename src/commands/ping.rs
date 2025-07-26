@@ -28,7 +28,7 @@ use serenity::{
 ///   - ^ping
 pub async fn ping(ctx: &Context, msg: &Message, _args: Args) -> CommandResult {
     let start_time = std::time::Instant::now();
-    let _typing = ctx.http.start_typing(msg.channel_id.0)?;
+
     
     // Send the initial response and measure the time
     let response_result = msg.reply(ctx, "Pong! Calculating delay...").await;

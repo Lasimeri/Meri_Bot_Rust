@@ -36,12 +36,40 @@ A powerful Discord bot written in Rust using the Serenity framework, featuring r
 - **📝 User Experience Tracking**: Logs user interactions, command usage patterns, and response quality
 - **🔄 Real-Time Monitoring**: Live logging during streaming operations with progress updates
 - **📁 Log File**: All logs are saved to `log.txt` for persistent debugging and analysis
+- **⚙️ Configurable Log Levels**: Trace logging can be enabled by changing `RUST_LOG` from "info" to "trace" in `src/main.rs`
 
-## Features
+## 🔧 Admin Commands (Owner Only)
+
+The bot includes administrative commands that can only be used by the bot owner:
+
+### `^restart` / `^reboot` / `^restartbot`
+- **Owner Only**: Restarts the bot gracefully
+- **Function**: Saves all conversation contexts, shuts down cleanly, and restarts the bot process
+- **Usage**: `^restart`
+
+### `^shutdown` / `^stopbot`
+- **Owner Only**: Shuts down the bot gracefully
+- **Function**: Saves all conversation contexts and exits the bot process
+- **Usage**: `^shutdown`
+
+### `^adminhelp` / `^ahelp`
+- **Owner Only**: Shows help for admin commands
+- **Function**: Lists all available administrative commands
+- **Usage**: `^adminhelp`
+
+### Configuration
+To use admin commands, add your Discord user ID to `botconfig.txt`:
+```
+BOT_OWNER_ID=YOUR_DISCORD_USER_ID_HERE
+```
+
+**Note**: If `BOT_OWNER_ID` is not set, the bot will fall back to using `BOT_USER_ID` as the owner.
+
+## 🤖 AI Commands
 
 ### 🆕 Primary AI Chat (User ID Mention Only)
 - `<@Meri_> <prompt>` - AI chat with real-time streaming and **per-user conversation memory**
-  - **Features**: **Real-time streaming responses**, smart message chunking, extended output length (8K tokens), live progress indicators, multi-part message support, robust buffered streaming for improved reliability, **60-second timeout**
+  - **Features**: **Real-time streaming responses**, smart message chunking, extended output length (8K tokens), live progress indicators, multi-part message support, robust buffered streaming for improved reliability, **5-minute timeout for complex reasoning**
 - `<@Meri_> <prompt>` + **attachments** - RAG-enhanced analysis of documents (PDF, TXT, images, etc.)
   - **Supported file types**: PDF, TXT, MD, CSV, HTML, JSON, XML, JPG, PNG, GIF, WebP
   - **RAG Features**: Document content extraction, context-aware analysis, multimodal support
@@ -96,28 +124,31 @@ A powerful Discord bot written in Rust using the Serenity framework, featuring r
 ### 🤖 Legacy AI Chat Commands
 - `^lm <prompt>` - Chat with AI via LM Studio/Ollama
   - **Aliases**: `^llm`, `^ai`, `^chat` 
-  - **Features**: **Real-time streaming responses**, smart message chunking, extended output length (8K tokens), live progress indicators, multi-part message support, robust buffered streaming for improved reliability, **60-second timeout**
+  - **Features**: **Real-time streaming responses**, smart message chunking, extended output length (8K tokens), live progress indicators, multi-part message support, robust buffered streaming for improved reliability, **5-minute timeout for complex reasoning**
+- `^lm --seed <number> <prompt>` - Reproducible AI responses with specific seed
+  - **Features**: **Deterministic responses** for testing and debugging, same output for same input, no conversation history (ensures reproducibility), **5-minute timeout for complex reasoning**
 - `^lm -v <prompt>` + **image** - Vision analysis (analyze attached images)
   - **Features**: Advanced image analysis, GIF support, attachment detection in replies
 - `^lm -s <search query>` - AI-enhanced web search with intelligent query optimization and result summarization
   - **Aliases**: `^lm --search <query>`
-  - **Features**: **AI query refinement**, **intelligent summarization with embedded links**, real-time progress updates, fallback to basic search, **60-second timeout**
+  - **Features**: **AI query refinement**, **intelligent summarization with embedded links**, real-time progress updates, fallback to basic search, **5-minute timeout for complex reasoning**
 - `^reason <question>` - Deep reasoning with specialized AI model
   - **Aliases**: `^reasoning`
-  - **Features**: **Real-time streaming with thinking tag filtering**, step-by-step reasoning, dedicated reasoning model (Qwen3 4B), automatic `<think>` content removal, logical explanations, robust buffered streaming for improved reliability, **60-second timeout**
+  - **Features**: **Real-time streaming with thinking tag filtering**, step-by-step reasoning, dedicated reasoning model (Qwen3 4B), automatic `<think>` content removal, logical explanations, robust buffered streaming for improved reliability, **5-minute timeout for complex reasoning**
 - `^reason -s <search query>` - Reasoning-enhanced web search with analytical insights
   - **Aliases**: `^reasoning -s`, `^reasoning --search`
-  - **Features**: **Analytical research synthesis**, reasoning-focused query optimization, embedded source links, specialized reasoning model analysis (Qwen3 4B), **buffered chunking** (posts content in 2000-character chunks), **60-second timeout**
+  - **Features**: **Analytical research synthesis**, reasoning-focused query optimization, embedded source links, specialized reasoning model analysis (Qwen3 4B), **buffered chunking** (posts content in 2000-character chunks), **5-minute timeout for complex reasoning**
 
 ### 📺 Content Summarization Commands (Legacy)
 - `^sum <url>` - Summarize webpage content or YouTube videos using AI reasoning model
   - **Aliases**: `^summarize`, `^webpage`
   - **Features**: 
     - **YouTube transcript extraction** with yt-dlp (automatic subtitle download)
+    - **🆕 Intelligent caching** - Subtitles are cached by URL hash to avoid re-downloading
     - **HTML content extraction** and intelligent cleaning
     - **RAG (map-reduce) summarization** for long content (chunks content >8K chars)
     - **Automatic reasoning tag filtering** (removes `<think>` sections from responses)
-    - **60-second timeout** for reliable processing
+    - **5-minute timeout** for reliable processing of complex content
     - **Streaming responses** with progress updates
     - **Smart message chunking** for long summaries
     - **Enhanced logging** with detailed step-by-step tracking and error diagnosis
@@ -154,7 +185,7 @@ A powerful Discord bot written in Rust using the Serenity framework, featuring r
 - **Progress tracking** - Live character counts and generation status
 
 ### ⚡ Streaming Technology
-- **Robust Connection Handling** - Uses a **60-second timeout** to prevent hanging requests while ensuring complete responses from AI models
+- **Robust Connection Handling** - Uses a **5-minute timeout** to prevent hanging requests while ensuring complete responses from AI models for complex reasoning tasks
 - **Buffered Stream Processing** - Assembles incoming data into a line buffer before parsing. This prevents errors caused by data packets being split across network chunks, making the stream processing significantly more reliable.
 - **Live Discord Message Editing** - Messages update in real-time every 0.8 seconds with the latest content from the stream.
 - **Thinking Tag Filtering** - Automatically removes `<think>...</think>` content from reasoning responses in real-time.
@@ -220,6 +251,7 @@ A powerful Discord bot written in Rust using the Serenity framework, featuring r
    DEFAULT_REASON_MODEL=qwen2.5:4b  # Qwen3 4B reasoning model
    DEFAULT_TEMPERATURE=0.8
    DEFAULT_MAX_TOKENS=8192                    # Extended for longer responses
+   DEFAULT_SEED=                              # Optional: seed for reproducible responses
    MAX_DISCORD_MESSAGE_LENGTH=2000           # Discord's limit
    RESPONSE_FORMAT_PADDING=50                # Buffer for formatting
    ```
@@ -286,6 +318,37 @@ yt-dlp --version
 ```
 
 **Note**: The `^sum` command will automatically detect if yt-dlp is available and provide helpful error messages if it's not installed.
+
+## 🆕 YouTube Subtitle Caching System
+
+The bot now includes an intelligent caching system for YouTube subtitles to improve performance and reduce bandwidth usage:
+
+### How It Works
+- **URL Hashing**: Each YouTube URL is converted to a SHA-256 hash for consistent file naming
+- **Cache Storage**: Subtitles are stored in `subtitles/cached_{hash}.vtt` format
+- **Automatic Detection**: Before downloading, the bot checks if cached subtitles exist
+- **Validation**: Cached files are validated for content integrity before use
+- **Fallback**: If cached files are invalid, the bot automatically re-downloads
+
+### Benefits
+- **⚡ Faster Processing**: Subsequent requests for the same video are instant
+- **🌐 Reduced Bandwidth**: No need to re-download subtitles from YouTube
+- **🔄 Reliability**: Reduces dependency on YouTube's availability
+- **💾 Storage Efficient**: Uses SHA-256 hashing for compact, unique filenames
+
+### Cache Management
+- **Location**: `subtitles/` directory
+- **Format**: `cached_{sha256_hash}.vtt`
+- **Automatic Cleanup**: Old temporary files are automatically managed
+- **Manual Cleanup**: You can safely delete cached files to free space
+
+### Example Cache Files
+```
+subtitles/
+├── cached_a1b2c3d4e5f6...vtt  # Cached subtitles for video 1
+├── cached_f6e5d4c3b2a1...vtt  # Cached subtitles for video 2
+└── yt_transcript_*.vtt        # Temporary files (auto-managed)
+```
 
 ## Inviting the Bot to Your Server
 
@@ -461,6 +524,30 @@ The `^lm` command provides real-time AI chat functionality via LM Studio or Olla
   - Valid model loaded in your AI server
   - Complete `lmapiconf.txt` configuration (8 required settings)
   - `system_prompt.txt` file for AI personality/behavior
+
+### 🎲 Reproducible Responses with Seeds
+
+The `^lm --seed` command provides deterministic AI responses for testing and debugging:
+
+- **Usage**: `^lm --seed <number> <prompt>`
+- **Example**: `^lm --seed 42 What is the meaning of life?`
+- **Features**:
+  - **🎯 Deterministic Output** - Same input + same seed = same response every time
+  - **🧪 Testing & Debugging** - Perfect for verifying model behavior and debugging prompts
+  - **📊 Academic Research** - Reproducible experiments and consistent results
+  - **🎨 Creative Consistency** - Get the same creative output for content generation
+  - **🔒 No Context History** - Seed requests don't use conversation history (ensures reproducibility)
+  - **⚡ Same Performance** - Real-time streaming with all standard features
+- **Configuration**:
+  - **Global Seed**: Set `DEFAULT_SEED=42` in `lmapiconf.txt` for all responses
+  - **Per-Request Seed**: Use `^lm --seed <number> <prompt>` for specific requests
+  - **Seed Range**: Any non-negative integer (0, 1, 42, 12345, etc.)
+- **Use Cases**:
+  - **Testing**: Verify prompt changes produce expected results
+  - **Debugging**: Reproduce issues with consistent model behavior
+  - **Research**: Academic experiments requiring reproducibility
+  - **Content Creation**: Generate consistent creative content
+  - **Quality Assurance**: Ensure model responses meet standards
 
 ### AI Reasoning Command (LM Studio/Ollama)
 

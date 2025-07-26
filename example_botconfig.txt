@@ -2,4 +2,5 @@
 # Copy this file to botconfig.txt and replace with your actual bot token
 DISCORD_TOKEN=YOUR_BOT_TOKEN_HERE
 PREFIX=^
-RUST_LOG=info 
+RUST_LOG=info
+BOT_OWNER_ID=YOUR_DISCORD_USER_ID_HERE 

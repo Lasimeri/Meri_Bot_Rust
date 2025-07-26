@@ -213,6 +213,7 @@ pub async fn stream_vision_response(
         temperature: config.default_temperature,
         max_tokens: config.default_max_tokens,
         stream: true,
+        seed: config.default_seed,
     };
     
     println!("[VISION_STREAM] ChatRequest created:");

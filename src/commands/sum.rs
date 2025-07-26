@@ -1,4 +1,4 @@
-// sum.rs - Webpage and YouTube Summarization Command Module
+// sum.rs - Self-Contained Webpage and YouTube Summarization Command Module
 // This module implements the ^sum command, providing AI-powered summarization for webpages and YouTube videos.
 // It supports robust content fetching, VTT/HTML cleaning, RAG chunking, and real-time streaming to Discord.
 //
@@ -10,26 +10,707 @@
 // - Real-time streaming of summary to Discord
 // - Multi-path config and prompt loading
 // - Robust error handling and logging
+// - Self-contained with no external module dependencies
 //
-//
-// Used by: main.rs (command registration), search.rs (for config)
+// Self-contained includes:
+// - LM Studio configuration loading and management
+// - HTTP client setup with connection pooling
+// - Chat completion functionality with retry logic
+// - All necessary structures and functions from search.rs and reason.rs
 
 use serenity::{
     client::Context,
     framework::standard::{macros::command, Args, CommandResult},
     model::channel::Message,
 };
-use crate::commands::search::{LMConfig, ChatMessage};
-use reqwest;
 use std::time::Duration;
 use std::fs;
 use std::process::Command;
 use uuid::Uuid;
 use log::{info, warn, error, debug, trace};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use regex::Regex;
-use crate::commands::search::chat_completion;
 use std::time::Instant;
+use sha2::{Sha256, Digest};
+use std::collections::HashMap;
+use tokio::sync::OnceCell;
+
+// ============================================================================
+// SELF-CONTAINED COMPONENTS FROM SEARCH.RS AND REASON.RS
+// ============================================================================
+
+// Global HTTP client for connection pooling and reuse
+static HTTP_CLIENT: OnceCell<reqwest::Client> = OnceCell::const_new();
+
+// Initialize shared HTTP client with optimized settings
+pub async fn get_http_client() -> &'static reqwest::Client {
+    HTTP_CLIENT.get_or_init(|| async {
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(120)) // Increased timeout for LM Studio
+            .connect_timeout(Duration::from_secs(30)) // Connection timeout
+            .pool_idle_timeout(Duration::from_secs(90)) // Keep connections alive
+            .pool_max_idle_per_host(10) // Connection pool size per host
+            .danger_accept_invalid_certs(true) // Accept self-signed certificates for local servers
+            .tcp_keepalive(Duration::from_secs(60)) // TCP keepalive
+            .http2_keep_alive_interval(Duration::from_secs(30)) // HTTP/2 keepalive
+            .http2_keep_alive_timeout(Duration::from_secs(10)) // HTTP/2 keepalive timeout
+            .http2_keep_alive_while_idle(true) // Keep HTTP/2 alive when idle
+            .user_agent("Meri-Bot-Rust-Client/1.0") // Identify the client
+            .build()
+            .expect("Failed to create HTTP client")
+    }).await
+}
+
+// Chat message structure for context
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatMessage {
+    pub role: String,
+    pub content: String,
+}
+
+// LM configuration structure
+#[derive(Debug, Clone)]
+pub struct LMConfig {
+    pub base_url: String,
+    pub timeout: u64,
+    pub default_model: String,
+    pub default_reason_model: String,
+    pub default_summarization_model: String,
+    pub default_ranking_model: String,
+    pub default_temperature: f32,
+    pub default_max_tokens: i32,
+    pub max_discord_message_length: usize,
+    pub response_format_padding: usize,
+    pub default_vision_model: String,
+    pub default_seed: Option<i64>, // Optional seed for reproducible responses
+}
+
+/// Enhanced connectivity test function
+pub async fn test_api_connectivity(config: &LMConfig) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let client = get_http_client().await;
+    
+    println!("[DEBUG][CONNECTIVITY] Testing API connectivity to: {}", config.base_url);
+    
+    // Test 1: Basic server connectivity
+    let basic_response = client
+        .get(&config.base_url)
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await;
+    
+    match basic_response {
+        Ok(response) => {
+            println!("[DEBUG][CONNECTIVITY] Basic connectivity OK - Status: {}", response.status());
+        }
+        Err(e) => {
+            let error_msg = format!("{}", e);
+            if error_msg.contains("os error 10013") || error_msg.contains("access permissions") {
+                return Err(format!(
+                    "🚫 **Windows Network Permission Error (10013)**\n\n\
+                    Cannot connect to LM Studio at `{}`\n\n\
+                    **Solutions:**\n\
+                    • **Add Firewall Exception**: Windows Defender Firewall → Allow an app → Add this program\n\
+                    • **Run as Administrator**: Try running the bot with administrator privileges\n\
+                    • **Check LM Studio**: Ensure LM Studio is running and accessible\n\
+                    • **Try localhost**: Use `http://127.0.0.1:1234` instead of `http://localhost:1234`\n\
+                    • **Check Port**: Verify no other application is using the port\n\n\
+                    **Original error:** {}", 
+                    config.base_url, e
+                ).into());
+            } else if error_msg.contains("timeout") || error_msg.contains("timed out") {
+                return Err(format!(
+                    "⏰ **Connection Timeout**\n\n\
+                    Cannot reach LM Studio server at `{}` within 10 seconds\n\n\
+                    **Solutions:**\n\
+                    • **Check LM Studio**: Ensure LM Studio is running and responsive\n\
+                    • **Network Connection**: Verify your network connection is stable\n\
+                    • **Server Load**: LM Studio might be overloaded - wait and retry\n\
+                    • **Firewall**: Check if firewall is blocking the connection\n\n\
+                    **Original error:** {}", 
+                    config.base_url, e
+                ).into());
+            } else if error_msg.contains("refused") || error_msg.contains("connection refused") {
+                return Err(format!(
+                    "🚫 **Connection Refused**\n\n\
+                    LM Studio at `{}` is not accepting connections\n\n\
+                    **Solutions:**\n\
+                    • **Start LM Studio**: Make sure LM Studio is running\n\
+                    • **Check Port**: Verify LM Studio is listening on the correct port (usually 1234)\n\
+                    • **Load Model**: Ensure a model is loaded in LM Studio\n\
+                    • **Server Status**: Check LM Studio's server status indicator\n\
+                    • **Alternative Port**: Try port 11434 if using Ollama instead\n\n\
+                    **Original error:** {}", 
+                    config.base_url, e
+                ).into());
+            } else if error_msg.contains("dns") || error_msg.contains("name resolution") {
+                return Err(format!(
+                    "🌐 **DNS Resolution Error**\n\n\
+                    Cannot resolve hostname in `{}`\n\n\
+                    **Solutions:**\n\
+                    • **Use IP Address**: Try `http://127.0.0.1:1234` instead of `http://localhost:1234`\n\
+                    • **Check Hostname**: Verify the hostname is correct\n\
+                    • **DNS Settings**: Check your DNS configuration\n\n\
+                    **Original error:** {}", 
+                    config.base_url, e
+                ).into());
+            } else {
+                return Err(format!(
+                    "🔗 **Connection Error**\n\n\
+                    Cannot connect to LM Studio at `{}`\n\n\
+                    **Solutions:**\n\
+                    • **Check URL**: Verify the base URL in lmapiconf.txt\n\
+                    • **Start LM Studio**: Ensure LM Studio is running\n\
+                    • **Network**: Check your network connection\n\
+                    • **Firewall**: Verify firewall settings\n\n\
+                    **Original error:** {}", 
+                    config.base_url, e
+                ).into());
+            }
+        }
+    }
+    
+    // Test 2: API endpoint availability
+    let api_url = format!("{}/v1/chat/completions", config.base_url);
+    let test_payload = serde_json::json!({
+        "model": config.default_model,
+        "messages": [{"role": "user", "content": "test"}],
+        "max_tokens": 1,
+        "temperature": 0.1
+    });
+    
+    println!("[DEBUG][CONNECTIVITY] Testing API endpoint: {}", api_url);
+    
+    let api_response = client
+        .post(&api_url)
+        .json(&test_payload)
+        .timeout(Duration::from_secs(60)) // 1 minute for API endpoint test
+        .send()
+        .await;
+    
+    match api_response {
+        Ok(response) => {
+            let status = response.status();
+            if status.is_success() || status == 400 || status == 422 {
+                // 400/422 are acceptable - means API is responding but request format might be wrong
+                println!("[DEBUG][CONNECTIVITY] API endpoint OK - Status: {}", status);
+                return Ok(());
+            } else if status == 404 {
+                return Err(format!(
+                    "🚫 **API Endpoint Not Found (404)**\n\n\
+                    The endpoint `{}` was not found\n\n\
+                    **Solutions:**\n\
+                    • **Check LM Studio Version**: Ensure you're using a recent version that supports OpenAI API\n\
+                    • **Enable API Server**: Make sure the 'Start Server' option is enabled in LM Studio\n\
+                    • **Correct Port**: LM Studio usually uses port 1234, Ollama uses 11434\n\
+                    • **API Path**: Verify the API path is `/v1/chat/completions`\n\n\
+                    **Current URL:** {}", 
+                    api_url, config.base_url
+                ).into());
+            } else {
+                let error_text = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
+                return Err(format!(
+                    "🚫 **API Error (HTTP {})**\n\n\
+                    LM Studio API returned an error\n\n\
+                    **Response:** {}\n\n\
+                    **Solutions:**\n\
+                    • **Load Model**: Ensure a model is loaded in LM Studio\n\
+                    • **Check Model Name**: Verify the model name in lmapiconf.txt matches loaded model\n\
+                    • **Server Status**: Check LM Studio's status and logs\n\n\
+                    **API URL:** {}", 
+                    status, error_text, api_url
+                ).into());
+            }
+        }
+        Err(e) => {
+            // API test failed, but basic connectivity worked, so this might be a model/configuration issue
+            println!("[DEBUG][CONNECTIVITY] API test failed but basic connectivity OK: {}", e);
+            return Err(format!(
+                "⚠️ **API Configuration Issue**\n\n\
+                Basic connectivity to `{}` works, but API test failed\n\n\
+                **Likely Issues:**\n\
+                • **Model Not Loaded**: No model is loaded in LM Studio\n\
+                • **Wrong Model Name**: Model name in lmapiconf.txt doesn't match loaded model\n\
+                • **API Not Enabled**: LM Studio server is not started\n\
+                • **Version Issue**: LM Studio version doesn't support OpenAI API\n\n\
+                **Error:** {}", 
+                config.base_url, e
+            ).into());
+        }
+    }
+}
+
+/// Load LM Studio/Ollama configuration from lmapiconf.txt file with enhanced validation
+pub async fn load_lm_config() -> Result<LMConfig, Box<dyn std::error::Error + Send + Sync>> {
+    // Trace-level function entry
+    trace!("[TRACE][SUM][load_lm_config] === FUNCTION ENTRY ===");
+    trace!("[TRACE][SUM][load_lm_config] Function: load_lm_config()");
+    trace!("[TRACE][SUM][load_lm_config] Current working dir: {:?}", std::env::current_dir());
+    
+    let config_paths = [
+        "lmapiconf.txt",
+        "../lmapiconf.txt", 
+        "../../lmapiconf.txt",
+        "src/lmapiconf.txt"
+    ];
+    
+    trace!("[TRACE][SUM][load_lm_config] Config paths to try: {:?}", config_paths);
+    
+    let mut config_content = String::new();
+    let mut config_file_found = false;
+    let mut config_file_path = "";
+    
+    // Try to read from multiple possible locations
+    trace!("[TRACE][SUM][load_lm_config] === FILE SEARCH LOOP ===");
+    for (index, path) in config_paths.iter().enumerate() {
+        trace!("[TRACE][SUM][load_lm_config] Attempt {}: trying path '{}'", index + 1, path);
+        trace!("[TRACE][SUM][load_lm_config] Path exists: {}", std::path::Path::new(path).exists());
+        
+        match fs::read_to_string(path) {
+            Ok(content) => {
+                trace!("[TRACE][SUM][load_lm_config] SUCCESS: File read from '{}'", path);
+                trace!("[TRACE][SUM][load_lm_config] Content length: {} bytes", content.len());
+                trace!("[TRACE][SUM][load_lm_config] Content preview: {}", &content[..std::cmp::min(200, content.len())]);
+                
+                config_content = content;
+                config_file_found = true;
+                config_file_path = path;
+                println!("✅ Configuration loaded from: {}", path);
+                break;
+            }
+            Err(e) => {
+                trace!("[TRACE][SUM][load_lm_config] FAILED: Could not read '{}': {}", path, e);
+                continue;
+            }
+        }
+    }
+    
+    trace!("[TRACE][SUM][load_lm_config] File search complete. Found: {}", config_file_found);
+    
+    if !config_file_found {
+        return Err(format!(
+            "❌ **Configuration File Not Found**\n\n\
+            Could not find `lmapiconf.txt` in any of these locations:\n\
+            • ./lmapiconf.txt\n\
+            • ../lmapiconf.txt\n\
+            • ../../lmapiconf.txt\n\
+            • src/lmapiconf.txt\n\n\
+            **Solution:** Copy `example_lmapiconf.txt` to `lmapiconf.txt` and configure it for your setup."
+        ).into());
+    }
+    
+    // Parse configuration
+    let mut config_map = HashMap::new();
+    for (line_num, line) in config_content.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        
+        if let Some(equals_pos) = line.find('=') {
+            let key = line[..equals_pos].trim().to_string();
+            let value = line[equals_pos + 1..].trim().to_string();
+            config_map.insert(key, value);
+        } else {
+            println!("⚠️ Warning: Invalid line {} in {}: {}", line_num + 1, config_file_path, line);
+        }
+    }
+    
+    // Validate required keys
+    let required_keys = [
+        "LM_STUDIO_BASE_URL",
+        "LM_STUDIO_TIMEOUT",
+        "DEFAULT_MODEL",
+        "DEFAULT_REASON_MODEL",
+        "DEFAULT_SUMMARIZATION_MODEL",
+        "DEFAULT_RANKING_MODEL",
+        "DEFAULT_TEMPERATURE",
+        "DEFAULT_MAX_TOKENS",
+        "MAX_DISCORD_MESSAGE_LENGTH",
+        "RESPONSE_FORMAT_PADDING",
+        "DEFAULT_VISION_MODEL",
+    ];
+    
+    let mut missing_keys = Vec::new();
+    for key in &required_keys {
+        if !config_map.contains_key(*key) {
+            missing_keys.push(*key);
+        }
+    }
+    
+    if !missing_keys.is_empty() {
+        return Err(format!(
+            "❌ **Missing Configuration Keys**\n\n\
+            The following required keys are missing from `{}`:\n\
+            {}\n\n\
+            **Solution:** Add these keys to your lmapiconf.txt file. See example_lmapiconf.txt for reference.",
+            config_file_path,
+            missing_keys.iter().map(|k| format!("• {}", k)).collect::<Vec<_>>().join("\n")
+        ).into());
+    }
+    
+    // Extract and validate configuration values
+    let base_url = config_map.get("LM_STUDIO_BASE_URL")
+        .ok_or("LM_STUDIO_BASE_URL not found in lmapiconf.txt")?
+        .clone();
+    
+    // Validate base URL format
+    if !base_url.starts_with("http://") && !base_url.starts_with("https://") {
+        return Err(format!(
+            "❌ **Invalid Base URL**\n\n\
+            LM_STUDIO_BASE_URL must start with http:// or https://\n\
+            Current value: `{}`\n\n\
+            **Examples:**\n\
+            • http://localhost:1234 (LM Studio)\n\
+            • http://localhost:11434 (Ollama)\n\
+            • http://127.0.0.1:1234 (Local IP)",
+            base_url
+        ).into());
+    }
+    
+    let timeout = config_map.get("LM_STUDIO_TIMEOUT")
+        .ok_or("LM_STUDIO_TIMEOUT not found in lmapiconf.txt")?
+        .parse::<u64>()
+        .map_err(|_| "LM_STUDIO_TIMEOUT must be a valid number (seconds)")?;
+    
+    if timeout == 0 || timeout > 600 {
+        return Err(format!(
+            "❌ **Invalid Timeout Value**\n\n\
+            LM_STUDIO_TIMEOUT must be between 1 and 600 seconds\n\
+            Current value: {} seconds\n\n\
+            **Recommended:** 30-120 seconds",
+            timeout
+        ).into());
+    }
+    
+    let default_model = config_map.get("DEFAULT_MODEL")
+        .ok_or("DEFAULT_MODEL not found in lmapiconf.txt")?
+        .clone();
+        
+    if default_model.trim().is_empty() {
+        return Err("❌ DEFAULT_MODEL cannot be empty. Specify the model name loaded in LM Studio.".into());
+    }
+    
+    let default_reason_model = config_map.get("DEFAULT_REASON_MODEL")
+        .ok_or("DEFAULT_REASON_MODEL not found in lmapiconf.txt")?
+        .clone();
+        
+    let default_summarization_model = config_map.get("DEFAULT_SUMMARIZATION_MODEL")
+        .ok_or("DEFAULT_SUMMARIZATION_MODEL not found in lmapiconf.txt")?
+        .clone();
+        
+    let default_ranking_model = config_map.get("DEFAULT_RANKING_MODEL")
+        .ok_or("DEFAULT_RANKING_MODEL not found in lmapiconf.txt")?
+        .clone();
+        
+    let default_vision_model = config_map.get("DEFAULT_VISION_MODEL")
+        .ok_or("DEFAULT_VISION_MODEL not found in lmapiconf.txt")?
+        .clone();
+    
+    let default_temperature = config_map.get("DEFAULT_TEMPERATURE")
+        .ok_or("DEFAULT_TEMPERATURE not found in lmapiconf.txt")?
+        .parse::<f32>()
+        .map_err(|_| "DEFAULT_TEMPERATURE must be a valid number")?;
+    
+    if default_temperature < 0.0 || default_temperature > 2.0 {
+        return Err(format!(
+            "❌ **Invalid Temperature Value**\n\n\
+            DEFAULT_TEMPERATURE must be between 0.0 and 2.0\n\
+            Current value: {}\n\n\
+            **Recommended:** 0.1-1.0 (0.7-0.8 is typical)",
+            default_temperature
+        ).into());
+    }
+    
+    let default_max_tokens = config_map.get("DEFAULT_MAX_TOKENS")
+        .ok_or("DEFAULT_MAX_TOKENS not found in lmapiconf.txt")?
+        .parse::<i32>()
+        .map_err(|_| "DEFAULT_MAX_TOKENS must be a valid number")?;
+    
+    if default_max_tokens <= 0 || default_max_tokens > 32768 {
+        return Err(format!(
+            "❌ **Invalid Max Tokens Value**\n\n\
+            DEFAULT_MAX_TOKENS must be between 1 and 32768\n\
+            Current value: {}\n\n\
+            **Recommended:** 1000-8000 for most use cases",
+            default_max_tokens
+        ).into());
+    }
+    
+    let max_discord_message_length = config_map.get("MAX_DISCORD_MESSAGE_LENGTH")
+        .ok_or("MAX_DISCORD_MESSAGE_LENGTH not found in lmapiconf.txt")?
+        .parse::<usize>()
+        .map_err(|_| "MAX_DISCORD_MESSAGE_LENGTH must be a valid number")?;
+    
+    let response_format_padding = config_map.get("RESPONSE_FORMAT_PADDING")
+        .ok_or("RESPONSE_FORMAT_PADDING not found in lmapiconf.txt")?
+        .parse::<usize>()
+        .map_err(|_| "RESPONSE_FORMAT_PADDING must be a valid number")?;
+    
+    // Optional seed configuration for reproducible responses
+    let default_seed = config_map.get("DEFAULT_SEED")
+        .filter(|s| !s.trim().is_empty()) // Ignore empty values
+        .map(|s| s.parse::<i64>())
+        .transpose()
+        .map_err(|_| "DEFAULT_SEED must be a valid integer if specified")?;
+    
+    let config = LMConfig {
+        base_url,
+        timeout,
+        default_model,
+        default_reason_model,
+        default_summarization_model,
+        default_ranking_model,
+        default_temperature,
+        default_max_tokens,
+        max_discord_message_length,
+        response_format_padding,
+        default_vision_model,
+        default_seed,
+    };
+    
+    // Test connectivity after loading configuration
+    println!("🔍 Testing API connectivity...");
+    if let Err(e) = test_api_connectivity(&config).await {
+        return Err(format!(
+            "❌ **Connectivity Test Failed**\n\n\
+            Configuration loaded successfully from `{}`, but connectivity test failed:\n\n\
+            {}\n\n\
+            **Config Details:**\n\
+            • Base URL: {}\n\
+            • Default Model: {}\n\
+            • Timeout: {}s",
+            config_file_path, e, config.base_url, config.default_model, config.timeout
+        ).into());
+    }
+    
+    println!("✅ API connectivity test passed!");
+    Ok(config)
+}
+
+/// Enhanced chat completion with retry logic and better error handling
+pub async fn chat_completion(
+    messages: Vec<ChatMessage>,
+    model: &str,
+    config: &LMConfig,
+    max_tokens: Option<i32>,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    // Trace-level function entry for chat completion
+    trace!("[TRACE][SUM][chat_completion] === FUNCTION ENTRY ===");
+    trace!("[TRACE][SUM][chat_completion] Model: '{}'", model);
+    trace!("[TRACE][SUM][chat_completion] Messages count: {}", messages.len());
+    trace!("[TRACE][SUM][chat_completion] Max tokens: {:?}", max_tokens);
+    trace!("[TRACE][SUM][chat_completion] Config base URL: {}", config.base_url);
+    trace!("[TRACE][SUM][chat_completion] Config temperature: {}", config.default_temperature);
+    
+    let result = chat_completion_with_retries(messages, model, config, max_tokens, 3).await;
+    
+    // Trace-level function exit
+    match &result {
+        Ok(response) => {
+            trace!("[TRACE][SUM][chat_completion] === FUNCTION EXIT (SUCCESS) ===");
+            trace!("[TRACE][SUM][chat_completion] Response length: {} chars", response.len());
+        }
+        Err(e) => {
+            trace!("[TRACE][SUM][chat_completion] === FUNCTION EXIT (ERROR) ===");
+            trace!("[TRACE][SUM][chat_completion] Error: {}", e);
+        }
+    }
+    
+    result
+}
+
+/// Chat completion with configurable retry attempts
+async fn chat_completion_with_retries(
+    messages: Vec<ChatMessage>,
+    model: &str,
+    config: &LMConfig,
+    max_tokens: Option<i32>,
+    max_retries: u32,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let client = get_http_client().await;
+    let api_url = format!("{}/v1/chat/completions", config.base_url);
+    
+    let chat_request = serde_json::json!({
+        "model": model,
+        "messages": messages,
+        "temperature": config.default_temperature,
+        "max_tokens": max_tokens.unwrap_or(config.default_max_tokens),
+        "stream": false,
+        "seed": config.default_seed
+    });
+
+    let mut last_error: Option<Box<dyn std::error::Error + Send + Sync>> = None;
+    
+    for attempt in 1..=max_retries {
+        println!("[DEBUG][CHAT] Attempt {}/{} - Sending request to: {}", attempt, max_retries, api_url);
+        
+        let start_time = std::time::Instant::now();
+        
+        let response = match client
+            .post(&api_url)
+            .json(&chat_request)
+            .timeout(Duration::from_secs(config.timeout))
+            .send()
+            .await
+        {
+            Ok(resp) => {
+                let elapsed = start_time.elapsed();
+                println!("[DEBUG][CHAT] Request completed in {:.2}s - Status: {}", elapsed.as_secs_f32(), resp.status());
+                resp
+            }
+            Err(e) => {
+                let elapsed = start_time.elapsed();
+                println!("[DEBUG][CHAT] Request failed after {:.2}s: {}", elapsed.as_secs_f32(), e);
+                
+                let error_msg = format!("{}", e);
+                
+                // Check for specific error types that might benefit from retry
+                let should_retry = attempt < max_retries && (
+                    error_msg.contains("timeout") ||
+                    error_msg.contains("connection reset") ||
+                    error_msg.contains("connection aborted") ||
+                    error_msg.contains("broken pipe") ||
+                    error_msg.contains("connection closed")
+                );
+                
+                if should_retry {
+                    let delay = Duration::from_millis(1000 * attempt as u64); // Exponential backoff
+                    println!("[DEBUG][CHAT] Retrying in {:.1}s...", delay.as_secs_f32());
+                    tokio::time::sleep(delay).await;
+                    last_error = Some(Box::new(std::io::Error::new(std::io::ErrorKind::Other, format!("{}", e))));
+                    continue;
+                } else {
+                    // Don't retry for these errors - they're likely configuration issues
+                    if error_msg.contains("os error 10013") || error_msg.contains("access permissions") {
+                        return Err(format!(
+                            "🚫 **Windows Network Permission Error**\n\n\
+                            Cannot connect to LM Studio API\n\n\
+                            **Quick Fixes:**\n\
+                            • **Run as Administrator**: Right-click and 'Run as administrator'\n\
+                            • **Windows Firewall**: Add firewall exception for this program\n\
+                            • **Try localhost**: Use `http://127.0.0.1:1234` in lmapiconf.txt\n\n\
+                            **Current URL:** {}\n\
+                            **Error:** {}", 
+                            config.base_url, e
+                        ).into());
+                    } else if error_msg.contains("refused") || error_msg.contains("connection refused") {
+                        return Err(format!(
+                            "🚫 **Connection Refused**\n\n\
+                            LM Studio is not accepting connections\n\n\
+                            **Solutions:**\n\
+                            • **Start LM Studio**: Make sure LM Studio is running\n\
+                            • **Load Model**: Ensure a model is loaded\n\
+                            • **Enable Server**: Click 'Start Server' in LM Studio\n\
+                            • **Check Port**: Verify port 1234 is available\n\n\
+                            **Current URL:** {}\n\
+                            **Error:** {}", 
+                            config.base_url, e
+                        ).into());
+                    } else {
+                        return Err(format!("API request failed: {}", e).into());
+                    }
+                }
+            }
+        };
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let error_text = response.text().await.unwrap_or_else(|_| "Unable to read error response".to_string());
+            
+            // Check if this is a retryable server error
+            let is_server_error = status.is_server_error();
+            let should_retry = attempt < max_retries && is_server_error;
+            
+            if should_retry {
+                let delay = Duration::from_millis(1000 * attempt as u64);
+                println!("[DEBUG][CHAT] Server error ({}), retrying in {:.1}s...", status, delay.as_secs_f32());
+                tokio::time::sleep(delay).await;
+                last_error = Some(Box::new(std::io::Error::new(std::io::ErrorKind::Other, format!("HTTP {} - {}", status, error_text))));
+                continue;
+            } else {
+                return Err(format!(
+                    "🚫 **API Error (HTTP {})**\n\n\
+                    **Response:** {}\n\n\
+                    **Solutions:**\n\
+                    • **Model Loaded**: Ensure model '{}' is loaded in LM Studio\n\
+                    • **Model Name**: Verify model name matches exactly\n\
+                    • **Server Status**: Check LM Studio server logs\n\
+                    • **Memory**: Ensure sufficient RAM for the model\n\n\
+                    **API URL:** {}", 
+                    status, error_text, model, api_url
+                ).into());
+            }
+        }
+
+        // Parse successful response
+        let response_text = match response.text().await {
+            Ok(text) => text,
+            Err(e) => {
+                if attempt < max_retries {
+                    let delay = Duration::from_millis(1000 * attempt as u64);
+                    println!("[DEBUG][CHAT] Failed to read response, retrying in {:.1}s...", delay.as_secs_f32());
+                    tokio::time::sleep(delay).await;
+                    last_error = Some(Box::new(e));
+                    continue;
+                } else {
+                    return Err(format!("Failed to read response: {}", e).into());
+                }
+            }
+        };
+        
+        let response_json: serde_json::Value = match serde_json::from_str(&response_text) {
+            Ok(json) => json,
+            Err(e) => {
+                return Err(format!(
+                    "🚫 **Invalid API Response**\n\n\
+                    Failed to parse JSON response from LM Studio\n\n\
+                    **Response:** {}\n\
+                    **Parse Error:** {}\n\n\
+                    **Solutions:**\n\
+                    • **Update LM Studio**: Ensure you're using a recent version\n\
+                    • **Check Model**: Verify the model supports chat completions\n\
+                    • **Server Logs**: Check LM Studio logs for errors",
+                    response_text.chars().take(500).collect::<String>(), e
+                ).into());
+            }
+        };
+        
+        // Extract content from response
+        if let Some(choices) = response_json["choices"].as_array() {
+            if let Some(first_choice) = choices.get(0) {
+                if let Some(message) = first_choice["message"].as_object() {
+                    if let Some(content) = message["content"].as_str() {
+                        let result = content.trim().to_string();
+                        println!("[DEBUG][CHAT] Success! Generated {} characters", result.len());
+                        return Ok(result);
+                    }
+                }
+            }
+        }
+        
+        // If we reach here, the JSON structure was unexpected
+        return Err(format!(
+            "🚫 **Unexpected API Response Format**\n\n\
+            LM Studio returned a valid JSON response, but the structure was unexpected\n\n\
+            **Response:** {}\n\n\
+            **Solutions:**\n\
+            • **Update LM Studio**: Ensure compatibility with OpenAI API format\n\
+            • **Check Model**: Verify the model supports chat completions\n\
+            • **API Version**: Ensure you're using a compatible API version",
+            serde_json::to_string_pretty(&response_json).unwrap_or_else(|_| "Unable to format response".to_string())
+        ).into());
+    }
+    
+    // All retries exhausted
+    Err(format!("Request failed after {} attempts. Last error: {}", 
+                max_retries, 
+                last_error.map(|e| format!("{}", e)).unwrap_or_else(|| "Unknown error".to_string())
+    ).into())
+}
+
+// ============================================================================
+// ORIGINAL SUM.RS FUNCTIONALITY
+// ============================================================================
 
 // SSE response structures for streaming summary
 // Used to parse streaming JSON chunks from the AI API
@@ -59,6 +740,16 @@ pub async fn sum(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
     let start_time = std::time::Instant::now();
     let command_uuid = Uuid::new_v4();
     
+    // Trace-level function entry logging
+    trace!("[TRACE][SUM] === FUNCTION ENTRY: sum() ===");
+    trace!("[TRACE][SUM] Function: sum(), UUID: {}", command_uuid);
+    trace!("[TRACE][SUM] Entry timestamp: {:?}", start_time);
+    trace!("[TRACE][SUM] Context data lock acquired successfully");
+    trace!("[TRACE][SUM] Message author: {} (ID: {})", msg.author.name, msg.author.id);
+    trace!("[TRACE][SUM] Channel: {} (ID: {})", msg.channel_id, msg.channel_id.0);
+    trace!("[TRACE][SUM] Guild: {:?}", msg.guild_id);
+    trace!("[TRACE][SUM] Raw arguments: '{}'", args.message());
+    
     info!("📺 === SUM COMMAND STARTED ===");
     info!("🆔 Command UUID: {}", command_uuid);
     info!("👤 User: {} ({})", msg.author.name, msg.author.id);
@@ -86,6 +777,18 @@ pub async fn sum(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
            command_uuid, msg.author.id, msg.channel_id, msg.id);
     
     let url = args.message().trim();
+    
+    // Trace-level URL processing
+    trace!("[TRACE][SUM] === URL PROCESSING ENTRY ===");
+    trace!("[TRACE][SUM] Raw args message: '{}'", args.message());
+    trace!("[TRACE][SUM] Raw args length: {} chars", args.message().len());
+    trace!("[TRACE][SUM] After trim: '{}'", url);
+    trace!("[TRACE][SUM] After trim length: {} chars", url.len());
+    trace!("[TRACE][SUM] Is empty after trim: {}", url.is_empty());
+    trace!("[TRACE][SUM] Contains http://: {}", url.contains("http://"));
+    trace!("[TRACE][SUM] Contains https://: {}", url.contains("https://"));
+    trace!("[TRACE][SUM] First 50 chars: '{}'", &url[..std::cmp::min(50, url.len())]);
+    
     debug!("🔗 === URL PROCESSING ===");
     debug!("🔗 Raw URL: '{}'", url);
     debug!("🔗 URL length: {} characters", url.len());
@@ -104,6 +807,13 @@ pub async fn sum(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
         debug!("🔍 Sending error message to user");
         trace!("🔍 Empty URL error: user_id={}, channel_id={}, command_uuid={}", 
                msg.author.id, msg.channel_id, command_uuid);
+        
+        // Trace-level error exit
+        trace!("[TRACE][SUM] === FUNCTION EXIT: sum() (EMPTY URL ERROR) ===");
+        trace!("[TRACE][SUM] Function: sum(), UUID: {}", command_uuid);
+        trace!("[TRACE][SUM] Exit status: ERROR - Empty URL");
+        trace!("[TRACE][SUM] Exit timestamp: {:?}", std::time::Instant::now());
+        
         msg.reply(ctx, "Please provide a URL to summarize!\n\n**Usage:** `^sum <url>`").await?;
         debug!("✅ Error message sent successfully");
         return Ok(());
@@ -125,6 +835,14 @@ pub async fn sum(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
         debug!("🔍 URL first 10 characters: '{}'", url.chars().take(10).collect::<String>());
         trace!("🔍 URL validation failure details: length={}, first_chars={}, command_uuid={}", 
                url.len(), url.chars().take(10).collect::<String>(), command_uuid);
+        
+        // Trace-level error exit
+        trace!("[TRACE][SUM] === FUNCTION EXIT: sum() (INVALID URL FORMAT ERROR) ===");
+        trace!("[TRACE][SUM] Function: sum(), UUID: {}", command_uuid);
+        trace!("[TRACE][SUM] Exit status: ERROR - Invalid URL format");
+        trace!("[TRACE][SUM] Invalid URL: '{}'", url);
+        trace!("[TRACE][SUM] Exit timestamp: {:?}", std::time::Instant::now());
+        
         msg.reply(ctx, "Please provide a valid URL starting with `http://` or `https://`").await?;
         debug!("✅ Invalid URL error message sent");
         return Ok(());
@@ -133,17 +851,23 @@ pub async fn sum(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
     trace!("🔍 URL validation success: protocol={}, command_uuid={}", 
            if url.starts_with("https://") { "https" } else { "http" }, command_uuid);
     
-    // Load LM configuration from lmapiconf.txt BEFORE starting typing indicator
+    // Load LM configuration from lmapiconf.txt
+    trace!("[TRACE][SUM] === CONFIGURATION LOADING ENTRY ===");
+    trace!("[TRACE][SUM] About to call load_lm_config()");
+    trace!("[TRACE][SUM] Current working directory: {:?}", std::env::current_dir());
+    trace!("[TRACE][SUM] Command UUID: {}", command_uuid);
+    
     debug!("🔧 === CONFIGURATION LOADING ===");
     debug!("🔧 Loading LM configuration from lmapiconf.txt...");
     trace!("🔍 Configuration loading phase started: command_uuid={}", command_uuid);
     
-    let config = match crate::commands::search::load_lm_config().await {
+    let config = match load_lm_config().await {
         Ok(cfg) => {
             info!("✅ === CONFIGURATION LOADED SUCCESSFULLY ===");
             info!("✅ LM configuration loaded successfully");
             debug!("🧠 Using default model: {}", cfg.default_model);
             debug!("🧠 Using reasoning model: {}", cfg.default_reason_model);
+            debug!("🧠 Using summarization model: {}", cfg.default_summarization_model);
             debug!("🌐 API endpoint: {}", cfg.base_url);
             debug!("⏱️ Timeout setting: {} seconds", cfg.timeout);
             debug!("🔥 Temperature setting: {}", cfg.default_temperature);
@@ -161,26 +885,33 @@ pub async fn sum(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
             debug!("🔍 Configuration error type: {:?}", std::any::type_name_of_val(&e));
             trace!("🔍 Configuration error: error_type={}, command_uuid={}", 
                    std::any::type_name_of_val(&e), command_uuid);
-            msg.reply(ctx, &format!("Failed to load LM configuration: {}\n\n**Setup required:** Ensure `lmapiconf.txt` is properly configured with your reasoning model.", e)).await?;
+            msg.reply(ctx, &format!("❌ **Configuration Error**\n\n{}\n\n**Setup required:** Ensure `lmapiconf.txt` is properly configured with your LM Studio settings.", e)).await?;
             debug!("✅ Configuration error message sent");
             return Ok(());
         }
     };
     
     debug!("🔧 Configuration loaded successfully, proceeding with next steps");
-    trace!("🔍 Configuration phase completed, moving to typing indicator: command_uuid={}", command_uuid);
+    trace!("🔍 Configuration phase completed: command_uuid={}", command_uuid);
     
-    // Start typing indicator AFTER config is loaded
-    debug!("⌨️ === TYPING INDICATOR ===");
-    debug!("⌨️ Starting typing indicator...");
-    trace!("🔍 Typing indicator request: channel_id={}, command_uuid={}", msg.channel_id.0, command_uuid);
-    let _typing = ctx.http.start_typing(msg.channel_id.0)?;
-    debug!("✅ Typing indicator started successfully");
-    trace!("🔍 Typing indicator phase completed: command_uuid={}", command_uuid);
+
+    
+    // Trace-level URL type detection
+    trace!("[TRACE][SUM] === URL TYPE DETECTION ENTRY ===");
+    trace!("[TRACE][SUM] URL to analyze: '{}'", url);
+    trace!("[TRACE][SUM] URL length: {} chars", url.len());
+    trace!("[TRACE][SUM] Checking youtube.com/...");
+    let contains_youtube_com = url.contains("youtube.com/");
+    trace!("[TRACE][SUM] Contains youtube.com/: {}", contains_youtube_com);
+    trace!("[TRACE][SUM] Checking youtu.be/...");
+    let contains_youtu_be = url.contains("youtu.be/");
+    trace!("[TRACE][SUM] Contains youtu.be/: {}", contains_youtu_be);
+    let is_youtube = contains_youtube_com || contains_youtu_be;
+    trace!("[TRACE][SUM] Final determination - is_youtube: {}", is_youtube);
+    trace!("[TRACE][SUM] Content type will be: {}", if is_youtube { "YouTube video" } else { "Webpage" });
     
     debug!("🔍 === URL TYPE DETECTION ===");
     debug!("🔍 Detecting URL type...");
-    let is_youtube = url.contains("youtube.com/") || url.contains("youtu.be/");
     debug!("🔍 URL contains youtube.com/: {}", url.contains("youtube.com/"));
     debug!("🔍 URL contains youtu.be/: {}", url.contains("youtu.be/"));
     debug!("🔍 Final YouTube detection: {}", is_youtube);
@@ -189,6 +920,16 @@ pub async fn sum(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
     info!("🎯 === CONTENT TYPE DETECTED ===");
     info!("🎯 Processing {} URL: {}", if is_youtube { "YouTube" } else { "webpage" }, url);
     debug!("📊 URL type detection: YouTube = {}", is_youtube);
+    
+    // Always use the summarization model for all content types due to 32K context window
+    let selected_model = &config.default_summarization_model;
+    
+    // Log the model selection
+    info!("🎯 === SUMMARIZATION MODEL SELECTION ===");
+    info!("🎯 Using summarization model for all content types: {}", selected_model);
+    info!("🎯 Reason: 32K context window for optimal summarization performance");
+    debug!("🎯 Model selection: summarization_model={}, content_type={}", selected_model, if is_youtube { "YouTube" } else { "webpage" });
+    trace!("🔍 Model selection: model={}, content_type={}, command_uuid={}", selected_model, if is_youtube { "youtube" } else { "webpage" }, command_uuid);
     
     // Create response message
     debug!("💬 === DISCORD MESSAGE CREATION ===");
@@ -217,8 +958,7 @@ pub async fn sum(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
     trace!("🔍 Content fetching phase: url_type={}, url={}, command_uuid={}", 
            if is_youtube { "youtube" } else { "webpage" }, url, command_uuid);
 
-    let mut content = String::new();
-    let subtitle_file_path = if is_youtube {
+    let (subtitle_file_path, content) = if is_youtube {
         debug!("🎥 === YOUTUBE CONTENT FETCHING ===");
         debug!("🎥 YouTube URL detected, starting transcript extraction...");
         trace!("🔍 YouTube transcript extraction started: command_uuid={}", command_uuid);
@@ -230,9 +970,9 @@ pub async fn sum(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
                 debug!("📁 Subtitle file exists: {}", std::path::Path::new(&path).exists());
                 trace!("🔍 YouTube subtitle file success: path={}, command_uuid={}", path, command_uuid);
                 
-                // Read the subtitle file content for statistics
-                debug!("📖 === SUBTITLE FILE READING ===");
-                debug!("📖 Reading subtitle file for statistics...");
+                // Read the subtitle file content for statistics only (RAG will handle the actual processing)
+                debug!("📖 === SUBTITLE FILE READING FOR STATISTICS ===");
+                debug!("📖 Reading subtitle file for statistics only...");
                 match fs::read_to_string(&path) {
                     Ok(file_content) => {
                         debug!("📖 Subtitle file read successfully: {} characters", file_content.len());
@@ -241,14 +981,18 @@ pub async fn sum(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
                         
                         let cleaned_content = clean_vtt_content(&file_content);
                         debug!("🧹 === VTT CLEANING FOR STATISTICS ===");
-                        debug!("🧹 Cleaning VTT content for statistics...");
+                        debug!("🧹 Cleaning VTT content for statistics only...");
                         debug!("📝 Original subtitle content: {} characters", file_content.len());
                         debug!("📝 Cleaned subtitle content: {} characters", cleaned_content.len());
                         debug!("📝 Content preview: {}", &cleaned_content[..std::cmp::min(200, cleaned_content.len())]);
                         debug!("📊 Subtitle statistics: {} characters, {} words", cleaned_content.len(), cleaned_content.split_whitespace().count());
+                        debug!("📁 RAG will process the original file: {}", path);
                         trace!("🔍 VTT cleaning for statistics: original_length={}, cleaned_length={}, word_count={}, command_uuid={}", 
                                file_content.len(), cleaned_content.len(), cleaned_content.split_whitespace().count(), command_uuid);
-                        content = cleaned_content;
+                        
+                        // Store statistics for logging purposes only
+                        debug!("📊 YouTube subtitle statistics: {} characters, {} words", 
+                               cleaned_content.len(), cleaned_content.split_whitespace().count());
                     },
                     Err(e) => {
                         warn!("⚠️ === SUBTITLE FILE READ ERROR ===");
@@ -258,7 +1002,7 @@ pub async fn sum(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
                                path, std::any::type_name_of_val(&e), command_uuid);
                     }
                 }
-                Some(path)
+                (Some(path), String::new()) // Empty content for YouTube since RAG handles the file
             },
             Err(e) => {
                 error!("❌ === YOUTUBE TRANSCRIPT ERROR ===");
@@ -275,6 +1019,7 @@ pub async fn sum(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
             }
         }
     } else {
+        // Content will be assigned from webpage processing
         debug!("🌐 === WEBPAGE CONTENT FETCHING ===");
         debug!("🌐 Webpage URL detected, starting content extraction...");
         trace!("🔍 Webpage content extraction started: command_uuid={}", command_uuid);
@@ -305,8 +1050,7 @@ pub async fn sum(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
                 log::info!("✅ Content preview: {}", &page_content[..std::cmp::min(300, page_content.len())]);
                 log::info!("✅ Processing will use RAG with file: {}", html_file_path);
                 
-                content = page_content;
-                Some(html_file_path)
+                (Some(html_file_path), page_content)
             },
             Err(e) => {
                 error!("❌ === WEBPAGE CONTENT ERROR ===");
@@ -339,25 +1083,31 @@ pub async fn sum(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
     info!("🧠 Starting AI summarization process with streaming...");
     debug!("🚀 AI summarization phase initiated");
     
-    let content_length = if let Some(ref path) = subtitle_file_path {
-        debug!("📏 === CONTENT LENGTH CALCULATION ===");
-        debug!("📏 Calculating content length from subtitle file...");
-        match fs::read_to_string(path) {
-            Ok(content) => {
-                let cleaned_length = clean_vtt_content(&content).len();
-                debug!("📏 Content length from subtitle file: {} characters", cleaned_length);
-                trace!("🔍 Content length calculation: path={}, length={}, command_uuid={}", path, cleaned_length, command_uuid);
-                cleaned_length
-            },
-            Err(e) => {
-                warn!("⚠️ Could not read subtitle file for length calculation: {}", e);
-                debug!("🔍 Content length calculation error: path={}, error={}", path, e);
-                trace!("🔍 Content length calculation error: path={}, error_type={}, command_uuid={}", 
-                       path, std::any::type_name_of_val(&e), command_uuid);
-                0
+    let content_length = if is_youtube {
+        // For YouTube videos, calculate length from subtitle file
+        if let Some(ref path) = subtitle_file_path {
+            debug!("📏 === CONTENT LENGTH CALCULATION ===");
+            debug!("📏 Calculating content length from subtitle file...");
+            match fs::read_to_string(path) {
+                Ok(content) => {
+                    let cleaned_length = clean_vtt_content(&content).len();
+                    debug!("📏 Content length from subtitle file: {} characters", cleaned_length);
+                    trace!("🔍 Content length calculation: path={}, length={}, command_uuid={}", path, cleaned_length, command_uuid);
+                    cleaned_length
+                },
+                Err(e) => {
+                    warn!("⚠️ Could not read subtitle file for length calculation: {}", e);
+                    debug!("🔍 Content length calculation error: path={}, error={}", path, e);
+                    trace!("🔍 Content length calculation error: path={}, error_type={}, command_uuid={}", 
+                           path, std::any::type_name_of_val(&e), command_uuid);
+                    0
+                }
             }
+        } else {
+            0
         }
     } else {
+        // For webpages, calculate length from content
         debug!("📏 Content length from direct content: {} characters", content.len());
         trace!("🔍 Content length calculation: direct_length={}, command_uuid={}", content.len(), command_uuid);
         content.len()
@@ -368,7 +1118,38 @@ pub async fn sum(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
     let processing_start = std::time::Instant::now();
     debug!("⏱️ AI processing start time: {:?}", processing_start);
     
-    match stream_summary(&content, url, &config, &mut response_msg, ctx, is_youtube, subtitle_file_path.as_deref()).await {
+    // For YouTube videos, pass empty content since RAG will handle the file processing
+    // For webpages, pass the content directly
+    let content_for_summary = if is_youtube { 
+        debug!("🔧 YouTube video detected - passing empty content for RAG processing");
+        debug!("🔧 File path for RAG: {:?}", subtitle_file_path);
+        debug!("🔧 File path exists: {}", subtitle_file_path.as_ref().map(|p| std::path::Path::new(p).exists()).unwrap_or(false));
+        
+        // Verify the subtitle file exists before proceeding
+        if let Some(ref path) = subtitle_file_path {
+            if !std::path::Path::new(path).exists() {
+                error!("❌ === SUBTITLE FILE MISSING ERROR ===");
+                error!("❌ Subtitle file does not exist: {}", path);
+                response_msg.edit(ctx, |m| {
+                    m.content(format!("❌ Subtitle file missing: {}", path))
+                }).await?;
+                return Ok(()); // Exit early if subtitle file is missing
+            }
+        } else {
+            error!("❌ === NO SUBTITLE FILE PATH ERROR ===");
+            error!("❌ No subtitle file path provided for YouTube video");
+            response_msg.edit(ctx, |m| {
+                m.content("❌ No subtitle file path provided for YouTube video")
+            }).await?;
+            return Ok(()); // Exit early if no subtitle file path
+        }
+        
+        "" 
+    } else { 
+        debug!("🔧 Webpage detected - passing content directly");
+        &content 
+    };
+    match stream_summary(content_for_summary, url, &config, selected_model, &mut response_msg, ctx, is_youtube, subtitle_file_path.as_deref()).await {
         Ok(_) => {
             let processing_time = processing_start.elapsed();
             info!("✅ === AI SUMMARIZATION SUCCESS ===");
@@ -419,50 +1200,33 @@ pub async fn sum(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
     log::info!("🎯 URL: {}", url);
     log::info!("🎯 Processing method: {}", if subtitle_file_path.is_some() { "RAG with file" } else { "Direct processing" });
     
-    // Clean up temporary files
-    if let Some(file_path) = subtitle_file_path {
-        // Log file path before cleanup
+    // TEMPORARILY BYPASS CLEANUP - Keep temporary files for debugging
+    if let Some(ref file_path) = subtitle_file_path {
+        // Log file path
         log::info!("🎯 File path used: {}", file_path);
+        log::info!("🔄 === CLEANUP BYPASSED ===");
+        log::info!("🔄 Temporary file preserved for debugging: {}", file_path);
+        log::info!("🔄 File exists: {}", std::path::Path::new(&file_path).exists());
+        log::info!("🔄 Command UUID: {}", command_uuid);
+        log::info!("🔄 Status: Temporary file preserved (cleanup bypassed)");
         
-        debug!("🧹 === TEMPORARY FILE CLEANUP ===");
-        debug!("🧹 Cleaning up temporary file: {}", file_path);
-        
-        // Enhanced logging for cleanup process
-        log::info!("🧹 === TEMPORARY FILE CLEANUP STARTED ===");
-        log::info!("🧹 File path: {}", file_path);
-        log::info!("🧹 File exists: {}", std::path::Path::new(&file_path).exists());
-        log::info!("🧹 Command UUID: {}", command_uuid);
-        
-        match fs::remove_file(&file_path) {
-            Ok(_) => {
-                debug!("✅ Temporary file cleaned up successfully: {}", file_path);
-                trace!("🔍 File cleanup success: path={}, command_uuid={}", file_path, command_uuid);
-                
-                // Enhanced logging for successful cleanup
-                log::info!("✅ === TEMPORARY FILE CLEANUP SUCCESS ===");
-                log::info!("✅ File removed: {}", file_path);
-                log::info!("✅ File no longer exists: {}", !std::path::Path::new(&file_path).exists());
-            },
-            Err(e) => {
-                warn!("⚠️ Failed to clean up temporary file: {} - {}", file_path, e);
-                debug!("🔍 File cleanup error: path={}, error={}", file_path, e);
-                trace!("🔍 File cleanup error: path={}, error_type={}, command_uuid={}", 
-                       file_path, std::any::type_name_of_val(&e), command_uuid);
-                
-                // Enhanced logging for cleanup failure
-                log::error!("❌ === TEMPORARY FILE CLEANUP FAILED ===");
-                log::error!("❌ File path: {}", file_path);
-                log::error!("❌ Error: {}", e);
-                log::error!("❌ Error type: {}", std::any::type_name_of_val(&e));
-                log::error!("❌ File still exists: {}", std::path::Path::new(&file_path).exists());
-            }
-        }
-        
-        // Log cleanup status
-        log::info!("🎯 File cleaned up: {}", !std::path::Path::new(&file_path).exists());
+        debug!("🔄 === CLEANUP BYPASSED ===");
+        debug!("🔄 Preserving temporary file for debugging: {}", file_path);
+        trace!("🔍 Cleanup bypassed: path={}, command_uuid={}", file_path, command_uuid);
     }
     
     log::info!("🎯 Status: SUCCESS");
+    
+    // Trace-level function exit
+    trace!("[TRACE][SUM] === FUNCTION EXIT: sum() ===");
+    trace!("[TRACE][SUM] Function: sum(), UUID: {}", command_uuid);
+    trace!("[TRACE][SUM] Exit status: SUCCESS");
+    trace!("[TRACE][SUM] Total execution time: {:.3}s", total_time.as_secs_f64());
+    trace!("[TRACE][SUM] Final content length: {} chars", content_length);
+    trace!("[TRACE][SUM] Processing method used: {}", 
+           if let Some(ref _path) = subtitle_file_path { "RAG with file" } else { "Direct processing" });
+    trace!("[TRACE][SUM] Exit timestamp: {:?}", std::time::Instant::now());
+
     
     Ok(())
 }
@@ -530,14 +1294,37 @@ async fn load_youtube_summarization_prompt() -> Result<String, Box<dyn std::erro
 }
 
 // Enhanced YouTube transcript fetcher using yt-dlp with detailed logging
-// Downloads and cleans VTT subtitles for a given YouTube URL
+// Generate a hash from YouTube URL for caching
+fn generate_youtube_cache_key(url: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(url.as_bytes());
+    let result = hasher.finalize();
+    format!("{:x}", result)
+}
+
+// Downloads and cleans VTT subtitles for a given YouTube URL with caching
 async fn fetch_youtube_transcript(url: &str) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    let temp_file = format!("yt_transcript_{}", Uuid::new_v4());
     let process_uuid = Uuid::new_v4();
+    
+    // Trace-level function entry
+    trace!("[TRACE][SUM][fetch_youtube_transcript] === FUNCTION ENTRY ===");
+    trace!("[TRACE][SUM][fetch_youtube_transcript] Function: fetch_youtube_transcript()");
+    trace!("[TRACE][SUM][fetch_youtube_transcript] Process UUID: {}", process_uuid);
+    trace!("[TRACE][SUM][fetch_youtube_transcript] Input URL: '{}'", url);
+    trace!("[TRACE][SUM][fetch_youtube_transcript] URL length: {} chars", url.len());
+    trace!("[TRACE][SUM][fetch_youtube_transcript] Current working dir: {:?}", std::env::current_dir());
     
     info!("🎥 === YOUTUBE TRANSCRIPT EXTRACTION STARTED ===");
     info!("🆔 Process UUID: {}", process_uuid);
     info!("📍 Target URL: {}", url);
+    
+    // TEMPORARILY BYPASS CACHING - Use direct yt_transcript files
+    info!("🔄 === CACHING BYPASSED ===");
+    info!("🔄 Using direct yt_transcript files for RAG processing");
+    debug!("🔄 Cache system temporarily disabled");
+    trace!("🔍 Cache bypass: process_uuid={}", process_uuid);
+    
+    let temp_file = format!("yt_transcript_{}", Uuid::new_v4());
     info!("📁 Temp file base: {}", temp_file);
     
     debug!("🔧 === YOUTUBE TRANSCRIPT INITIALIZATION ===");
@@ -648,6 +1435,9 @@ async fn fetch_youtube_transcript(url: &str) -> Result<String, Box<dyn std::erro
             .arg("--no-playlist")
             .arg("--sleep-interval").arg("2")  // Add 2 second delay between requests
             .arg("--max-sleep-interval").arg("5")  // Max 5 second delay
+            .arg("--retries").arg("3")  // Retry failed downloads
+            .arg("--fragment-retries").arg("3")  // Retry failed fragments
+            .arg("--user-agent").arg("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")  // Use realistic user agent
             .arg("--output").arg(&format!("{}/{}", subtitles_dir, temp_file))
             .arg(url);
         
@@ -662,6 +1452,9 @@ async fn fetch_youtube_transcript(url: &str) -> Result<String, Box<dyn std::erro
         debug!("📋   - --no-playlist");
         debug!("📋   - --sleep-interval 2");
         debug!("📋   - --max-sleep-interval 5");
+        debug!("📋   - --retries 3");
+        debug!("📋   - --fragment-retries 3");
+        debug!("📋   - --user-agent [Chrome 120]");
         debug!("📋   - --output {}/{}", subtitles_dir, temp_file);
         debug!("📋   - URL: {}", url);
         trace!("🔍 yt-dlp command details: attempt={}, output_path={}/{}, url_length={}, process_uuid={}", 
@@ -752,6 +1545,9 @@ async fn fetch_youtube_transcript(url: &str) -> Result<String, Box<dyn std::erro
                 .arg("--no-playlist")
                 .arg("--sleep-interval").arg("2")  // Add 2 second delay between requests
                 .arg("--max-sleep-interval").arg("5")  // Max 5 second delay
+                .arg("--retries").arg("3")  // Retry failed downloads
+                .arg("--fragment-retries").arg("3")  // Retry failed fragments
+                .arg("--user-agent").arg("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")  // Use realistic user agent
                 .arg("--output").arg(&format!("{}/{}", subtitles_dir, temp_file))
                 .arg(url);
             
@@ -765,6 +1561,9 @@ async fn fetch_youtube_transcript(url: &str) -> Result<String, Box<dyn std::erro
             debug!("📋   - --no-playlist");
             debug!("📋   - --sleep-interval 2");
             debug!("📋   - --max-sleep-interval 5");
+            debug!("📋   - --retries 3");
+            debug!("📋   - --fragment-retries 3");
+            debug!("📋   - --user-agent [Chrome 120]");
             debug!("📋   - --output {}/{}", subtitles_dir, temp_file);
             debug!("📋   - URL: {}", url);
             trace!("🔍 Method 2 command details: attempt={}, output_path={}/{}, url_length={}, process_uuid={}", 
@@ -853,10 +1652,15 @@ async fn fetch_youtube_transcript(url: &str) -> Result<String, Box<dyn std::erro
         debug!("🔍 Error contains 'No subtitles': {}", last_error.contains("No subtitles"));
         debug!("🔍 Error contains 'no automatic captions': {}", last_error.contains("no automatic captions"));
         debug!("🔍 Error contains 'This video is not available': {}", last_error.contains("This video is not available"));
-        trace!("🔍 Error pattern analysis: data_blocks={}, bot_confirmation={}, private_video={}, video_unavailable={}, rate_limit={}, no_subtitles={}, not_available={}, process_uuid={}", 
+        debug!("🔍 Error contains '403': {}", last_error.contains("403"));
+        debug!("🔍 Error contains 'Forbidden': {}", last_error.contains("Forbidden"));
+        debug!("🔍 Error contains 'fragment 1 not found': {}", last_error.contains("fragment 1 not found"));
+        trace!("🔍 Error pattern analysis: data_blocks={}, bot_confirmation={}, private_video={}, video_unavailable={}, rate_limit={}, forbidden={}, fragment_not_found={}, no_subtitles={}, not_available={}, process_uuid={}", 
                last_error.contains("Did not get any data blocks"), last_error.contains("Sign in to confirm you're not a bot"), 
                last_error.contains("Private video"), last_error.contains("Video unavailable"), 
                last_error.contains("429") || last_error.contains("Too Many Requests"),
+               last_error.contains("403") || last_error.contains("Forbidden"),
+               last_error.contains("fragment 1 not found"),
                last_error.contains("No subtitles") || last_error.contains("no automatic captions"),
                last_error.contains("This video is not available"), process_uuid);
         
@@ -874,6 +1678,14 @@ async fn fetch_youtube_transcript(url: &str) -> Result<String, Box<dyn std::erro
         
         if last_error.contains("429") || last_error.contains("Too Many Requests") {
             return Err("YouTube is rate limiting requests. Please wait a few minutes and try again, or try a different video.".into());
+        }
+        
+        if last_error.contains("403") || last_error.contains("Forbidden") {
+            return Err("YouTube is blocking access to this video (403 Forbidden). This could be due to:\n• Video is age-restricted or private\n• YouTube's anti-bot measures\n• Regional restrictions\n• Try updating yt-dlp: `yt-dlp -U`\n• Try a different video or wait and retry later.".into());
+        }
+        
+        if last_error.contains("fragment 1 not found") {
+            return Err("YouTube video fragment not found. This usually indicates:\n• Video is being processed or temporarily unavailable\n• YouTube's servers are having issues\n• Try again in a few minutes\n• If persistent, try updating yt-dlp: `yt-dlp -U`".into());
         }
         
         if last_error.contains("No subtitles") || last_error.contains("no automatic captions") {
@@ -1040,7 +1852,12 @@ async fn fetch_youtube_transcript(url: &str) -> Result<String, Box<dyn std::erro
     trace!("🔍 YouTube transcript extraction success: file_path={}, original_length={}, cleaned_length={}, process_uuid={}", 
            vtt_file, content.len(), cleaned.len(), process_uuid);
     
-    // Return the path to the subtitle file for RAG processing
+    // TEMPORARILY BYPASS CACHING - Return temporary file directly
+    info!("🔄 === RETURNING TEMPORARY FILE PATH ===");
+    info!("🔄 Returning temporary file path for RAG processing: {}", vtt_file);
+    debug!("📄 Temporary file path: {}", vtt_file);
+    trace!("🔍 Returning temporary path: temp={}, process_uuid={}", vtt_file, process_uuid);
+    
     Ok(vtt_file)
 }
 
@@ -1178,8 +1995,8 @@ fn clean_vtt_content(vtt: &str) -> String {
     final_result
 }
 
-// Simple webpage fetcher
-// Downloads and cleans HTML content for a given URL
+// Simple webpage fetcher with improved connectivity
+// Downloads and cleans HTML content for a given URL using the shared HTTP client
 async fn fetch_webpage_content(url: &str) -> Result<(String, String), Box<dyn std::error::Error + Send + Sync>> {
     let fetch_uuid = Uuid::new_v4();
     
@@ -1195,18 +2012,14 @@ async fn fetch_webpage_content(url: &str) -> Result<(String, String), Box<dyn st
     debug!("🌐 Starting webpage fetch for URL: {}", url);
     
     debug!("🔧 === HTTP CLIENT SETUP ===");
-    debug!("🔧 Creating HTTP client with timeout...");
-    trace!("🔍 HTTP client creation started: fetch_uuid={}", fetch_uuid);
+    debug!("🔧 Using shared HTTP client with optimized settings...");
+    trace!("🔍 HTTP client setup started: fetch_uuid={}", fetch_uuid);
     
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
-        .build()?;
+    let client = get_http_client().await;
     
-    debug!("✅ HTTP client created successfully");
-    debug!("🔧 Timeout: 30 seconds");
-    debug!("🔧 User agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36");
-    trace!("🔍 HTTP client created: timeout=30s, fetch_uuid={}", fetch_uuid);
+    debug!("✅ Shared HTTP client obtained successfully");
+    debug!("🔧 Using optimized connection pooling and settings");
+    trace!("🔍 HTTP client obtained: fetch_uuid={}", fetch_uuid);
     
     debug!("📡 === HTTP REQUEST EXECUTION ===");
     debug!("📡 Sending HTTP request...");
@@ -1416,6 +2229,7 @@ async fn stream_summary(
     content: &str,
     url: &str,
     config: &LMConfig,
+    selected_model: &str,
     msg: &mut Message,
     ctx: &Context,
     is_youtube: bool,
@@ -1423,6 +2237,19 @@ async fn stream_summary(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     
     let stream_uuid = Uuid::new_v4();
+    
+    // Trace-level function entry
+    trace!("[TRACE][SUM][stream_summary] === FUNCTION ENTRY ===");
+    trace!("[TRACE][SUM][stream_summary] Function: stream_summary()");
+    trace!("[TRACE][SUM][stream_summary] Stream UUID: {}", stream_uuid);
+    trace!("[TRACE][SUM][stream_summary] Input content length: {} chars", content.len());
+    trace!("[TRACE][SUM][stream_summary] URL: '{}'", url);
+    trace!("[TRACE][SUM][stream_summary] Is YouTube: {}", is_youtube);
+    trace!("[TRACE][SUM][stream_summary] File path: {:?}", file_path);
+    trace!("[TRACE][SUM][stream_summary] Config base URL: {}", config.base_url);
+    trace!("[TRACE][SUM][stream_summary] Selected model: {}", selected_model);
+    trace!("[TRACE][SUM][stream_summary] Config temperature: {}", config.default_temperature);
+    trace!("[TRACE][SUM][stream_summary] Config max tokens: {}", config.default_max_tokens);
     
     info!("🤖 === AI SUMMARIZATION STREAMING STARTED ===");
     info!("🆔 Stream UUID: {}", stream_uuid);
@@ -1436,16 +2263,16 @@ async fn stream_summary(
     debug!("🔧 Content length: {} characters", content.len());
     debug!("🔧 Is YouTube: {}", is_youtube);
     debug!("🔧 File path: {:?}", file_path);
-    debug!("🔧 Model: {}", config.default_reason_model);
+    debug!("🔧 Model: {}", selected_model);
     debug!("🔧 Base URL: {}", config.base_url);
     debug!("🔧 Temperature: {}", config.default_temperature);
     debug!("🔧 Max tokens: {}", config.default_max_tokens);
     trace!("🔍 Stream summary started: content_length={}, url={}, is_youtube={}, model={}, stream_uuid={}", 
-           content.len(), url, is_youtube, config.default_reason_model, stream_uuid);
+           content.len(), url, is_youtube, selected_model, stream_uuid);
     
     debug!("🤖 Preparing AI request...");
     trace!("🔍 Stream summary started: content_length={}, url={}, is_youtube={}, model={}, stream_uuid={}", 
-           content.len(), url, is_youtube, config.default_reason_model, stream_uuid);    
+           content.len(), url, is_youtube, selected_model, stream_uuid);    
     
     // Load appropriate system prompt from files
     debug!("📄 === SYSTEM PROMPT LOADING ===");
@@ -1491,12 +2318,21 @@ async fn stream_summary(
     trace!("🔍 System prompt loaded: length={}, stream_uuid={}", system_prompt.len(), stream_uuid);
     
     // FIXED: Properly handle content processing for YouTube vs webpage
+    trace!("[TRACE][SUM][stream_summary] === CONTENT PROCESSING ENTRY ===");
+    trace!("[TRACE][SUM][stream_summary] File path provided: {}", file_path.is_some());
+    trace!("[TRACE][SUM][stream_summary] Content type: {}", if is_youtube { "YouTube" } else { "Webpage" });
+    trace!("[TRACE][SUM][stream_summary] Input content length: {} chars", content.len());
+    
     debug!("🔧 === CONTENT PROCESSING ===");
     debug!("🔧 Processing content for AI request...");
     
     let (user_prompt, content_to_process) = if file_path.is_some() {
         // Use RAG document processing with the file (YouTube subtitle or HTML)
         let file_path = file_path.unwrap();
+        debug!("🔧 === RAG PROCESSING TRIGGERED ===");
+        debug!("🔧 File path provided: {}", file_path);
+        debug!("🔧 File exists: {}", std::path::Path::new(file_path).exists());
+        debug!("🔧 Is YouTube: {}", is_youtube);
         debug!("📁 === RAG DOCUMENT PROCESSING ===");
         debug!("📁 Using RAG document processing for file: {}", file_path);
         debug!("📁 Content type: {}", if is_youtube { "YouTube subtitle" } else { "HTML webpage" });
@@ -1615,18 +2451,29 @@ async fn stream_summary(
         (prompt, cleaned_content)
     } else {
         // For webpages or fallback, use the original content
+        debug!("🔧 === DIRECT PROCESSING TRIGGERED ===");
+        debug!("🔧 No file path provided, using direct content processing");
+        debug!("🔧 Content length: {} characters", content.len());
+        debug!("🔧 Is YouTube: {}", is_youtube);
         debug!("📄 === WEBPAGE CONTENT PROCESSING ===");
         debug!("📄 Using webpage content processing");
         trace!("🔍 Webpage content processing: content_length={}, stream_uuid={}", content.len(), stream_uuid);
         
-        // Truncate content to prevent context overflow
-        let max_content_length = 20000;
-        debug!("📏 === CONTENT TRUNCATION CHECK ===");
+        // For YouTube videos, don't truncate content since RAG will handle chunking
+        // For webpages, apply reasonable limits to prevent context overflow
+        let max_content_length = if is_youtube { 
+            usize::MAX // No limit for YouTube videos - RAG will handle chunking
+        } else { 
+            20000 // Limit for webpages
+        };
+        
+        debug!("📏 === CONTENT LENGTH CHECK ===");
         debug!("📏 Checking content length: {} characters", content.len());
         debug!("📏 Max content length: {} characters", max_content_length);
+        debug!("📏 Content type: {}", if is_youtube { "YouTube" } else { "Webpage" });
         debug!("📏 Needs truncation: {}", content.len() > max_content_length);
-        trace!("🔍 Content truncation check: content_length={}, max_length={}, stream_uuid={}", 
-               content.len(), max_content_length, stream_uuid);
+        trace!("🔍 Content length check: content_length={}, max_length={}, content_type={}, stream_uuid={}", 
+               content.len(), max_content_length, if is_youtube { "youtube" } else { "webpage" }, stream_uuid);
         
         let truncated_content = if content.len() > max_content_length {
             let truncated = format!("{} [Content truncated due to length]", &content[0..max_content_length]);
@@ -1665,14 +2512,18 @@ async fn stream_summary(
     trace!("🔍 Prompt details: system_length={}, user_length={}, content_length={}, url_length={}, stream_uuid={}", 
            system_prompt.len(), user_prompt.len(), content_to_process.len(), url.len(), stream_uuid);
     
-    let chunk_size = 8000;
+    // Use model context limit of 32,000 tokens, with safety margin for prompts
+    // Assuming ~4 characters per token, use ~24,000 characters per chunk to leave room for prompts
+    let chunk_size = if is_youtube { 24000 } else { 16000 }; // Optimized for 32K context limit
     let mut chunk_summaries = Vec::new();
     let request_payload;
     
-    debug!("📄 === CHUNKING DECISION ===");
-    debug!("📄 Content length: {} characters", content_to_process.len());
-    debug!("📄 Chunk size: {} characters", chunk_size);
-    debug!("📄 Needs chunking: {}", content_to_process.len() > chunk_size);
+            debug!("📄 === CHUNKING DECISION ===");
+        debug!("📄 Content length: {} characters", content_to_process.len());
+        debug!("📄 Chunk size: {} characters (optimized for 32K context)", chunk_size);
+        debug!("📄 Model context limit: 32,000 tokens");
+        debug!("📄 Max tokens per response: {}", config.default_max_tokens);
+        debug!("📄 Needs chunking: {}", content_to_process.len() > chunk_size);
     trace!("🔍 Chunking decision: content_length={}, chunk_size={}, needs_chunking={}, stream_uuid={}", 
            content_to_process.len(), chunk_size, content_to_process.len() > chunk_size, stream_uuid);
     
@@ -1698,8 +2549,21 @@ async fn stream_summary(
         // Use character-based splitting to avoid breaking UTF-8 characters
         let mut chunks = Vec::new();
         let mut current_chunk = String::new();
+        let words: Vec<&str> = content_to_process.split_whitespace().collect();
         
-        for word in content_to_process.split_whitespace() {
+        // Safety check for extremely long content
+        if words.len() > 100000 {
+            warn!("⚠️ === EXTREMELY LONG CONTENT WARNING ===");
+            warn!("⚠️ Content has {} words, this may cause performance issues", words.len());
+        }
+        
+        for word in words {
+            // Check if a single word is too long (might be corrupted data)
+            if word.len() > chunk_size / 2 {
+                warn!("⚠️ Skipping extremely long word: {} characters", word.len());
+                continue;
+            }
+            
             if current_chunk.len() + word.len() + 1 > chunk_size && !current_chunk.is_empty() {
                 chunks.push(current_chunk.trim().to_string());
                 current_chunk = String::new();
@@ -1716,9 +2580,23 @@ async fn stream_summary(
             chunks.push(current_chunk.trim().to_string());
         }
         
+        // Safety check for too many chunks
+        if chunks.len() > 50 {
+            warn!("⚠️ === TOO MANY CHUNKS WARNING ===");
+            warn!("⚠️ Content split into {} chunks, this may take a very long time", chunks.len());
+        }
+        
         debug!("📄 Split content into {} chunks", chunks.len());
         debug!("📄 Chunk sizes: {:?}", chunks.iter().map(|c| c.len()).collect::<Vec<_>>());
         trace!("🔍 Content chunked: total_chunks={}, stream_uuid={}", chunks.len(), stream_uuid);
+        
+        // For very long videos, implement hierarchical summarization
+        let is_very_long_video = is_youtube && chunks.len() > 10;
+        if is_very_long_video {
+            info!("📄 === VERY LONG VIDEO DETECTED ===");
+            info!("📄 Video has {} chunks, using hierarchical summarization", chunks.len());
+            debug!("📄 Implementing hierarchical summarization for very long video");
+        }
         
         for (i, chunk) in chunks.iter().enumerate() {
             info!("🤖 === CHUNK {} PROCESSING ===", i+1);
@@ -1752,13 +2630,13 @@ async fn stream_summary(
             
             debug!("🤖 === CHUNK LLM REQUEST ===");
             debug!("🤖 Sending chunk {} to LLM with {} characters", i+1, chunk.len());
-            debug!("🤖 Using model: {}", config.default_reason_model);
-            debug!("🤖 Max tokens: 500");
+            debug!("🤖 Using selected model: {}", selected_model);
+            debug!("🤖 Max tokens: 2000 (optimized for 32K context)");
             trace!("🔍 Chunk {} LLM request: chunk_length={}, prompt_length={}, model={}, stream_uuid={}", 
-                   i+1, chunk.len(), chunk_prompt.len(), config.default_reason_model, stream_uuid);
+                   i+1, chunk.len(), chunk_prompt.len(), selected_model, stream_uuid);
             
-            // Use reasoning model for chunk summaries
-            let chunk_summary = match chat_completion(chunk_messages, &config.default_reason_model, config, Some(500)).await {
+            // Use selected model with retry logic for chunk summaries
+            let chunk_summary = match chat_completion(chunk_messages, selected_model, config, Some(2000)).await {
                 Ok(summary) => {
                     debug!("✅ Chunk {} summary received: {} characters", i+1, summary.len());
                     debug!("📝 Chunk {} summary preview: {}", i+1, &summary[..std::cmp::min(200, summary.len())]);
@@ -1773,7 +2651,40 @@ async fn stream_summary(
                     debug!("🔍 Chunk {} LLM error type: {:?}", i+1, std::any::type_name_of_val(&e));
                     trace!("🔍 Chunk {} LLM error: error_type={}, stream_uuid={}", 
                            i+1, std::any::type_name_of_val(&e), stream_uuid);
-                    return Err(e);
+                    
+                    // Enhanced error handling with user-friendly messages
+                    let error_msg = format!("{}", e);
+                    if error_msg.contains("Connection refused") || error_msg.contains("Connection Error") {
+                        return Err(format!(
+                            "❌ **LM Studio Connection Lost During Chunk Processing**\n\n\
+                            Failed to process chunk {} of {}\n\n\
+                            **Solutions:**\n\
+                            • **Check LM Studio**: Ensure LM Studio is still running\n\
+                            • **Model Loaded**: Verify model `{}` is still loaded\n\
+                            • **Server Status**: Check if LM Studio server is still active\n\
+                            • **Try Shorter Content**: Consider using shorter videos/webpages\n\n\
+                            **Progress:** Successfully processed {} of {} chunks before failure",
+                            i+1, chunks.len(), selected_model, i, chunks.len()
+                        ).into());
+                    } else if error_msg.contains("Windows Permission Error") || error_msg.contains("os error 10013") {
+                        return Err(format!(
+                            "❌ **Windows Permission Error During Processing**\n\n\
+                            Network access was denied while processing chunk {} of {}\n\n\
+                            **Quick Fix:**\n\
+                            • **Restart as Administrator**: Close the bot and run as administrator\n\n\
+                            **Progress:** Successfully processed {} of {} chunks before failure",
+                            i+1, chunks.len(), i, chunks.len()
+                        ).into());
+                    } else {
+                        return Err(format!(
+                            "❌ **Chunk Processing Error**\n\n\
+                            Failed to process chunk {} of {}\n\n\
+                            **Error:** {}\n\n\
+                            **Progress:** Successfully processed {} of {} chunks\n\
+                            **Suggestion:** Try using shorter content or a different model",
+                            i+1, chunks.len(), e, i, chunks.len()
+                        ).into());
+                    }
                 }
             };
             
@@ -1785,7 +2696,7 @@ async fn stream_summary(
             
             if chunk_summary.contains("Search functionality is not available") || chunk_summary.contains("fallback") {
                 warn!("⚠️ === CHUNK {} FALLBACK DETECTED ===", i+1);
-                warn!("⚠️ Model {} appears to be a search model, not suitable for summarization", config.default_reason_model);
+                warn!("⚠️ Model {} appears to be a search model, not suitable for summarization", selected_model);
                 debug!("🔍 Chunk {} returned search model response: {}", i+1, chunk_summary);
                 debug!("🔍 Using direct content approach for this chunk");
                 // Use a more direct approach for this chunk
@@ -1803,16 +2714,104 @@ async fn stream_summary(
         // FIXED: Combine chunk summaries for final prompt with better structure
         debug!("📝 === CHUNK SUMMARIES COMBINATION ===");
         debug!("📝 Combining {} chunk summaries...", chunk_summaries.len());
-        let combined = chunk_summaries.join("\n\n---\n\n");
-        debug!("📝 Combined chunk summaries: {} characters", combined.len());
-        debug!("📝 Combined summaries preview: {}", &combined[..std::cmp::min(300, combined.len())]);
-        trace!("🔍 Chunk summaries combined: combined_length={}, chunk_count={}, stream_uuid={}", 
-               combined.len(), chunk_summaries.len(), stream_uuid);
+        
+        let combined = if is_very_long_video {
+            // For very long videos, implement hierarchical summarization
+            info!("📄 === HIERARCHICAL SUMMARIZATION FOR VERY LONG VIDEO ===");
+            info!("📄 Processing {} chunk summaries hierarchically", chunk_summaries.len());
+            
+            // Group chunk summaries into sections (every 5 chunks)
+            let mut section_summaries = Vec::new();
+            let section_size = 5;
+            
+            for (section_idx, section_chunks) in chunk_summaries.chunks(section_size).enumerate() {
+                info!("📄 === SECTION {} SUMMARIZATION ===", section_idx + 1);
+                info!("📄 Summarizing section {} with {} chunks", section_idx + 1, section_chunks.len());
+                
+                let section_combined = section_chunks.join("\n\n---\n\n");
+                debug!("📝 Section {} combined: {} characters", section_idx + 1, section_combined.len());
+                
+                let section_prompt = format!(
+                    "Create a comprehensive summary of this section from a YouTube video. Focus on the main topics, key points, and important information:\n\n{}",
+                    section_combined
+                );
+                
+                let section_messages = vec![
+                    ChatMessage { 
+                        role: "system".to_string(), 
+                        content: "You are an expert content summarizer. Create comprehensive section summaries that capture the main topics and key information.".to_string() 
+                    },
+                    ChatMessage { 
+                        role: "user".to_string(), 
+                        content: section_prompt 
+                    }
+                ];
+                
+                let section_summary = match chat_completion(section_messages, selected_model, config, Some(1500)).await {
+                    Ok(summary) => {
+                        info!("✅ Section {} summary completed: {} characters", section_idx + 1, summary.len());
+                        summary
+                    },
+                    Err(e) => {
+                        error!("❌ Failed to summarize section {}: {}", section_idx + 1, e);
+                        
+                        // Enhanced error handling for section processing
+                        let error_msg = format!("{}", e);
+                        if error_msg.contains("Connection refused") || error_msg.contains("Connection Error") {
+                            return Err(format!(
+                                "❌ **LM Studio Connection Lost During Section Processing**\n\n\
+                                Failed to process section {} during hierarchical summarization\n\n\
+                                **Solutions:**\n\
+                                • **Check LM Studio**: Ensure LM Studio is still running\n\
+                                • **Model Status**: Verify model `{}` is still loaded\n\
+                                • **Try Again**: Restart the command\n\n\
+                                **Progress:** Individual chunks completed, failed during section consolidation",
+                                section_idx + 1, selected_model
+                            ).into());
+                        } else {
+                            return Err(format!(
+                                "❌ **Section Processing Error**\n\n\
+                                Failed during hierarchical summarization of section {}\n\n\
+                                **Error:** {}\n\n\
+                                **Note:** Individual chunks were processed successfully",
+                                section_idx + 1, e
+                            ).into());
+                        }
+                    }
+                };
+                
+                section_summaries.push(format!("Section {}: {}", section_idx + 1, section_summary));
+            }
+            
+            // Combine section summaries for final summary
+            let final_sections = section_summaries.join("\n\n---\n\n");
+            debug!("📝 Final sections combined: {} characters", final_sections.len());
+            final_sections
+        } else {
+            // For normal videos, use direct combination
+            let combined = chunk_summaries.join("\n\n---\n\n");
+            debug!("📝 Combined chunk summaries: {} characters", combined.len());
+            debug!("📝 Combined summaries preview: {}", &combined[..std::cmp::min(300, combined.len())]);
+            trace!("🔍 Chunk summaries combined: combined_length={}, chunk_count={}, stream_uuid={}", 
+                   combined.len(), chunk_summaries.len(), stream_uuid);
+            combined
+        };
+        
+        // Limit final prompt size to prevent context overflow
+        let max_final_prompt_size = 80000; // ~20K tokens
+        let final_content = if combined.len() > max_final_prompt_size {
+            warn!("⚠️ === FINAL PROMPT TOO LARGE ===");
+            warn!("⚠️ Combined content too large ({} chars), truncating to {} chars", combined.len(), max_final_prompt_size);
+            format!("{} [Content truncated due to size - showing first {} characters]", 
+                    &combined[0..max_final_prompt_size], max_final_prompt_size)
+        } else {
+            combined
+        };
         
         let final_user_prompt = format!(
             "Create a comprehensive, well-structured summary of this {} from {}. Use the following detailed chunk summaries to build a complete overview that covers all major topics, key points, and important information:\n\n{}\n\nPlease organize the summary with clear sections and highlight the most important takeaways.",
             if is_youtube { "YouTube video" } else { "webpage" },
-            url, combined
+            url, final_content
         );
         
         debug!("📝 === FINAL RAG PROMPT CREATION ===");
@@ -1832,7 +2831,7 @@ async fn stream_summary(
         
         request_payload = serde_json::json!(
             {
-                "model": config.default_reason_model,
+                "model": selected_model,
                 "messages": final_messages,
                 "temperature": config.default_temperature,
                 "max_tokens": config.default_max_tokens,
@@ -1867,7 +2866,7 @@ async fn stream_summary(
         
         request_payload = serde_json::json!(
             {
-                "model": config.default_reason_model,
+                "model": selected_model,
                 "messages": messages,
                 "temperature": config.default_temperature,
                 "max_tokens": config.default_max_tokens,
@@ -1876,18 +2875,22 @@ async fn stream_summary(
         );
     }
     
-    // Create reqwest client
-    debug!("🔧 === HTTP CLIENT CREATION ===");
-    debug!("🔧 Creating HTTP client for streaming request...");
-    trace!("🔍 HTTP client creation started: stream_uuid={}", stream_uuid);
+    // Use shared HTTP client with optimal settings
+    debug!("🔧 === HTTP CLIENT SETUP ===");
+    debug!("🔧 Using shared HTTP client for streaming request...");
+    trace!("🔍 HTTP client setup started: stream_uuid={}", stream_uuid);
     
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(60))
-        .build()?;
+    // Calculate appropriate timeout for content complexity
+    let timeout_seconds = 300; // 5 minutes for all content types
     
-    debug!("✅ HTTP client created successfully");
-    debug!("🔧 Timeout: 60 seconds");
-    trace!("🔍 HTTP client created: timeout=60s, stream_uuid={}", stream_uuid);
+    let client = get_http_client().await;
+    
+    debug!("✅ Shared HTTP client obtained successfully");
+    debug!("🔧 Using optimized timeout: {} seconds", timeout_seconds);
+    debug!("🔧 Content length: {} characters", content_to_process.len());
+    debug!("🔧 Video type: {}", if is_youtube { "YouTube" } else { "Webpage" });
+    debug!("🔧 Connection pooling and SSL bypass enabled");
+    trace!("🔍 HTTP client obtained: timeout={}s, content_length={}, stream_uuid={}", timeout_seconds, content_to_process.len(), stream_uuid);
     
     // Send streaming request
     let api_url = format!("{}/v1/chat/completions", config.base_url);
@@ -1896,7 +2899,7 @@ async fn stream_summary(
     debug!("🚀 === STREAMING REQUEST PREPARATION ===");
     debug!("🚀 API URL: {}", api_url);
     debug!("🚀 Payload size: {} bytes", payload_size);
-    debug!("🚀 Model: {}", config.default_reason_model);
+    debug!("🚀 Model: {}", selected_model);
     debug!("🚀 Temperature: {}", config.default_temperature);
     debug!("🚀 Max tokens: {}", config.default_max_tokens);
     debug!("🚀 Streaming: true");
@@ -1905,11 +2908,36 @@ async fn stream_summary(
     debug!("🚀 Sending streaming request to LLM...");
     trace!("🔍 Streaming request started: stream_uuid={}", stream_uuid);
     
-    let mut response = client
+    let mut response = match client
         .post(&api_url)
         .json(&request_payload)
+        .timeout(Duration::from_secs(timeout_seconds))
         .send()
-        .await?;
+        .await {
+            Ok(resp) => resp,
+            Err(e) => {
+                error!("❌ === HTTP REQUEST ERROR ===");
+                error!("❌ Failed to send HTTP request: {}", e);
+                
+                let error_msg = format!("{}", e);
+                let error_message = if e.is_timeout() {
+                    format!("⏰ **Request Timeout**\n\nThe request to LM Studio timed out after {} seconds.\n\n**Solutions:**\n• **Reduce Content**: Try a shorter video/webpage\n• **Check LM Studio**: Ensure LM Studio is running and responsive\n• **Model Performance**: Consider using a faster model\n• **System Resources**: Check if your system has enough RAM/CPU\n\n**Current Setup:**\n• LM Studio URL: `{}`\n• Model: `{}`\n• Content Length: {} characters\n\n*Source: <{}>*", 
+                            timeout_seconds, config.base_url, selected_model, content_to_process.len(), url)
+                } else if e.is_connect() {
+                                          format!("🚫 **Connection Error**\n\nCannot connect to LM Studio at `{}`.\n\n**Solutions:**\n• **Start LM Studio**: Ensure LM Studio is running\n• **Load Model**: Load model `{}` in LM Studio\n• **Enable Server**: Click 'Start Server' in LM Studio\n• **Check Configuration**: Verify URL in lmapiconf.txt\n• **Firewall**: Check Windows Defender/firewall settings\n• **Try localhost**: Use `http://127.0.0.1:1234` instead of localhost\n\n*Source: <{}>*", 
+                            config.base_url, selected_model, url)
+                } else if error_msg.contains("os error 10013") {
+                    format!("🚫 **Windows Permission Error (10013)**\n\nNetwork access denied by Windows.\n\n**Quick Fixes:**\n• **Run as Administrator**: Right-click and 'Run as administrator'\n• **Windows Firewall**: Add firewall exception for this program\n• **Use IP Address**: Try `http://127.0.0.1:1234` in lmapiconf.txt\n\n**Current URL:** `{}`\n*Source: <{}>*", 
+                            config.base_url, url)
+                } else {
+                    format!("🔗 **Network Error**\n\nUnexpected network error occurred.\n\n**Error:** {}\n\n**Solutions:**\n• **Check Connection**: Verify your internet connection\n• **Restart LM Studio**: Try restarting LM Studio\n• **Check Configuration**: Verify settings in lmapiconf.txt\n• **Try Again**: Network issues are often temporary\n\n**Current Setup:**\n• LM Studio URL: `{}`\n• Model: `{}`\n\n*Source: <{}>*", 
+                            e, config.base_url, selected_model, url)
+                };
+                
+                msg.edit(ctx, |m| m.content(&error_message)).await?;
+                return Ok(());
+            }
+        };
     
     debug!("📡 === STREAMING RESPONSE RECEIVED ===");
     debug!("📡 HTTP Response Status: {}", response.status());
@@ -1945,7 +2973,21 @@ async fn stream_summary(
     debug!("📊 Initial chunk count: {}", chunk_count);
     trace!("🔍 Streaming started: start_time={:?}, stream_uuid={}", start_time, stream_uuid);
     
-    while let Some(chunk) = response.chunk().await? {
+    while let Some(chunk) = match response.chunk().await {
+        Ok(chunk_opt) => chunk_opt,
+        Err(e) => {
+            error!("❌ === STREAMING CHUNK ERROR ===");
+            error!("❌ Failed to read streaming chunk: {}", e);
+            
+            let error_message = format!(
+                "❌ **Streaming Error**\n\nFailed to read streaming response: {}\n\n**Solutions:**\n• Try again with a shorter video/webpage\n• Check your internet connection\n• Verify AI model is stable\n\n*Source: <{}>*", 
+                e, url
+            );
+            
+            msg.edit(ctx, |m| m.content(&error_message)).await?;
+            return Ok(());
+        }
+    } {
         chunk_count += 1;
         debug!("📡 === CHUNK {} RECEIVED ===", chunk_count);
         debug!("📡 Received chunk {}: {} bytes", chunk_count, chunk.len());
@@ -2057,14 +3099,14 @@ async fn stream_summary(
     
     if stripped.contains("Search functionality is not available") || stripped.contains("fallback") {
         warn!("⚠️ === FALLBACK MESSAGE DETECTED ===");
-        warn!("⚠️ Model {} returned fallback message, indicating it's not suitable for summarization", config.default_reason_model);
+        warn!("⚠️ Model {} returned fallback message, indicating it's not suitable for summarization", selected_model);
         debug!("🔍 Final response contains fallback message: {}", stripped);
-        trace!("🔍 Fallback message detected: model={}, stream_uuid={}", config.default_reason_model, stream_uuid);
+        trace!("🔍 Fallback message detected: model={}, stream_uuid={}", selected_model, stream_uuid);
         
         // Provide a user-friendly error message
         let error_message = format!(
-            "❌ **Summarization Failed**\n\n**Issue:** The AI model `{}` appears to be a search/retrieval model, not suitable for content summarization.\n\n**Solution:** Please update your `lmapiconf.txt` to use a chat/completion model instead of a search model.\n\n**Recommended models:**\n• `llama3.2:3b`\n• `llama3.2:7b`\n• `qwen2.5:4b`\n• `qwen2.5:7b`\n• `mistral:7b`\n\n*Source: <{}>*",
-            config.default_reason_model, url
+            "❌ **Summarization Failed**\n\n**Issue:** The AI model `{}` appears to be unsuitable for content summarization.\n\n**Solution:** This may indicate:\n• **Model Type**: Model may need different prompting strategies\n• **Content Complexity**: Try shorter content or different approach\n• **Model Configuration**: Verify model is properly loaded in LM Studio\n\n**Alternative:** Try using a different model configured for summarization.\n\n*Source: <{}>*",
+            selected_model, url
         );
         
         debug!("📝 === FALLBACK ERROR MESSAGE ===");
@@ -2340,5 +3382,105 @@ This is a test"#;
         assert!(!cleaned.contains("<style>"));
         assert!(!cleaned.contains("<html>"));
         assert!(!cleaned.contains("<b>"));
+    }
+    
+    #[test]
+    fn test_lm_config_structure() {
+        // Test that the LMConfig structure can be created and has all expected fields
+        let config = LMConfig {
+            base_url: "http://localhost:1234".to_string(),
+            timeout: 60,
+            default_model: "test-model".to_string(),
+            default_reason_model: "test-reason-model".to_string(),
+            default_summarization_model: "test-sum-model".to_string(),
+            default_ranking_model: "test-rank-model".to_string(),
+            default_temperature: 0.7,
+            default_max_tokens: 2000,
+            max_discord_message_length: 2000,
+            response_format_padding: 100,
+            default_vision_model: "test-vision-model".to_string(),
+            default_seed: Some(42),
+        };
+        
+        assert_eq!(config.base_url, "http://localhost:1234");
+        assert_eq!(config.timeout, 60);
+        assert_eq!(config.default_model, "test-model");
+        assert_eq!(config.default_summarization_model, "test-sum-model");
+        assert_eq!(config.default_temperature, 0.7);
+        assert_eq!(config.default_max_tokens, 2000);
+        assert_eq!(config.default_seed, Some(42));
+    }
+    
+    #[test]
+    fn test_chat_message_structure() {
+        // Test that the ChatMessage structure can be created and serialized
+        let message = ChatMessage {
+            role: "user".to_string(),
+            content: "Hello, world!".to_string(),
+        };
+        
+        assert_eq!(message.role, "user");
+        assert_eq!(message.content, "Hello, world!");
+        
+        // Test serialization
+        let json = serde_json::to_string(&message).unwrap();
+        assert!(json.contains("user"));
+        assert!(json.contains("Hello, world!"));
+        
+        // Test deserialization
+        let deserialized: ChatMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.role, "user");
+        assert_eq!(deserialized.content, "Hello, world!");
+    }
+    
+    #[test]
+    fn test_split_message_functionality() {
+        // Test the message splitting functionality with multi-line content
+        // The split_message function splits by lines, not character count
+        let lines = vec![
+            "This is line 1 with some text that makes it moderately long to test splitting.",
+            "This is line 2 with additional content that should also be quite lengthy.",
+            "This is line 3 with even more text to ensure we exceed the character limit.",
+            "This is line 4 which continues to add content for comprehensive testing.",
+            "This is line 5 that should definitely push us over the max_len limit.",
+            "This is line 6 with final content to ensure proper multi-chunk splitting.",
+            "This is line 7 with additional verification content for thorough testing.",
+            "This is line 8 providing the last bit of content for split verification."
+        ];
+        let long_content = lines.join("\n");
+        let max_len = 200; // Small limit to force splitting
+        
+        // Verify the content is actually long enough to require splitting
+        assert!(long_content.len() > max_len, "Test content should be longer than max_len for proper testing");
+        
+        let chunks = split_message(&long_content, max_len);
+        
+        // Should create multiple chunks since we have multiple lines that exceed the limit
+        assert!(chunks.len() > 1, "Content of {} chars with {} lines should split with max_len {}", 
+                long_content.len(), lines.len(), max_len);
+        
+        // Each chunk should be within the limit (except possibly the last one with remaining content)
+        for (i, chunk) in chunks.iter().enumerate() {
+            if i < chunks.len() - 1 {
+                assert!(chunk.len() <= max_len, "Chunk {} exceeds max length: {} > {}", i, chunk.len(), max_len);
+            }
+        }
+        
+        // All chunks combined should contain the original content (minus whitespace differences)
+        let combined = chunks.join("\n");
+        let original_words: Vec<&str> = long_content.split_whitespace().collect();
+        let combined_words: Vec<&str> = combined.split_whitespace().collect();
+        assert_eq!(original_words.len(), combined_words.len());
+        
+        // Test with very short content that shouldn't be split
+        let short_content = "Short message";
+        let short_chunks = split_message(short_content, max_len);
+        assert_eq!(short_chunks.len(), 1, "Short content should not be split");
+        assert_eq!(short_chunks[0], short_content);
+        
+        // Test with single long line (should not be split since split_message works by lines)
+        let single_long_line = "This is a very long single line that exceeds the max_len but has no line breaks so it cannot be split by the line-based splitting algorithm.".repeat(5);
+        let single_line_chunks = split_message(&single_long_line, max_len);
+        assert_eq!(single_line_chunks.len(), 1, "Single long line should not be split");
     }
 } 

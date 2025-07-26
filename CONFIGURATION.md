@@ -14,13 +14,13 @@ This guide explains all configuration files used by Meri Bot Rust, their purpose
 ```txt
 DISCORD_TOKEN=your_actual_discord_token_here
 PREFIX=^
-RUST_LOG=trace
+RUST_LOG=info
 ```
 
 **Settings**:
 - `DISCORD_TOKEN`: Your Discord bot token (required)
 - `PREFIX`: Command prefix (default: `^`)
-- `RUST_LOG`: Logging level (recommended: `trace`)
+- `RUST_LOG`: Logging level (recommended: `info`, use `trace` for debugging)
 
 ### `lmapiconf.txt` - AI Model Configuration
 **Purpose**: LM Studio/Ollama API settings
@@ -29,7 +29,7 @@ RUST_LOG=trace
 
 ```txt
 LM_STUDIO_BASE_URL=http://127.0.0.1:11434
-LM_STUDIO_TIMEOUT=30
+LM_STUDIO_TIMEOUT=300
 DEFAULT_MODEL=your-chat-model-name
 DEFAULT_REASON_MODEL=qwen2.5:4b
 DEFAULT_TEMPERATURE=0.8
@@ -40,11 +40,12 @@ RESPONSE_FORMAT_PADDING=50
 
 **Settings**:
 - `LM_STUDIO_BASE_URL`: AI server URL (Ollama: `http://127.0.0.1:11434`)
-- `LM_STUDIO_TIMEOUT`: Request timeout in seconds
+- `LM_STUDIO_TIMEOUT`: Request timeout in seconds (recommended: 300 for complex reasoning)
 - `DEFAULT_MODEL`: Your chat model name
 - `DEFAULT_REASON_MODEL`: Reasoning model name
 - `DEFAULT_TEMPERATURE`: AI creativity (0.0-1.0)
 - `DEFAULT_MAX_TOKENS`: Maximum response length
+- `DEFAULT_SEED`: Optional seed for reproducible responses (leave empty for random)
 - `MAX_DISCORD_MESSAGE_LENGTH`: Discord message limit
 - `RESPONSE_FORMAT_PADDING`: Buffer for formatting
 

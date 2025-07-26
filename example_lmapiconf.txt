@@ -6,22 +6,43 @@
 # LM Studio: http://localhost:1234
 # Ollama: http://localhost:11434 or http://127.0.0.1:11434
 # Remote server example: http://192.168.0.87:11434
-LM_STUDIO_BASE_URL=http://127.0.0.1:11434
+LM_STUDIO_BASE_URL=http://192.168.0.87:11434
 LM_STUDIO_TIMEOUT=30
 
 # Model configuration
 # Replace with your actual model name from LM Studio/Ollama
 # Examples: llama3.1:8b, codellama:13b, mistral:7b, qwen:7b
-DEFAULT_MODEL=your-chat-model-name
+DEFAULT_MODEL=qwen/qwen3-4b
 
 # Reasoning model configuration (for ^reason command)
 # Use a model specifically designed for reasoning tasks
 # Examples: qwen2.5:4b, qwen2.5:7b, llama3.1:8b-reasoning
 DEFAULT_REASON_MODEL=qwen/qwen3-4b
 
+# Summarization model configuration (for ^sum command)
+# Use a model specifically designed for summarization tasks
+# Examples: qwen/qwen3-1.7b, llama3.2:3b, mistral:7b
+DEFAULT_SUMMARIZATION_MODEL=qwen/qwen3-1.7b
+
+# Ranking model configuration (for ^rank and ^sum commands)
+# Use a model specifically designed for ranking and analysis tasks
+# Examples: qwen3-reranker-4b, qwen/qwen3-4b, llama3.2:7b, mistral:7b
+DEFAULT_RANKING_MODEL=qwen3-reranker-4b
+
+# Vision model configuration (for ^vis command)
+# Use a model specifically designed for vision tasks
+# Examples: llava:7b, llava:13b, qwen-vl:7b
+DEFAULT_VISION_MODEL=llava:7b
+
 # Chat completion parameters
 DEFAULT_TEMPERATURE=0.8
-DEFAULT_MAX_TOKENS=8192
+DEFAULT_MAX_TOKENS=24000
+
+# Optional: Seed for reproducible responses (leave empty for random)
+# Setting a seed will make the AI give the same response for the same input
+# Useful for testing, debugging, or when you want consistent outputs
+# Example: DEFAULT_SEED=42
+DEFAULT_SEED=64
 
 # Discord integration settings
 MAX_DISCORD_MESSAGE_LENGTH=2000

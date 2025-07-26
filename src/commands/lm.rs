@@ -88,6 +88,8 @@ pub struct ChatRequest {
     pub temperature: f32,                     // Sampling temperature
     pub max_tokens: i32,                      // Max tokens to generate
     pub stream: bool,                         // Whether to stream output
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seed: Option<i64>,                    // Optional seed for reproducible responses
 }
 
 #[derive(Deserialize)]
@@ -347,9 +349,9 @@ pub async fn handle_lm_request_global(
     println!("[DEBUG][HANDLE_LM_GLOBAL] === SENDING INITIAL MESSAGE ===");
     let mut initial_msg = msg.channel_id.send_message(&ctx.http, |m| {
         let content = if !processed_documents.is_empty() {
-            format!("**AI Response (Global Context - Document Analysis - Part 1):**\n```\n\n```")
+            format!("**Document Analysis (Part 1):**\n```\n\n```")
         } else {
-            "**AI Response (Global Context - Part 1):**\n```\n\n```".to_string()
+            "**Part 1:**\n```\n\n```".to_string()
         };
         m.content(content)
     }).await?;
@@ -811,9 +813,9 @@ pub async fn handle_lm_request(
     println!("[DEBUG][HANDLE_LM] === SENDING INITIAL MESSAGE ===");
     let mut initial_msg = msg.channel_id.send_message(&ctx.http, |m| {
         let content = if !processed_documents.is_empty() {
-            format!("**AI Response (Document Analysis - Part 1):**\n```\n\n```")
+            format!("**Document Analysis (Part 1):**\n```\nThinking...\n```")
         } else {
-            "**AI Response (Part 1):**\n```\n\n```".to_string()
+            "**Part 1:**\n```\nThinking...\n```".to_string()
         };
         m.content(content)
     }).await?;
@@ -865,6 +867,138 @@ pub async fn handle_lm_request(
     Ok(())
 }
 
+/// Handle LM request with a specific seed for reproducible responses
+/// This is similar to handle_lm_request but uses a specific seed value
+pub async fn handle_lm_request_with_seed(
+    ctx: &Context,
+    msg: &Message,
+    input: &str,
+    original_prompt: Option<&str>,
+    seed: i64,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    println!("[DEBUG][HANDLE_LM_SEED] === STARTING LM REQUEST WITH SEED ===");
+    println!("[DEBUG][HANDLE_LM_SEED] User: {} (ID: {})", msg.author.name, msg.author.id);
+    println!("[DEBUG][HANDLE_LM_SEED] Input received: '{}'", input);
+    println!("[DEBUG][HANDLE_LM_SEED] Seed: {}", seed);
+    if let Some(orig) = original_prompt {
+        println!("[DEBUG][HANDLE_LM_SEED] Original prompt: '{}'", orig);
+    } else {
+        println!("[DEBUG][HANDLE_LM_SEED] No original prompt provided");
+    }
+    println!("[DEBUG][HANDLE_LM_SEED] Message attachments: {}", msg.attachments.len());
+    println!("[DEBUG][HANDLE_LM_SEED] Has referenced message: {}", msg.referenced_message.is_some());
+    
+    // Resolve user IDs to usernames in the input
+    let processed_input = resolve_user_mentions(ctx, input).await;
+    println!("[DEBUG][HANDLE_LM_SEED] Processed input with resolved mentions: '{}'", processed_input);
+    
+    // Check if this is a vision request (seeds don't apply to vision)
+    if processed_input.starts_with("-v") || processed_input.starts_with("--vision") {
+        println!("[DEBUG][HANDLE_LM_SEED] Vision request detected - seeds don't apply to vision analysis");
+        msg.reply(ctx, "**Seed not supported for vision analysis!**\n\nVision analysis uses deterministic image processing and doesn't support seeds. Use `^lm -v <prompt>` for vision analysis.").await?;
+        return Ok(());
+    }
+    
+    // Regular LM handling with seed support
+    println!("[DEBUG][HANDLE_LM_SEED] === REGULAR LM REQUEST WITH SEED ===");
+    println!("[DEBUG][HANDLE_LM_SEED] Processing as regular LM request with seed: {}", seed);
+    
+    let prompt = processed_input.clone();
+    println!("[DEBUG][HANDLE_LM_SEED] Using processed prompt: '{}'", prompt);
+    
+    // Process attachments for RAG if any
+    println!("[DEBUG][HANDLE_LM_SEED] === RAG ATTACHMENT PROCESSING ===");
+    let mut processed_documents = Vec::new();
+    if !msg.attachments.is_empty() {
+        println!("[DEBUG][HANDLE_LM_SEED] Found {} attachments, processing for document analysis", msg.attachments.len());
+        
+        match process_attachments(&msg.attachments, ctx).await {
+            Ok(docs) => {
+                processed_documents = docs;
+                println!("[DEBUG][HANDLE_LM_SEED] Successfully processed {} documents", processed_documents.len());
+                for (i, doc) in processed_documents.iter().enumerate() {
+                    println!("[DEBUG][HANDLE_LM_SEED] Document {}: {} ({} chars, type: {})", 
+                        i + 1, doc.filename, doc.content.len(), doc.content_type);
+                }
+            }
+            Err(e) => {
+                eprintln!("[DEBUG][HANDLE_LM_SEED] Failed to process attachments: {}", e);
+                msg.reply(ctx, &format!("⚠️ Failed to process some attachments: {}\n\nContinuing with text-only analysis.", e)).await?;
+            }
+        }
+    } else {
+        println!("[DEBUG][HANDLE_LM_SEED] No attachments found for RAG processing");
+    }
+    
+    // Create RAG-enhanced prompt if documents were processed
+    println!("[DEBUG][HANDLE_LM_SEED] === PROMPT ENHANCEMENT ===");
+    let final_prompt = if !processed_documents.is_empty() {
+        let enhanced = create_rag_prompt(&prompt, &processed_documents);
+        println!("[DEBUG][HANDLE_LM_SEED] Created RAG-enhanced prompt ({} chars)", enhanced.len());
+        enhanced
+    } else {
+        println!("[DEBUG][HANDLE_LM_SEED] Using original prompt (no RAG enhancement)");
+        prompt.to_string()
+    };
+
+    // Note: We don't record seed requests in context history to avoid confusion
+    // Seed requests are meant for reproducible testing, not conversation flow
+    println!("[DEBUG][HANDLE_LM_SEED] === SKIPPING CONTEXT RECORDING (SEED REQUEST) ===");
+    println!("[DEBUG][HANDLE_LM_SEED] Seed requests are not recorded in conversation history");
+
+    println!("[DEBUG][HANDLE_LM_SEED] === CONFIGURATION LOADING ===");
+    let mut config = crate::commands::search::load_lm_config().await?;
+    config.default_seed = Some(seed); // Override with the specified seed
+    println!("[DEBUG][HANDLE_LM_SEED] Loaded LM config - Model: {}, URL: {}, Seed: {}", 
+        config.default_model, config.base_url, seed);
+    
+    let base_system_prompt = load_system_prompt().await?;
+    println!("[DEBUG][HANDLE_LM_SEED] Loaded system prompt ({} chars)", base_system_prompt.len());
+    
+    println!("[DEBUG][HANDLE_LM_SEED] === MESSAGE BUILDING ===");
+    let mut messages = Vec::new();
+    messages.push(ChatMessage { role: "system".to_string(), content: base_system_prompt });
+    println!("[DEBUG][HANDLE_LM_SEED] Added system message");
+    
+    // For seed requests, we don't include conversation history to ensure reproducibility
+    println!("[DEBUG][HANDLE_LM_SEED] Skipping conversation history for seed request");
+    
+    messages.push(ChatMessage { role: "user".to_string(), content: final_prompt.clone() });
+    println!("[DEBUG][HANDLE_LM_SEED] Added final user message: {} chars", final_prompt.len());
+    
+    let multimodal_messages = convert_to_multimodal(messages);
+    println!("[DEBUG][HANDLE_LM_SEED] Converted to {} multimodal messages", multimodal_messages.len());
+    
+    // Log which model is being used for LM command
+    println!("[DEBUG][HANDLE_LM_SEED] === API PREPARATION ===");
+    println!("[DEBUG][HANDLE_LM_SEED] Using model '{}' for chat with seed {}", config.default_model, seed);
+    if !processed_documents.is_empty() {
+        println!("[DEBUG][HANDLE_LM_SEED] Using document-enhanced prompt with {} documents", processed_documents.len());
+    }
+    
+    println!("[DEBUG][HANDLE_LM_SEED] === SENDING INITIAL MESSAGE ===");
+    let mut initial_msg = msg.channel_id.send_message(&ctx.http, |m| {
+        let content = if !processed_documents.is_empty() {
+            format!("**Document Analysis (Seed: {} - Part 1):**\n```\nThinking...\n```", seed)
+        } else {
+            format!("**Seed: {} - Part 1:**\n```\nThinking...\n```", seed)
+        };
+        m.content(content)
+    }).await?;
+    println!("[DEBUG][HANDLE_LM_SEED] Initial Discord message sent successfully");
+    
+    println!("[DEBUG][HANDLE_LM_SEED] === STARTING STREAMING ===");
+    let _stats = stream_chat_response(multimodal_messages, &config.default_model, &config, ctx, &mut initial_msg).await?;
+    println!("[DEBUG][HANDLE_LM_SEED] Streaming completed successfully");
+    
+    // Note: We don't record seed responses in history
+    println!("[DEBUG][HANDLE_LM_SEED] === SKIPPING RESPONSE RECORDING (SEED REQUEST) ===");
+    println!("[DEBUG][HANDLE_LM_SEED] Seed responses are not recorded in conversation history");
+    
+    println!("[DEBUG][HANDLE_LM_SEED] === LM REQUEST WITH SEED COMPLETED ===");
+    Ok(())
+}
+
 #[command]
 #[aliases("llm", "ai", "chat")]
 /// Main ^lm command handler
@@ -875,6 +1009,7 @@ pub async fn handle_lm_request(
 ///   - ^lm -s <query> (AI-enhanced search)
 ///   - ^lm --test (API connectivity test)
 ///   - ^lm --clear (clear context)
+///   - ^lm --seed <number> <prompt> (reproducible responses)
 pub async fn lm(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
     println!("[DEBUG][LM] === LM COMMAND STARTED ===");
     println!("[DEBUG][LM] User: {} (ID: {})", msg.author.name, msg.author.id);
@@ -883,9 +1018,7 @@ pub async fn lm(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
     let mut input = args.message().trim().to_string();
     println!("[DEBUG][LM] Raw input: '{}'", input);
     
-    // Start typing indicator
-    println!("[DEBUG][LM] Starting typing indicator");
-    let _typing = ctx.http.start_typing(msg.channel_id.0)?;
+
     
     // IMPORTANT: Check for vision flag BEFORE processing reply logic
     // This ensures we detect -v flag even in replies
@@ -1027,10 +1160,11 @@ pub async fn lm(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
         // Perform connectivity test
         println!("[DEBUG][LM] Starting connectivity test");
         match crate::commands::search::test_api_connectivity(&config).await {
-            Ok(success_message) => {
+            Ok(()) => {
                 println!("[DEBUG][LM] Connectivity test successful");
-                let final_message = format!("**Connectivity Test Results**\n\n{:?}\n\n**Configuration:**\n- Base URL: {}\n- Default Model: {}\n- Default Reason Model: {}\n- Default Ranking Model: {}\n- Timeout: {}s\n- Max Tokens: {}\n- Temperature: {}\n- Vision Model: {}\n",
-                    success_message, config.base_url, config.default_model, config.default_reason_model, config.default_ranking_model, config.timeout, config.default_max_tokens, config.default_temperature, config.default_vision_model
+                
+                let final_message = format!("**Connectivity Test Results**\n\n✅ Successfully connected to LM Studio\n\n**Configuration:**\n- Base URL: {}\n- Default Model: {}\n- Default Reason Model: {}\n- Default Summarization Model: {}\n- Default Ranking Model: {}\n- Timeout: {}s\n- Max Tokens: {}\n- Temperature: {}\n- Vision Model: {}\n",
+                    config.base_url, config.default_model, config.default_reason_model, config.default_summarization_model, config.default_ranking_model, config.timeout, config.default_max_tokens, config.default_temperature, config.default_vision_model
                 );
                 
                 if let Err(e) = test_msg.edit(&ctx.http, |m| {
@@ -1093,6 +1227,57 @@ pub async fn lm(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
             println!("[DEBUG][LM] No context to clear");
             msg.reply(ctx, "**No LM Context Found** ℹ️\nYou don't have any active conversation history to clear.").await?;
         }
+        return Ok(());
+    }
+
+    // Check if this is a seed request
+    if input.starts_with("--seed ") {
+        println!("[DEBUG][LM] === SEED REQUEST DETECTED ===");
+        
+        // Parse seed value and prompt
+        let after_seed = &input[7..]; // "--seed "
+        let parts: Vec<&str> = after_seed.splitn(2, ' ').collect();
+        
+        if parts.len() != 2 {
+            println!("[DEBUG][LM] Invalid seed format, sending usage message");
+            msg.reply(ctx, "**Invalid seed format!**\n\nUsage: `^lm --seed <number> <prompt>`\n\nExample: `^lm --seed 42 What is the meaning of life?`\n\nThis will use the specified seed for reproducible responses.").await?;
+            return Ok(());
+        }
+        
+        let seed_str = parts[0];
+        let seed_prompt = parts[1];
+        
+        // Parse seed value
+        let seed = match seed_str.parse::<i64>() {
+            Ok(s) => {
+                if s < 0 {
+                    println!("[DEBUG][LM] Negative seed value provided");
+                    msg.reply(ctx, "**Invalid seed value!**\n\nSeed must be a non-negative integer.\n\nUsage: `^lm --seed <number> <prompt>`").await?;
+                    return Ok(());
+                }
+                s
+            },
+            Err(_) => {
+                println!("[DEBUG][LM] Invalid seed value format");
+                msg.reply(ctx, "**Invalid seed value!**\n\nSeed must be a valid integer.\n\nUsage: `^lm --seed <number> <prompt>`").await?;
+                return Ok(());
+            }
+        };
+        
+        println!("[DEBUG][LM] Using seed: {} for prompt: '{}'", seed, seed_prompt);
+        
+        // Create a temporary config with the specified seed
+        let mut config = crate::commands::search::load_lm_config().await?;
+        config.default_seed = Some(seed);
+        
+        // Process the seed prompt through the regular LM flow
+        if let Err(e) = handle_lm_request_with_seed(ctx, msg, seed_prompt, Some(seed_prompt), seed).await {
+            eprintln!("[DEBUG][LM] handle_lm_request_with_seed failed: {}", e);
+            msg.reply(ctx, format!("LM error: {}", e)).await?;
+        } else {
+            println!("[DEBUG][LM] handle_lm_request_with_seed completed successfully");
+        }
+        
         return Ok(());
     }
 
@@ -1226,6 +1411,9 @@ pub async fn lm(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
     }
 
     println!("[DEBUG][LM] === LM COMMAND COMPLETED ===");
+    
+
+    
     Ok(())
 }
 
@@ -1253,17 +1441,18 @@ pub async fn clearcontext(ctx: &Context, msg: &Message, _args: Args) -> CommandR
     
     if had_context {
         // Save the cleared context state to disk immediately
-        {
-            let data = ctx.data.read().await;
-            let lm_contexts = data.get::<crate::LmContextMap>().cloned().unwrap_or_default();
-            let reason_contexts = data.get::<crate::ReasonContextMap>().cloned().unwrap_or_default();
-            let global_lm_context = data.get::<crate::GlobalLmContextMap>().cloned().unwrap_or_else(|| crate::UserContext::new());
-            
-            if let Err(e) = crate::save_contexts_to_disk(&lm_contexts, &reason_contexts, &global_lm_context).await {
-                eprintln!("Failed to save cleared context to disk: {}", e);
-            } else {
-                println!("[clearcontext] Cleared context state saved to disk");
-            }
+        // We need to clone the data before releasing the write lock to avoid deadlock
+        let lm_contexts = lm_map.clone();
+        let reason_contexts = data_map.get::<crate::ReasonContextMap>().cloned().unwrap_or_default();
+        let global_lm_context = data_map.get::<crate::GlobalLmContextMap>().cloned().unwrap_or_else(|| crate::UserContext::new());
+        
+        // Release the write lock before saving to disk
+        drop(data_map);
+        
+        if let Err(e) = crate::save_contexts_to_disk(&lm_contexts, &reason_contexts, &global_lm_context).await {
+            eprintln!("Failed to save cleared context to disk: {}", e);
+        } else {
+            println!("[clearcontext] Cleared context state saved to disk");
         }
         
         msg.reply(ctx, "**LM Chat Context Cleared** ✅\nYour conversation history with the AI has been fully reset and saved. The next message you send will start a brand new context.").await?;
@@ -1469,6 +1658,7 @@ pub async fn stream_chat_response(
         temperature: config.default_temperature,
         max_tokens: config.default_max_tokens,
         stream: true,
+        seed: config.default_seed,
     };
     println!("[DEBUG][STREAMING] Chat request created - Temperature: {}, Max tokens: {}, Stream: {}", 
         chat_request.temperature, chat_request.max_tokens, chat_request.stream);
@@ -1762,7 +1952,7 @@ pub async fn update_chat_message(
     println!("[DEBUG][UPDATE] State content after adding: '{}' ({} chars)", state.current_content, state.current_content.len());
     
     // Then create the formatted content for Discord
-    let potential_content = format!("**AI Response (Part {}):**\n```\n{}\n```", 
+            let potential_content = format!("**Part {}:**\n```\n{}\n```", 
         state.message_index, state.current_content);
     
     println!("[DEBUG][UPDATE] Formatted content for Discord: '{}' ({} chars)", potential_content, potential_content.len());
@@ -1773,7 +1963,7 @@ pub async fn update_chat_message(
             potential_content.len(), state.char_limit);
         
         // Finalize current message
-        let final_content = format!("**AI Response (Part {}):**\n```\n{}\n```", 
+        let final_content = format!("**Part {}:**\n```\n{}\n```", 
             state.message_index, state.current_content);
         let edit_result = state.current_message.edit(&ctx.http, |m| {
             m.content(final_content)
@@ -1788,7 +1978,7 @@ pub async fn update_chat_message(
         state.message_index += 1;
         // Reset current_content for the new message
         state.current_content = new_content.to_string();
-        let new_msg_content = format!("**AI Response (Part {}):**\n```\n{}\n```", 
+        let new_msg_content = format!("**Part {}:**\n```\n{}\n```", 
             state.message_index, state.current_content);
         let send_result = state.current_message.channel_id.send_message(&ctx.http, |m| {
             m.content(new_msg_content)
@@ -1853,9 +2043,9 @@ pub async fn finalize_chat_message(
     
     // Mark the final message as complete
     let final_display = if state.message_index == 1 {
-        format!("**AI Response Complete**\n```\n{}\n```", state.current_content)
+        format!("**Complete**\n```\n{}\n```", state.current_content)
     } else {
-        format!("**AI Response Complete (Part {}/{})**\n```\n{}\n```", 
+        format!("**Complete (Part {}/{})**\n```\n{}\n```", 
             state.message_index, state.message_index, state.current_content)
     };
 
@@ -1914,6 +2104,44 @@ mod tests {
         
         assert_eq!(system_message.role, "system");
         assert_eq!(user_message.role, "user");
+    }
+    
+    #[test]
+    fn test_seed_functionality() {
+        // Test that ChatRequest can be created with and without seeds
+        let messages = vec![
+            MultimodalChatMessage {
+                role: "user".to_string(),
+                content: vec![MessageContent::Text {
+                    content_type: "text".to_string(),
+                    text: "Hello".to_string(),
+                }],
+            }
+        ];
+        
+        // Test without seed
+        let request_without_seed = ChatRequest {
+            model: "test-model".to_string(),
+            messages: messages.clone(),
+            temperature: 0.8,
+            max_tokens: 100,
+            stream: true,
+            seed: None,
+        };
+        
+        // Test with seed
+        let request_with_seed = ChatRequest {
+            model: "test-model".to_string(),
+            messages,
+            temperature: 0.8,
+            max_tokens: 100,
+            stream: true,
+            seed: Some(42),
+        };
+        
+        assert_eq!(request_without_seed.seed, None);
+        assert_eq!(request_with_seed.seed, Some(42));
+        assert_eq!(request_with_seed.model, "test-model");
     }
     
     #[tokio::test]
