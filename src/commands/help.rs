@@ -3,7 +3,7 @@
 
 use serenity::{
     client::Context,
-    framework::standard::{macros::command, CommandResult},
+    framework::standard::{macros::command, macros::group, CommandResult},
     model::channel::Message,
 };
 
@@ -25,6 +25,8 @@ pub async fn help(ctx: &Context, msg: &Message) -> CommandResult {
 • `^lm -v <prompt>` - Vision analysis (attach image)
 • `^lm -s <query>` - AI-enhanced web search
 • `^lm --test` - Test API connectivity
+• `^lm --models` - List available models in LM Studio
+• `^lm --load-model` - Validate model configuration
 • `^lm --clear` - Clear your personal chat context
 • `^lm --clear-global` - Clear shared global context
 • `^clearcontext` - Clear your personal LM chat context
@@ -94,6 +96,8 @@ pub async fn lmhelp(ctx: &Context, msg: &Message) -> CommandResult {
 
 **⚙️ Utility Commands:**
 • `^lm --test` - Test API connectivity and configuration
+• `^lm --models` - List available models in LM Studio
+• `^lm --load-model` - Validate model configuration
 • `^lm --clear` - Clear your personal conversation history
 • `^lm --clear-global` - Clear shared conversation history
 • `^clearcontext` - Clear your personal LM chat context
@@ -161,4 +165,18 @@ pub async fn reasonhelp(ctx: &Context, msg: &Message) -> CommandResult {
 
     msg.reply(ctx, reason_help_text).await?;
     Ok(())
+}
+
+// ============================================================================
+// COMMAND GROUP
+// ============================================================================
+
+#[group]
+#[commands(help, lmhelp, reasonhelp)]
+pub struct Help;
+
+impl Help {
+    pub const fn new() -> Self {
+        Help
+    }
 } 

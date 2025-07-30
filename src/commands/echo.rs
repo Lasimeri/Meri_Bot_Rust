@@ -9,7 +9,7 @@
 
 use serenity::{
     client::Context,
-    framework::standard::{macros::command, Args, CommandResult},
+    framework::standard::{macros::command, macros::group, Args, CommandResult},
     model::channel::Message,
 };
 
@@ -29,4 +29,18 @@ pub async fn echo(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
         msg.reply(ctx, text).await?;
     }
     Ok(())
+}
+
+// ============================================================================
+// COMMAND GROUP
+// ============================================================================
+
+#[group]
+#[commands(echo)]
+pub struct Echo;
+
+impl Echo {
+    pub const fn new() -> Self {
+        Echo
+    }
 } 

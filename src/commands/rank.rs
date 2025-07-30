@@ -1,4 +1,4 @@
-// rank.rs - Content Ranking Command Module
+// rank.rs - Self-Contained Webpage and YouTube Ranking Command Module
 // This module implements the ^rank command, providing AI-powered content ranking and analysis for webpages and YouTube videos.
 // It supports robust content fetching, VTT/HTML cleaning, RAG chunking, and real-time streaming to Discord.
 //
@@ -10,190 +10,537 @@
 // - Real-time streaming of ranking analysis to Discord
 // - Multi-path config and prompt loading
 // - Robust error handling and logging
-// - Thinking tag filtering and buffered streaming (like reason.rs)
-// - MODULAR SYSTEM: Flag-based analysis types (usability, quality, accessibility, etc.)
+// - Self-contained with no external module dependencies
 //
-// Supported Flags:
-//   - ^rank <url> (default comprehensive analysis)
-//   - ^rank -usability <url> (usability-focused analysis)
-//   - ^rank -quality <url> (content quality analysis)
-//   - ^rank -accessibility <url> (accessibility analysis)
-//   - ^rank -seo <url> (SEO analysis)
-//   - ^rank -performance <url> (performance analysis)
-//   - ^rank -security <url> (security analysis)
-//   - ^rank -comprehensive <url> (comprehensive analysis)
-//
-// Used by: main.rs (command registration), search.rs (for config)
+// Self-contained includes:
+// - LM Studio configuration loading and management
+// - HTTP client setup with connection pooling
+// - Chat completion functionality with retry logic
+// - All necessary structures and functions from search.rs and reason.rs
 
 use serenity::{
     client::Context,
-    framework::standard::{macros::command, Args, CommandResult},
+    framework::standard::{macros::command, macros::group, Args, CommandResult},
     model::channel::Message,
 };
-use crate::commands::search::{LMConfig, ChatMessage};
-use reqwest;
 use std::time::Duration;
 use std::fs;
 use std::process::Command;
 use uuid::Uuid;
 use log::{info, warn, error, debug, trace};
 use serde::{Deserialize, Serialize};
-
-use futures_util::StreamExt;
 use regex::Regex;
-use once_cell::sync::Lazy;
-
-// Compile regex once for better performance - matches <think> tags
-// Used to filter out internal AI thoughts from streaming output
-static THINKING_TAG_REGEX: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?s)<think>.*?</think>").unwrap()
-});
+use std::time::Instant;
+use sha2::{Sha256, Digest};
+use std::collections::HashMap;
+use tokio::sync::OnceCell;
 
 // ============================================================================
-// MODULAR RANKING SYSTEM STRUCTURES
+// SELF-CONTAINED COMPONENTS FROM SEARCH.RS AND REASON.RS
 // ============================================================================
 
-/// Enumeration of available ranking analysis types
-#[derive(Debug, Clone, PartialEq)]
-pub enum RankingMode {
-    Comprehensive,  // Default comprehensive analysis
-    Usability,      // Usability-focused analysis
-    Quality,        // Content quality analysis
-    Accessibility,  // Accessibility analysis
-    SEO,           // SEO analysis
-    Performance,   // Performance analysis
-    Security,      // Security analysis
-    Educational,   // Educational value analysis
-    Entertainment, // Entertainment value analysis
-    Technical,     // Technical analysis
+// Global HTTP client for connection pooling and reuse
+static HTTP_CLIENT: OnceCell<reqwest::Client> = OnceCell::const_new();
+
+// Initialize shared HTTP client with optimized settings
+pub async fn get_http_client() -> &'static reqwest::Client {
+    HTTP_CLIENT.get_or_init(|| async {
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(120)) // Increased timeout for LM Studio
+            .connect_timeout(Duration::from_secs(30)) // Connection timeout
+            .pool_idle_timeout(Duration::from_secs(90)) // Keep connections alive
+            .pool_max_idle_per_host(10) // Connection pool size per host
+            .danger_accept_invalid_certs(true) // Accept self-signed certificates for local servers
+            .tcp_keepalive(Duration::from_secs(60)) // TCP keepalive
+            .http2_keep_alive_interval(Duration::from_secs(30)) // HTTP/2 keepalive
+            .http2_keep_alive_timeout(Duration::from_secs(10)) // HTTP/2 keepalive timeout
+            .http2_keep_alive_while_idle(true) // Keep HTTP/2 alive when idle
+            .user_agent("Meri-Bot-Rust-Client/1.0") // Identify the client
+            .build()
+            .expect("Failed to create HTTP client")
+    }).await
 }
 
-impl RankingMode {
-    /// Get the flag string for this mode
-    pub fn flag(&self) -> &'static str {
-        match self {
-            RankingMode::Comprehensive => "-comprehensive",
-            RankingMode::Usability => "-usability",
-            RankingMode::Quality => "-quality",
-            RankingMode::Accessibility => "-accessibility",
-            RankingMode::SEO => "-seo",
-            RankingMode::Performance => "-performance",
-            RankingMode::Security => "-security",
-            RankingMode::Educational => "-educational",
-            RankingMode::Entertainment => "-entertainment",
-            RankingMode::Technical => "-technical",
+// Chat message structure for context
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatMessage {
+    pub role: String,
+    pub content: String,
+}
+
+// LM configuration structure
+#[derive(Debug, Clone)]
+pub struct LMConfig {
+    pub base_url: String,
+    pub timeout: u64,
+    pub default_model: String,
+    pub default_reason_model: String,
+    pub default_summarization_model: String,
+    pub default_ranking_model: String,
+    pub default_temperature: f32,
+    pub default_max_tokens: i32,
+    pub max_discord_message_length: usize,
+    pub response_format_padding: usize,
+    pub default_vision_model: String,
+    pub default_seed: Option<i64>, // Optional seed for reproducible responses
+} 
+
+/// Enhanced connectivity test function
+pub async fn test_api_connectivity(config: &LMConfig) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let client = get_http_client().await;
+    
+    println!("[DEBUG][CONNECTIVITY] Testing API connectivity to: {}", config.base_url);
+    
+    // Test 1: Basic server connectivity
+    let basic_response = client
+        .get(&config.base_url)
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await;
+    
+    match basic_response {
+        Ok(response) => {
+            println!("[DEBUG][CONNECTIVITY] Basic connectivity OK - Status: {}", response.status());
+        }
+        Err(e) => {
+            let error_msg = format!("{}", e);
+            if error_msg.contains("os error 10013") || error_msg.contains("access permissions") {
+                return Err(format!(
+                    "🚫 **Windows Network Permission Error (10013)**\n\n\
+                    Cannot connect to LM Studio at `{}`\n\n\
+                    **Solutions:**\n\
+                    • **Add Firewall Exception**: Windows Defender Firewall → Allow an app → Add this program\n\
+                    • **Run as Administrator**: Try running the bot with administrator privileges\n\
+                    • **Check LM Studio**: Ensure LM Studio is running and accessible\n\
+                    • **Try localhost**: Use `http://127.0.0.1:1234` instead of `http://localhost:1234`\n\
+                    • **Check Port**: Verify no other application is using the port\n\n\
+                    **Original error:** {}", 
+                    config.base_url, e
+                ).into());
+            } else if error_msg.contains("timeout") || error_msg.contains("timed out") {
+                return Err(format!(
+                    "⏰ **Connection Timeout**\n\n\
+                    Cannot reach LM Studio server at `{}` within 10 seconds\n\n\
+                    **Solutions:**\n\
+                    • **Check LM Studio**: Ensure LM Studio is running and responsive\n\
+                    • **Network Connection**: Verify your network connection is stable\n\
+                    • **Server Load**: LM Studio might be overloaded - wait and retry\n\
+                    • **Firewall**: Check if firewall is blocking the connection\n\n\
+                    **Original error:** {}", 
+                    config.base_url, e
+                ).into());
+            } else if error_msg.contains("refused") || error_msg.contains("connection refused") {
+                return Err(format!(
+                    "🚫 **Connection Refused**\n\n\
+                    LM Studio at `{}` is not accepting connections\n\n\
+                    **Solutions:**\n\
+                    • **Start LM Studio**: Make sure LM Studio is running\n\
+                    • **Check Port**: Verify LM Studio is listening on the correct port (usually 1234)\n\
+                    • **Load Model**: Ensure a model is loaded in LM Studio\n\
+                    • **Server Status**: Check LM Studio's server status indicator\n\
+                    • **Alternative Port**: Try port 11434 if using Ollama instead\n\n\
+                    **Original error:** {}", 
+                    config.base_url, e
+                ).into());
+            } else if error_msg.contains("dns") || error_msg.contains("name resolution") {
+                return Err(format!(
+                    "🌐 **DNS Resolution Error**\n\n\
+                    Cannot resolve hostname in `{}`\n\n\
+                    **Solutions:**\n\
+                    • **Use IP Address**: Try `http://127.0.0.1:1234` instead of `http://localhost:1234`\n\
+                    • **Check Hostname**: Verify the hostname is correct\n\
+                    • **DNS Settings**: Check your DNS configuration\n\n\
+                    **Original error:** {}", 
+                    config.base_url, e
+                ).into());
+            } else {
+                return Err(format!(
+                    "🔗 **Connection Error**\n\n\
+                    Cannot connect to LM Studio at `{}`\n\n\
+                    **Solutions:**\n\
+                    • **Check URL**: Verify the base URL in lmapiconf.txt\n\
+                    • **Start LM Studio**: Ensure LM Studio is running\n\
+                    • **Network**: Check your network connection\n\
+                    • **Firewall**: Verify firewall settings\n\n\
+                    **Original error:** {}", 
+                    config.base_url, e
+                ).into());
+            }
+        }
+    }
+    
+    // Test 2: API endpoint availability
+    let api_url = format!("{}/v1/chat/completions", config.base_url);
+    let test_payload = serde_json::json!({
+        "model": config.default_model,
+        "messages": [{"role": "user", "content": "test"}],
+        "max_tokens": 1,
+        "temperature": 0.1
+    });
+    
+    println!("[DEBUG][CONNECTIVITY] Testing API endpoint: {}", api_url);
+    
+    let api_response = client
+        .post(&api_url)
+        .json(&test_payload)
+        .timeout(Duration::from_secs(60)) // 1 minute for API endpoint test
+        .send()
+        .await;
+    
+    match api_response {
+        Ok(response) => {
+            let status = response.status();
+            println!("[DEBUG][CONNECTIVITY] API endpoint OK - Status: {}", status);
+            if status.is_success() {
+                println!("[DEBUG][CONNECTIVITY] API connectivity test PASSED");
+                Ok(())
+            } else {
+                let error_text = response.text().await.unwrap_or_else(|_| "Unable to read error response".to_string());
+                println!("[DEBUG][CONNECTIVITY] API endpoint returned error status {}: {}", status, error_text);
+                Err(format!("API endpoint test failed: HTTP {} - {}", status, error_text).into())
+            }
+        }
+        Err(e) => {
+            println!("[DEBUG][CONNECTIVITY] API endpoint test failed: {}", e);
+            Err(format!("API endpoint connectivity test failed: {}", e).into())
+        }
+    }
+}
+
+/// Load LM Studio configuration from lmapiconf.txt with multi-path fallback
+pub async fn load_lm_config() -> Result<LMConfig, Box<dyn std::error::Error + Send + Sync>> {
+    let config_paths = [
+        "lmapiconf.txt",
+        "../lmapiconf.txt", 
+        "../../lmapiconf.txt",
+        "src/lmapiconf.txt"
+    ];
+    
+    let mut content = String::new();
+    let mut found_file = false;
+    let mut config_source = "";
+    
+    // Try to find the config file in multiple locations
+    for config_path in &config_paths {
+        match fs::read_to_string(config_path) {
+            Ok(file_content) => {
+                content = file_content;
+                found_file = true;
+                config_source = config_path;
+                println!("Ranking command: Found config file at {}", config_path);
+                break;
+            }
+            Err(_) => {
+                continue;
+            }
+        }
+    }
+    
+    if !found_file {
+        return Err("lmapiconf.txt file not found in any expected location (., .., ../.., src/) for ranking command".into());
+    }
+    
+    // Remove BOM if present
+    let content = content.strip_prefix('\u{feff}').unwrap_or(&content);
+    let mut config_map = HashMap::new();
+
+    // Parse the config file line by line
+    for line in content.lines() {
+        let line = line.trim();
+        
+        // Skip empty lines and comments
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        
+        // Parse KEY=VALUE format
+        if let Some(equals_pos) = line.find('=') {
+            let key = line[..equals_pos].trim().to_string();
+            let value = line[equals_pos + 1..].trim().to_string();
+            config_map.insert(key, value);
+        }
+    }
+    
+    // Check for required keys
+    let required_keys = [
+        "LM_STUDIO_BASE_URL",
+        "LM_STUDIO_TIMEOUT", 
+        "DEFAULT_MODEL",
+        "DEFAULT_REASON_MODEL",
+        "DEFAULT_SUMMARIZATION_MODEL",
+        "DEFAULT_RANKING_MODEL",
+        "DEFAULT_TEMPERATURE",
+        "DEFAULT_MAX_TOKENS",
+        "MAX_DISCORD_MESSAGE_LENGTH",
+        "RESPONSE_FORMAT_PADDING",
+        "DEFAULT_VISION_MODEL",
+    ];
+    
+    for key in &required_keys {
+        if !config_map.contains_key(*key) {
+            return Err(format!("Required setting '{}' not found in {} (ranking command)", key, config_source).into());
+        }
+    }
+    
+    // Validate timeout value
+    let timeout = config_map.get("LM_STUDIO_TIMEOUT")
+        .ok_or("LM_STUDIO_TIMEOUT not found in lmapiconf.txt")?
+        .parse::<u64>()
+        .map_err(|_| "LM_STUDIO_TIMEOUT must be a valid number (seconds)")?;
+    
+    if timeout == 0 || timeout > 600 {
+        return Err(format!(
+            "❌ **Invalid Timeout Value**\n\n\
+            LM_STUDIO_TIMEOUT must be between 1 and 600 seconds\n\
+            Current value: {} seconds\n\
+            Recommended: 300 seconds for complex ranking operations", 
+            timeout
+        ).into());
+    }
+    
+    // Create config - all values must be present in lmapiconf.txt
+    let config = LMConfig {
+        base_url: config_map.get("LM_STUDIO_BASE_URL")
+            .ok_or("LM_STUDIO_BASE_URL not found")?.clone(),
+        timeout,
+        default_model: config_map.get("DEFAULT_MODEL")
+            .ok_or("DEFAULT_MODEL not found")?.clone(),
+        default_reason_model: config_map.get("DEFAULT_REASON_MODEL")
+            .ok_or("DEFAULT_REASON_MODEL not found")?.clone(),
+        default_summarization_model: config_map.get("DEFAULT_SUMMARIZATION_MODEL")
+            .ok_or("DEFAULT_SUMMARIZATION_MODEL not found")?.clone(),
+        default_ranking_model: config_map.get("DEFAULT_RANKING_MODEL")
+            .ok_or("DEFAULT_RANKING_MODEL not found")?.clone(),
+        default_temperature: config_map.get("DEFAULT_TEMPERATURE")
+            .ok_or("DEFAULT_TEMPERATURE not found")?
+            .parse()
+            .map_err(|_| "Invalid DEFAULT_TEMPERATURE value")?,
+        default_max_tokens: config_map.get("DEFAULT_MAX_TOKENS")
+            .ok_or("DEFAULT_MAX_TOKENS not found")?
+            .parse()
+            .map_err(|_| "Invalid DEFAULT_MAX_TOKENS value")?,
+        max_discord_message_length: config_map.get("MAX_DISCORD_MESSAGE_LENGTH")
+            .ok_or("MAX_DISCORD_MESSAGE_LENGTH not found")?
+            .parse()
+            .map_err(|_| "Invalid MAX_DISCORD_MESSAGE_LENGTH value")?,
+        response_format_padding: config_map.get("RESPONSE_FORMAT_PADDING")
+            .ok_or("RESPONSE_FORMAT_PADDING not found")?
+            .parse()
+            .map_err(|_| "Invalid RESPONSE_FORMAT_PADDING value")?,
+        default_vision_model: config_map.get("DEFAULT_VISION_MODEL")
+            .ok_or("DEFAULT_VISION_MODEL not found")?.clone(),
+        default_seed: config_map.get("DEFAULT_SEED")
+            .map(|s| s.parse::<i64>())
+            .transpose()
+            .map_err(|_| "DEFAULT_SEED must be a valid integer if specified")?,
+    };
+
+    println!("Ranking command: Successfully loaded config from {} with ranking model: '{}'", config_source, config.default_ranking_model);
+    Ok(config)
+} 
+
+/// Chat completion function with retry logic
+pub async fn chat_completion(
+    messages: Vec<ChatMessage>,
+    model: &str,
+    config: &LMConfig,
+    max_tokens: Option<i32>,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    chat_completion_with_retries(messages, model, config, max_tokens, 3).await
+}
+
+/// Chat completion with retry logic for reliability
+async fn chat_completion_with_retries(
+    messages: Vec<ChatMessage>,
+    model: &str,
+    config: &LMConfig,
+    max_tokens: Option<i32>,
+    max_retries: u32,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let start_time = Instant::now();
+    let mut last_error: Option<Box<dyn std::error::Error + Send + Sync>> = None;
+    
+    for attempt in 1..=max_retries {
+        println!("[DEBUG][CHAT] Attempt {} of {} for chat completion", attempt, max_retries);
+        
+        let client = get_http_client().await;
+        let api_url = format!("{}/v1/chat/completions", config.base_url);
+        
+        let chat_request = serde_json::json!({
+            "model": model,
+            "messages": messages,
+            "temperature": config.default_temperature,
+            "max_tokens": max_tokens.unwrap_or(config.default_max_tokens),
+            "stream": false,
+            "seed": config.default_seed
+        });
+        
+        let response = match client
+            .post(&api_url)
+            .json(&chat_request)
+            .timeout(Duration::from_secs(config.timeout))
+            .send()
+            .await
+        {
+            Ok(resp) => {
+                let elapsed = start_time.elapsed();
+                println!("[DEBUG][CHAT] Request completed in {:.2}s - Status: {}", elapsed.as_secs_f32(), resp.status());
+                resp
+            }
+            Err(e) => {
+                let elapsed = start_time.elapsed();
+                println!("[DEBUG][CHAT] Request failed after {:.2}s: {}", elapsed.as_secs_f32(), e);
+                
+                let error_msg = format!("{}", e);
+                
+                // Check for specific error types that might benefit from retry
+                let should_retry = attempt < max_retries && (
+                    error_msg.contains("timeout") ||
+                    error_msg.contains("connection reset") ||
+                    error_msg.contains("connection aborted") ||
+                    error_msg.contains("broken pipe") ||
+                    error_msg.contains("connection closed")
+                );
+                
+                if should_retry {
+                    let delay = Duration::from_millis(1000 * attempt as u64); // Exponential backoff
+                    println!("[DEBUG][CHAT] Retrying in {:.1}s...", delay.as_secs_f32());
+                    tokio::time::sleep(delay).await;
+                    last_error = Some(Box::new(e));
+                    continue;
+                } else {
+                    // Don't retry for these errors - they're likely configuration issues
+                    if error_msg.contains("os error 10013") || error_msg.contains("access permissions") {
+                        return Err(format!(
+                            "🚫 **Windows Network Permission Error**\n\n\
+                            Cannot connect to LM Studio API\n\n\
+                            **Quick Fixes:**\n\
+                            • **Run as Administrator**: Right-click and 'Run as administrator'\n\
+                            • **Windows Firewall**: Add firewall exception for this program\n\
+                            • **Try localhost**: Use `http://127.0.0.1:1234` in lmapiconf.txt\n\n\
+                            **Current URL:** {}\n\
+                            **Error:** {}", 
+                            config.base_url, e
+                        ).into());
+                    } else if error_msg.contains("refused") || error_msg.contains("connection refused") {
+                        return Err(format!(
+                            "🚫 **Connection Refused**\n\n\
+                            LM Studio is not accepting connections\n\n\
+                            **Solutions:**\n\
+                            • **Start LM Studio**: Make sure LM Studio is running\n\
+                            • **Load Model**: Ensure a model is loaded\n\
+                            • **Enable Server**: Click 'Start Server' in LM Studio\n\
+                            • **Check Port**: Verify port 1234 is available\n\n\
+                            **Current URL:** {}\n\
+                            **Error:** {}", 
+                            config.base_url, e
+                        ).into());
+                    } else {
+                        return Err(format!("API request failed: {}", e).into());
+                    }
+                }
+            }
+        };
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let error_text = response.text().await.unwrap_or_else(|_| "Unable to read error response".to_string());
+            
+            // Check if this is a retryable server error
+            let is_server_error = status.is_server_error();
+            let should_retry = attempt < max_retries && is_server_error;
+            
+            if should_retry {
+                let delay = Duration::from_millis(1000 * attempt as u64);
+                println!("[DEBUG][CHAT] Server error ({}), retrying in {:.1}s...", status, delay.as_secs_f32());
+                tokio::time::sleep(delay).await;
+                last_error = Some(Box::new(std::io::Error::new(std::io::ErrorKind::Other, format!("HTTP {} - {}", status, error_text))));
+                continue;
+            } else {
+                return Err(format!(
+                    "🚫 **API Error (HTTP {})**\n\n\
+                    **Response:** {}\n\n\
+                    **Solutions:**\n\
+                    • **Model Loaded**: Ensure model '{}' is loaded in LM Studio\n\
+                    • **Model Name**: Verify model name matches exactly\n\
+                    • **Server Status**: Check LM Studio server logs\n\
+                    • **Memory**: Ensure sufficient RAM for the model\n\n\
+                    **API URL:** {}", 
+                    status, error_text, model, api_url
+                ).into());
+            }
+        }
+
+        // Parse successful response
+        let response_text = match response.text().await {
+            Ok(text) => text,
+            Err(e) => {
+                if attempt < max_retries {
+                    let delay = Duration::from_millis(1000 * attempt as u64);
+                    println!("[DEBUG][CHAT] Response parsing failed, retrying in {:.1}s...", delay.as_secs_f32());
+                    tokio::time::sleep(delay).await;
+                    last_error = Some(Box::new(e));
+                    continue;
+                } else {
+                    return Err(format!("Failed to read response text: {}", e).into());
+                }
+            }
+        };
+
+        // Parse JSON response
+        let response_json: serde_json::Value = match serde_json::from_str(&response_text) {
+            Ok(json) => json,
+            Err(e) => {
+                if attempt < max_retries {
+                    let delay = Duration::from_millis(1000 * attempt as u64);
+                    println!("[DEBUG][CHAT] JSON parsing failed, retrying in {:.1}s...", delay.as_secs_f32());
+                    tokio::time::sleep(delay).await;
+                    last_error = Some(Box::new(e));
+                    continue;
+                } else {
+                    return Err(format!("Failed to parse JSON response: {}", e).into());
+                }
+            }
+        };
+
+        // Extract content from response
+        if let Some(choices) = response_json["choices"].as_array() {
+            if let Some(first_choice) = choices.get(0) {
+                if let Some(message) = first_choice["message"].as_object() {
+                    if let Some(content) = message["content"].as_str() {
+                        let elapsed = start_time.elapsed();
+                        println!("[DEBUG][CHAT] Chat completion successful in {:.2}s - {} characters", 
+                                elapsed.as_secs_f32(), content.len());
+                        return Ok(content.trim().to_string());
+                    }
+                }
+            }
+        }
+
+        // If we get here, the response format was unexpected
+        if attempt < max_retries {
+            let delay = Duration::from_millis(1000 * attempt as u64);
+            println!("[DEBUG][CHAT] Unexpected response format, retrying in {:.1}s...", delay.as_secs_f32());
+            tokio::time::sleep(delay).await;
+            last_error = Some(Box::new(std::io::Error::new(std::io::ErrorKind::Other, "Unexpected response format")));
+            continue;
+        } else {
+            return Err("Failed to extract content from API response - unexpected format".into());
         }
     }
 
-    /// Get the display name for this mode
-    pub fn display_name(&self) -> &'static str {
-        match self {
-            RankingMode::Comprehensive => "Comprehensive Analysis",
-            RankingMode::Usability => "Usability Analysis",
-            RankingMode::Quality => "Content Quality Analysis",
-            RankingMode::Accessibility => "Accessibility Analysis",
-            RankingMode::SEO => "SEO Analysis",
-            RankingMode::Performance => "Performance Analysis",
-            RankingMode::Security => "Security Analysis",
-            RankingMode::Educational => "Educational Value Analysis",
-            RankingMode::Entertainment => "Entertainment Value Analysis",
-            RankingMode::Technical => "Technical Analysis",
-        }
+    // If we get here, all retries failed
+    match last_error {
+        Some(e) => Err(format!("All {} retry attempts failed. Last error: {}", max_retries, e).into()),
+        None => Err("All retry attempts failed with unknown errors".into()),
     }
-
-    /// Get the short description for this mode
-    pub fn description(&self) -> &'static str {
-        match self {
-            RankingMode::Comprehensive => "Complete analysis covering all aspects",
-            RankingMode::Usability => "Focus on user experience and ease of use",
-            RankingMode::Quality => "Content quality, accuracy, and value assessment",
-            RankingMode::Accessibility => "Accessibility compliance and inclusive design",
-            RankingMode::SEO => "Search engine optimization and discoverability",
-            RankingMode::Performance => "Speed, efficiency, and technical performance",
-            RankingMode::Security => "Security vulnerabilities and best practices",
-            RankingMode::Educational => "Educational value and learning potential",
-            RankingMode::Entertainment => "Entertainment value and engagement",
-            RankingMode::Technical => "Technical implementation and architecture",
-        }
-    }
-
-    /// Get all available modes
-    pub fn all_modes() -> Vec<RankingMode> {
-        vec![
-            RankingMode::Comprehensive,
-            RankingMode::Usability,
-            RankingMode::Quality,
-            RankingMode::Accessibility,
-            RankingMode::SEO,
-            RankingMode::Performance,
-            RankingMode::Security,
-            RankingMode::Educational,
-            RankingMode::Entertainment,
-            RankingMode::Technical,
-        ]
-    }
-}
-
-/// Structure to hold parsed command arguments
-#[derive(Debug)]
-pub struct RankCommandArgs {
-    pub mode: RankingMode,
-    pub url: String,
-    pub original_input: String,
 }
 
 // ============================================================================
-// EXISTING STRUCTURES
+// STREAMING STRUCTURES FOR REAL-TIME RESPONSES
 // ============================================================================
 
-// Structures for streaming API responses
-// Used to parse streaming JSON chunks from the AI API
-#[derive(Deserialize)]
-struct ChatResponse {
-    choices: Vec<Choice>,
-}
-
-#[derive(Deserialize)]
-struct Choice {
-    delta: Option<Delta>,
-    finish_reason: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct Delta {
-    content: Option<String>,
-}
-
-// API Request structure for ranking model
-#[derive(Serialize)]
-struct ChatRequest {
-    model: String,              // Model name
-    messages: Vec<ChatMessage>, // Conversation history
-    temperature: f32,           // Sampling temperature
-    max_tokens: i32,            // Max tokens to generate
-    stream: bool,               // Whether to stream output
-    #[serde(skip_serializing_if = "Option::is_none")]
-    seed: Option<i64>,          // Optional seed for reproducible responses
-}
-
-// Structure to track streaming statistics for ranking
-#[derive(Debug)]
-struct StreamingStats {
-    total_characters: usize,    // Total characters streamed
-    message_count: usize,       // Number of Discord messages sent
-    filtered_characters: usize, // Characters filtered by <think> tag removal
-}
-
-// Structure to track current message state during streaming
-struct MessageState {
-    current_content: String,    // Accumulated content for current Discord message
-    current_message: Message,   // Current Discord message object
-    message_index: usize,       // Part number (for chunked output)
-    char_limit: usize,          // Discord message length limit
-}
-
-// SSE response structures for streaming ranking analysis
-// Used to parse streaming JSON chunks from the AI API
+// Structure for streaming API responses
 #[derive(Deserialize)]
 struct StreamResponse {
     choices: Vec<StreamChoice>, // Streaming choices (delta content)
@@ -211,2272 +558,768 @@ struct StreamDelta {
 }
 
 // ============================================================================
-// COMMAND PARSING FUNCTIONS
+// HELPER FUNCTIONS FOR CONTENT PROCESSING
 // ============================================================================
 
-/// Parse command arguments to extract ranking mode and URL
-fn parse_rank_command(input: &str) -> Result<RankCommandArgs, String> {
-    let input = input.trim();
-    
-    if input.is_empty() {
-        return Err("No input provided".to_string());
-    }
-
-    // Check for help flag first
-    if input == "-h" || input == "--help" || input == "help" {
-        return Err("HELP_REQUESTED".to_string());
-    }
-
-    // Split input into words
-    let words: Vec<&str> = input.split_whitespace().collect();
-    
-    if words.is_empty() {
-        return Err("No arguments provided".to_string());
-    }
-
-    // Check if first word is a flag
-    if words[0].starts_with('-') {
-        // Flag-based mode
-        let mode = match words[0] {
-            "-usability" => RankingMode::Usability,
-            "-quality" => RankingMode::Quality,
-            "-accessibility" => RankingMode::Accessibility,
-            "-seo" => RankingMode::SEO,
-            "-performance" => RankingMode::Performance,
-            "-security" => RankingMode::Security,
-            "-educational" => RankingMode::Educational,
-            "-entertainment" => RankingMode::Entertainment,
-            "-technical" => RankingMode::Technical,
-            "-comprehensive" => RankingMode::Comprehensive,
-            _ => return Err(format!("Unknown flag: {}. Use -h for help.", words[0])),
-        };
-
-        // Check if we have a URL after the flag
-        if words.len() < 2 {
-            return Err(format!("Missing URL after flag {}. Usage: ^rank {} <url>", words[0], words[0]));
-        }
-
-        let url = words[1..].join(" ");
-        Ok(RankCommandArgs {
-            mode,
-            url,
-            original_input: input.to_string(),
-        })
-    } else {
-        // No flag provided, use comprehensive mode
-        let url = words.join(" ");
-        Ok(RankCommandArgs {
-            mode: RankingMode::Comprehensive,
-            url,
-            original_input: input.to_string(),
-        })
-    }
-}
-
-/// Generate help message for rank command
-fn generate_rank_help() -> String {
-    let mut help = String::new();
-    help.push_str("**📊 Rank Command - Content Analysis & Ranking**\n\n");
-    help.push_str("Analyze and rank webpages and YouTube videos with AI-powered insights.\n\n");
-    
-    help.push_str("**Usage:**\n");
-    help.push_str("• `^rank <url>` - Comprehensive analysis (default)\n");
-    help.push_str("• `^rank -<mode> <url>` - Specific analysis mode\n\n");
-    
-    help.push_str("**Available Analysis Modes:**\n");
-    for mode in RankingMode::all_modes() {
-        help.push_str(&format!("• `{}` - {}\n", mode.flag(), mode.description()));
-    }
-    
-    help.push_str("\n**Examples:**\n");
-    help.push_str("• `^rank https://example.com` - Comprehensive analysis\n");
-    help.push_str("• `^rank -usability https://example.com` - Usability focus\n");
-    help.push_str("• `^rank -quality https://youtube.com/watch?v=...` - Content quality\n");
-    help.push_str("• `^rank -accessibility https://example.com` - Accessibility analysis\n");
-    
-    help.push_str("\n**Supported Content:**\n");
-    help.push_str("• Webpages (HTML content)\n");
-    help.push_str("• YouTube videos (transcript analysis)\n");
-    
-    help
-}
-
-// ============================================================================
-// MODULAR PROMPT LOADING FUNCTIONS
-// ============================================================================
-
-/// Load system prompt for specific ranking mode
-async fn load_ranking_mode_prompt(mode: &RankingMode, is_youtube: bool) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    let base_filename = match mode {
-        RankingMode::Comprehensive => "rank_comprehensive_prompt",
-        RankingMode::Usability => "rank_usability_prompt",
-        RankingMode::Quality => "rank_quality_prompt",
-        RankingMode::Accessibility => "rank_accessibility_prompt",
-        RankingMode::SEO => "rank_seo_prompt",
-        RankingMode::Performance => "rank_performance_prompt",
-        RankingMode::Security => "rank_security_prompt",
-        RankingMode::Educational => "rank_educational_prompt",
-        RankingMode::Entertainment => "rank_entertainment_prompt",
-        RankingMode::Technical => "rank_technical_prompt",
-    };
-
-    let youtube_suffix = if is_youtube { "_youtube" } else { "" };
-    let filename = format!("{}{}.txt", base_filename, youtube_suffix);
-    
+/// Load ranking-specific system prompt from file
+async fn load_ranking_prompt() -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let prompt_paths = [
-        filename.as_str(),
-        &format!("../{}", filename),
-        &format!("../../{}", filename),
-        &format!("src/{}", filename),
-        &format!("example_{}", filename),
-        &format!("../example_{}", filename),
-        &format!("../../example_{}", filename),
-        &format!("src/example_{}", filename),
+        "rank_system_prompt.txt",
+        "../rank_system_prompt.txt",
+        "../../rank_system_prompt.txt",
+        "src/rank_system_prompt.txt",
+        "system_prompt.txt",
+        "../system_prompt.txt",
+        "../../system_prompt.txt",
+        "src/system_prompt.txt",
     ];
-
-    // Try to load mode-specific prompt
+    
     for path in &prompt_paths {
         match fs::read_to_string(path) {
             Ok(content) => {
                 let content = content.strip_prefix('\u{feff}').unwrap_or(&content);
-                debug!("📊 Loaded {} prompt from: {}", mode.display_name(), path);
+                println!("Ranking command: Loaded prompt from {}", path);
                 return Ok(content.trim().to_string());
             }
             Err(_) => continue,
         }
     }
+    
+    // Fallback prompt for ranking
+    Ok("You are an expert content analyst and evaluator. Your task is to rank and analyze content across multiple dimensions. Provide detailed, objective analysis with specific scores and actionable feedback.".to_string())
+}
 
-    // Fallback to generic mode prompt (without youtube suffix)
-    let generic_filename = format!("{}.txt", base_filename);
-    let generic_paths = [
-        generic_filename.as_str(),
-        &format!("../{}", generic_filename),
-        &format!("../../{}", generic_filename),
-        &format!("src/{}", generic_filename),
-        &format!("example_{}", generic_filename),
-        &format!("../example_{}", generic_filename),
-        &format!("../../example_{}", generic_filename),
-        &format!("src/example_{}", generic_filename),
+/// Load YouTube-specific ranking prompt
+async fn load_youtube_ranking_prompt() -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let prompt_paths = [
+        "youtube_ranking_prompt.txt",
+        "../youtube_ranking_prompt.txt",
+        "../../youtube_ranking_prompt.txt",
+        "src/youtube_ranking_prompt.txt",
+        "rank_system_prompt.txt",
+        "../rank_system_prompt.txt",
+        "../../rank_system_prompt.txt",
+        "src/rank_system_prompt.txt",
     ];
-
-    for path in &generic_paths {
+    
+    for path in &prompt_paths {
         match fs::read_to_string(path) {
             Ok(content) => {
                 let content = content.strip_prefix('\u{feff}').unwrap_or(&content);
-                debug!("📊 Loaded generic {} prompt from: {}", mode.display_name(), path);
+                println!("Ranking command: Loaded YouTube ranking prompt from {}", path);
                 return Ok(content.trim().to_string());
             }
             Err(_) => continue,
         }
     }
-
-    // Final fallback to built-in prompts
-    debug!("📊 Using built-in fallback prompt for {}", mode.display_name());
-    Ok(generate_fallback_prompt(mode, is_youtube))
+    
+    // Fallback prompt for YouTube ranking
+    Ok("You are an expert video content analyst. Analyze YouTube video transcripts and provide comprehensive ranking across multiple dimensions including content quality, educational value, engagement, and technical excellence.".to_string())
 }
 
-/// Generate fallback prompt for a specific mode
-fn generate_fallback_prompt(mode: &RankingMode, is_youtube: bool) -> String {
-    let content_type = if is_youtube { "YouTube video" } else { "webpage" };
-    
-    match mode {
-        RankingMode::Comprehensive => {
-            format!("You are an expert content analyst and evaluator. Analyze the provided {} content and provide a comprehensive ranking across multiple dimensions: Content Quality (1-10), Relevance (1-10), Engagement Potential (1-10), Educational Value (1-10), Technical Excellence (1-10), Usability (1-10), Accessibility (1-10), and SEO Optimization (1-10). Provide detailed analysis with specific examples, strengths, areas for improvement, and an overall recommendation. Use clear formatting and provide actionable insights.", content_type)
-        },
-        RankingMode::Usability => {
-            format!("You are a usability expert and UX analyst. Analyze the provided {} content focusing specifically on usability aspects: User Interface Design (1-10), Navigation Ease (1-10), Information Architecture (1-10), User Flow (1-10), Mobile Responsiveness (1-10), Loading Speed (1-10), and Overall User Experience (1-10). Provide detailed usability analysis with specific examples, user journey insights, and actionable recommendations for improvement.", content_type)
-        },
-        RankingMode::Quality => {
-            format!("You are a content quality specialist. Analyze the provided {} content focusing on quality metrics: Content Accuracy (1-10), Writing Quality (1-10), Information Depth (1-10), Originality (1-10), Relevance (1-10), Completeness (1-10), and Overall Value (1-10). Provide detailed quality analysis with specific examples, identify strengths and weaknesses, and suggest improvements for content enhancement.", content_type)
-        },
-        RankingMode::Accessibility => {
-            format!("You are an accessibility expert and inclusive design specialist. Analyze the provided {} content focusing on accessibility compliance: WCAG Compliance (1-10), Screen Reader Compatibility (1-10), Keyboard Navigation (1-10), Color Contrast (1-10), Text Readability (1-10), Alternative Text (1-10), and Overall Accessibility (1-10). Provide detailed accessibility analysis with specific compliance issues, inclusive design recommendations, and actionable improvements.", content_type)
-        },
-        RankingMode::SEO => {
-            format!("You are an SEO specialist and search engine optimization expert. Analyze the provided {} content focusing on SEO metrics: Keyword Optimization (1-10), Meta Tags (1-10), Content Structure (1-10), Internal Linking (1-10), Page Speed (1-10), Mobile Optimization (1-10), and Overall SEO Score (1-10). Provide detailed SEO analysis with specific optimization opportunities, ranking factors, and actionable recommendations for better search visibility.", content_type)
-        },
-        RankingMode::Performance => {
-            format!("You are a performance optimization expert. Analyze the provided {} content focusing on performance metrics: Loading Speed (1-10), Resource Optimization (1-10), Code Efficiency (1-10), Caching Strategy (1-10), Image Optimization (1-10), Server Response Time (1-10), and Overall Performance (1-10). Provide detailed performance analysis with specific bottlenecks, optimization opportunities, and actionable recommendations for better performance.", content_type)
-        },
-        RankingMode::Security => {
-            format!("You are a cybersecurity expert and security analyst. Analyze the provided {} content focusing on security aspects: Data Protection (1-10), Privacy Compliance (1-10), Secure Communication (1-10), Input Validation (1-10), Authentication Security (1-10), Vulnerability Assessment (1-10), and Overall Security Score (1-10). Provide detailed security analysis with specific vulnerabilities, compliance issues, and actionable security recommendations.", content_type)
-        },
-        RankingMode::Educational => {
-            format!("You are an educational content specialist and learning analyst. Analyze the provided {} content focusing on educational value: Learning Objectives (1-10), Content Clarity (1-10), Engagement Level (1-10), Knowledge Retention (1-10), Practical Application (1-10), Difficulty Level (1-10), and Overall Educational Value (1-10). Provide detailed educational analysis with specific learning insights, pedagogical recommendations, and suggestions for educational enhancement.", content_type)
-        },
-        RankingMode::Entertainment => {
-            format!("You are an entertainment content specialist and engagement analyst. Analyze the provided {} content focusing on entertainment value: Engagement Level (1-10), Content Appeal (1-10), Entertainment Quality (1-10), Audience Retention (1-10), Creative Elements (1-10), Production Value (1-10), and Overall Entertainment Score (1-10). Provide detailed entertainment analysis with specific engagement insights, audience appeal factors, and recommendations for enhanced entertainment value.", content_type)
-        },
-        RankingMode::Technical => {
-            format!("You are a technical architecture expert and systems analyst. Analyze the provided {} content focusing on technical aspects: Code Quality (1-10), Architecture Design (1-10), Scalability (1-10), Maintainability (1-10), Technology Stack (1-10), Best Practices (1-10), and Overall Technical Excellence (1-10). Provide detailed technical analysis with specific technical insights, architectural recommendations, and actionable improvements for technical excellence.", content_type)
-        },
-    }
-}
-
-// ============================================================================
-// LEGACY PROMPT FUNCTIONS (for backward compatibility)
-// ============================================================================
-
-/// Legacy function for backward compatibility
-async fn load_ranking_analysis_prompt() -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    load_ranking_mode_prompt(&RankingMode::Comprehensive, false).await
-}
-
-/// Legacy function for backward compatibility
-async fn load_youtube_ranking_analysis_prompt() -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    load_ranking_mode_prompt(&RankingMode::Comprehensive, true).await
-}
-
-// ... existing code ...
-
-#[command]
-#[aliases("rank", "analyze", "evaluate")]
-/// Main ^rank command handler
-/// Handles ranking and analysis of webpages and YouTube videos with modular analysis modes
-/// Supports:
-///   - ^rank <url> (default comprehensive analysis)
-///   - ^rank -usability <url> (usability-focused analysis)
-///   - ^rank -quality <url> (content quality analysis)
-///   - ^rank -accessibility <url> (accessibility analysis)
-///   - ^rank -seo <url> (SEO analysis)
-///   - ^rank -performance <url> (performance analysis)
-///   - ^rank -security <url> (security analysis)
-///   - ^rank -educational <url> (educational value analysis)
-///   - ^rank -entertainment <url> (entertainment value analysis)
-///   - ^rank -technical <url> (technical analysis)
-///   - ^rank -comprehensive <url> (comprehensive analysis)
-///   - ^rank -h (help)
-pub async fn rank(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
-    let start_time = std::time::Instant::now();
-    let command_uuid = Uuid::new_v4();
-    
-    info!("📊 === RANK COMMAND STARTED ===");
-    info!("🆔 Command UUID: {}", command_uuid);
-    info!("👤 User: {} ({})", msg.author.name, msg.author.id);
-    info!("📊 Channel: {} ({})", msg.channel_id, msg.channel_id.0);
-    info!("📊 Guild: {:?}", msg.guild_id);
-    info!("📊 Message ID: {}", msg.id);
-    info!("📊 Timestamp: {:?}", msg.timestamp);
-    
-    // Enhanced logging for content ranking debugging
-    log::info!("🔍 === RANK COMMAND DEBUG INFO ===");
-    log::info!("🔍 Command UUID: {}", command_uuid);
-    log::info!("🔍 User ID: {}", msg.author.id);
-    log::info!("🔍 Channel ID: {}", msg.channel_id);
-    log::info!("🔍 Message ID: {}", msg.id);
-    log::info!("🔍 Arguments: '{}'", args.message());
-    log::info!("🔍 Arguments length: {} characters", args.message().len());
-    log::info!("🔍 Start time: {:?}", start_time);
-    
-    debug!("🔧 === COMMAND INITIALIZATION ===");
-    debug!("🔧 Command arguments: '{}'", args.message());
-    debug!("🔧 Arguments length: {} characters", args.message().len());
-    debug!("🔧 Arguments trimmed: '{}'", args.message().trim());
-    debug!("🔧 Arguments trimmed length: {} characters", args.message().trim().len());
-    trace!("🔍 Command initialization details: uuid={}, author_id={}, channel_id={}, message_id={}", 
-           command_uuid, msg.author.id, msg.channel_id, msg.id);
-    
-    // Parse command arguments
-    debug!("🔧 === COMMAND PARSING ===");
-    debug!("🔧 Parsing command arguments: '{}'", args.message());
-    trace!("🔍 Command parsing started: input={}, command_uuid={}", args.message(), command_uuid);
-    
-    let command_args = match parse_rank_command(args.message()) {
-        Ok(args) => {
-            debug!("✅ Command parsed successfully");
-            debug!("📊 Analysis mode: {}", args.mode.display_name());
-            debug!("🔗 URL: {}", args.url);
-            trace!("🔍 Command parsing success: mode={}, url={}, command_uuid={}", 
-                   args.mode.display_name(), args.url, command_uuid);
-            args
-        },
-        Err(e) => {
-            if e == "HELP_REQUESTED" {
-                debug!("📖 Help requested by user");
-                trace!("🔍 Help request: user_id={}, command_uuid={}", msg.author.id, command_uuid);
-                msg.reply(ctx, &generate_rank_help()).await?;
-                debug!("✅ Help message sent successfully");
-                return Ok(());
-            } else {
-                warn!("❌ === COMMAND PARSING ERROR ===");
-                warn!("❌ Failed to parse command: {}", e);
-                debug!("🔍 Command parsing error details: {}", e);
-                trace!("🔍 Command parsing error: error={}, command_uuid={}", e, command_uuid);
-                msg.reply(ctx, &format!("**Command Error:** {}\n\nUse `^rank -h` for help.", e)).await?;
-                debug!("✅ Command error message sent");
-                return Ok(());
-            }
-        }
-    };
-    
-    let url = &command_args.url;
-    debug!("🔗 === URL PROCESSING ===");
-    debug!("🔗 Parsed URL: '{}'", url);
-    debug!("🔗 URL length: {} characters", url.len());
-    debug!("🔗 URL is empty: {}", url.is_empty());
-    trace!("🔍 URL processing: length={}, is_empty={}, command_uuid={}", 
-           url.len(), url.is_empty(), command_uuid);
-    
-    // Logging is now configured globally in main.rs to show all levels
-    debug!("🔧 Logging configured for maximum debugging detail");
-    trace!("🔍 TRACE logging enabled - will show all function calls and data flow");
-    
-    if url.is_empty() {
-        warn!("❌ === EMPTY URL ERROR ===");
-        warn!("❌ Empty URL provided by user {} ({})", msg.author.name, msg.author.id);
-        debug!("🔍 URL validation failed: empty string");
-        debug!("🔍 Sending error message to user");
-        trace!("🔍 Empty URL error: user_id={}, channel_id={}, command_uuid={}", 
-               msg.author.id, msg.channel_id, command_uuid);
-        msg.reply(ctx, "Please provide a URL to rank and analyze!\n\n**Usage:** `^rank <url>`\nUse `^rank -h` for help.").await?;
-        debug!("✅ Error message sent successfully");
-        return Ok(());
-    }
-    
-    debug!("🔍 === URL VALIDATION ===");
-    debug!("🔍 Validating URL format: {}", url);
-    debug!("🔍 URL starts with http://: {}", url.starts_with("http://"));
-    debug!("🔍 URL starts with https://: {}", url.starts_with("https://"));
-    debug!("🔍 URL contains youtube.com: {}", url.contains("youtube.com"));
-    debug!("🔍 URL contains youtu.be: {}", url.contains("youtu.be"));
-    trace!("🔍 URL validation details: starts_with_http={}, starts_with_https={}, contains_youtube_com={}, contains_youtu_be={}", 
-           url.starts_with("http://"), url.starts_with("https://"), url.contains("youtube.com"), url.contains("youtu.be"));
-    
-    if !url.starts_with("http://") && !url.starts_with("https://") {
-        warn!("❌ === INVALID URL FORMAT ERROR ===");
-        warn!("❌ Invalid URL format provided: {}", url);
-        debug!("🔍 URL validation failed: missing http/https prefix");
-        debug!("🔍 URL first 10 characters: '{}'", url.chars().take(10).collect::<String>());
-        trace!("🔍 URL validation failure details: length={}, first_chars={}, command_uuid={}", 
-               url.len(), url.chars().take(10).collect::<String>(), command_uuid);
-        msg.reply(ctx, "Please provide a valid URL starting with `http://` or `https://`").await?;
-        debug!("✅ Invalid URL error message sent");
-        return Ok(());
-    }
-    debug!("✅ URL format validation passed");
-    trace!("🔍 URL validation success: protocol={}, command_uuid={}", 
-           if url.starts_with("https://") { "https" } else { "http" }, command_uuid);
-    
-    // Load LM configuration from lmapiconf.txt
-    debug!("🔧 === CONFIGURATION LOADING ===");
-    debug!("🔧 Loading LM configuration from lmapiconf.txt...");
-    trace!("🔍 Configuration loading phase started: command_uuid={}", command_uuid);
-    
-    let config = match crate::commands::search::load_lm_config().await {
-        Ok(cfg) => {
-            info!("✅ === CONFIGURATION LOADED SUCCESSFULLY ===");
-            info!("✅ LM configuration loaded successfully");
-            debug!("🧠 Using default model: {}", cfg.default_model);
-            debug!("🧠 Using ranking model: {}", cfg.default_ranking_model);
-            debug!("🌐 API endpoint: {}", cfg.base_url);
-            debug!("⏱️ Timeout setting: {} seconds", cfg.timeout);
-            debug!("🔥 Temperature setting: {}", cfg.default_temperature);
-            debug!("📝 Max tokens setting: {}", cfg.default_max_tokens);
-            debug!("📏 Max Discord message length: {}", cfg.max_discord_message_length);
-            debug!("📏 Response format padding: {}", cfg.response_format_padding);
-            trace!("🔍 Configuration details: max_discord_length={}, response_format_padding={}, command_uuid={}", 
-                   cfg.max_discord_message_length, cfg.response_format_padding, command_uuid);
-            cfg
-        },
-        Err(e) => {
-            error!("❌ === CONFIGURATION LOADING ERROR ===");
-            error!("❌ Failed to load LM configuration: {}", e);
-            debug!("🔍 Configuration loading error details: {:?}", e);
-            debug!("🔍 Configuration error type: {:?}", std::any::type_name_of_val(&e));
-            trace!("🔍 Configuration error: error_type={}, command_uuid={}", 
-                   std::any::type_name_of_val(&e), command_uuid);
-            msg.reply(ctx, &format!("Failed to load LM configuration: {}\n\n**Setup required:** Ensure `lmapiconf.txt` is properly configured with your reasoning model.", e)).await?;
-            debug!("✅ Configuration error message sent");
-            return Ok(());
-        }
-    };
-    
-    debug!("🔧 Configuration loaded successfully, proceeding with next steps");
-    trace!("🔍 Configuration phase completed: command_uuid={}", command_uuid);
-    
-
-    
-    debug!("🔍 === URL TYPE DETECTION ===");
-    debug!("🔍 Detecting URL type...");
-    let is_youtube = url.contains("youtube.com/") || url.contains("youtu.be/");
-    debug!("🔍 URL contains youtube.com/: {}", url.contains("youtube.com/"));
-    debug!("🔍 URL contains youtu.be/: {}", url.contains("youtu.be/"));
-    debug!("🔍 Final YouTube detection: {}", is_youtube);
-    trace!("🔍 URL type detection details: contains_youtube_com={}, contains_youtu_be={}, is_youtube={}, command_uuid={}", 
-           url.contains("youtube.com/"), url.contains("youtu.be/"), is_youtube, command_uuid);
-    info!("🎯 === CONTENT TYPE DETECTED ===");
-    info!("🎯 Processing {} URL: {}", if is_youtube { "YouTube" } else { "webpage" }, url);
-    info!("📊 Analysis mode: {}", command_args.mode.display_name());
-    debug!("📊 URL type detection: YouTube = {}", is_youtube);
-    debug!("📊 Analysis mode: {}", command_args.mode.display_name());
-    
-    // Create response message
-    debug!("💬 === DISCORD MESSAGE CREATION ===");
-    debug!("💬 Creating initial Discord response message...");
-    trace!("🔍 Discord message creation: author={}, channel={}, command_uuid={}", msg.author.name, msg.channel_id, command_uuid);
-    
-    let initial_message = format!("🔄 Fetching content for {} analysis...", command_args.mode.display_name());
-    let mut response_msg = msg.reply(ctx, &initial_message).await?;
-    debug!("✅ Initial Discord message sent successfully");
-    debug!("📝 Response message ID: {}", response_msg.id);
-    debug!("📝 Response message channel ID: {}", response_msg.channel_id);
-    debug!("📝 Response message content: '{}'", response_msg.content);
-    trace!("🔍 Discord message details: id={}, channel_id={}, content_length={}, command_uuid={}", 
-           response_msg.id, response_msg.channel_id, response_msg.content.len(), command_uuid);
-    
-    // Add a small delay to avoid rate limiting if multiple requests are made quickly
-    debug!("⏳ === RATE LIMITING DELAY ===");
-    debug!("⏳ Adding 1-second delay to prevent rate limiting...");
-    trace!("🔍 Rate limiting delay: 1000ms, command_uuid={}", command_uuid);
-    tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
-    debug!("✅ Delay completed");
-    trace!("🔍 Rate limiting delay completed: command_uuid={}", command_uuid);
-    
-    // Fetch content
-    info!("🌐 === CONTENT FETCHING PHASE ===");
-    info!("🌐 Starting content fetching process...");
-    debug!("🚀 Content fetching phase initiated");
-    trace!("🔍 Content fetching phase: url_type={}, url={}, command_uuid={}", 
-           if is_youtube { "youtube" } else { "webpage" }, url, command_uuid);
-
-    let mut content = String::new();
-    let subtitle_file_path = if is_youtube {
-        debug!("🎥 === YOUTUBE CONTENT FETCHING ===");
-        debug!("🎥 YouTube URL detected, starting transcript extraction...");
-        trace!("🔍 YouTube transcript extraction started: command_uuid={}", command_uuid);
-        match fetch_youtube_transcript(url).await {
-            Ok(path) => {
-                info!("✅ === YOUTUBE TRANSCRIPT SUCCESS ===");
-                info!("✅ YouTube subtitle file created successfully: {}", path);
-                debug!("📁 Subtitle file path: {}", path);
-                debug!("📁 Subtitle file exists: {}", std::path::Path::new(&path).exists());
-                trace!("🔍 YouTube subtitle file success: path={}, command_uuid={}", path, command_uuid);
-                
-                // Read the subtitle file content for statistics
-                debug!("📖 === SUBTITLE FILE READING ===");
-                debug!("📖 Reading subtitle file for statistics...");
-                match fs::read_to_string(&path) {
-                    Ok(file_content) => {
-                        debug!("📖 Subtitle file read successfully: {} characters", file_content.len());
-                        debug!("📖 File content preview: {}", &file_content[..std::cmp::min(200, file_content.len())]);
-                        trace!("🔍 Subtitle file read: path={}, length={}, command_uuid={}", path, file_content.len(), command_uuid);
-                        
-                        let cleaned_content = clean_vtt_content(&file_content);
-                        debug!("🧹 === VTT CLEANING FOR STATISTICS ===");
-                        debug!("🧹 Cleaning VTT content for statistics...");
-                        debug!("📝 Original subtitle content: {} characters", file_content.len());
-                        debug!("📝 Cleaned subtitle content: {} characters", cleaned_content.len());
-                        debug!("📝 Content preview: {}", &cleaned_content[..std::cmp::min(200, cleaned_content.len())]);
-                        debug!("📊 Subtitle statistics: {} characters, {} words", cleaned_content.len(), cleaned_content.split_whitespace().count());
-                        trace!("🔍 VTT cleaning for statistics: original_length={}, cleaned_length={}, word_count={}, command_uuid={}", 
-                               file_content.len(), cleaned_content.len(), cleaned_content.split_whitespace().count(), command_uuid);
-                        content = cleaned_content;
-                    },
-                    Err(e) => {
-                        warn!("⚠️ === SUBTITLE FILE READ ERROR ===");
-                        warn!("⚠️ Could not read subtitle file for statistics: {}", e);
-                        debug!("🔍 Subtitle file read error: path={}, error={}", path, e);
-                        trace!("🔍 Subtitle file read error: path={}, error_type={}, command_uuid={}", 
-                               path, std::any::type_name_of_val(&e), command_uuid);
-                    }
-                }
-                Some(path)
-            },
-            Err(e) => {
-                error!("❌ === YOUTUBE TRANSCRIPT ERROR ===");
-                error!("❌ Failed to fetch YouTube transcript: {}", e);
-                debug!("🔍 YouTube transcript error details: {:?}", e);
-                debug!("🔍 YouTube transcript error type: {:?}", std::any::type_name_of_val(&e));
-                trace!("🔍 YouTube transcript error: error_type={}, command_uuid={}", 
-                       std::any::type_name_of_val(&e), command_uuid);
-                response_msg.edit(ctx, |m| {
-                    m.content(format!("❌ Failed to fetch YouTube transcript: {}", e))
-                }).await?;
-                debug!("✅ YouTube transcript error message sent to Discord");
-                return Ok(());
-            }
-        }
-    } else {
-        debug!("🌐 === WEBPAGE CONTENT FETCHING ===");
-        debug!("🌐 Webpage URL detected, starting content extraction...");
-        trace!("🔍 Webpage content extraction started: command_uuid={}", command_uuid);
-        
-        // Enhanced logging for web page processing
-        log::info!("🌐 === WEBPAGE PROCESSING STARTED ===");
-        log::info!("🌐 URL: {}", url);
-        log::info!("🌐 Command UUID: {}", command_uuid);
-        log::info!("🌐 Processing type: HTML file download and RAG processing");
-        
-        match fetch_webpage_content(url).await {
-            Ok((page_content, html_file_path)) => {
-                info!("✅ === WEBPAGE CONTENT SUCCESS ===");
-                info!("✅ Webpage content fetched successfully: {} characters", page_content.len());
-                info!("💾 HTML file saved for RAG processing: {}", html_file_path);
-                debug!("📄 Content preview: {}", &page_content[..std::cmp::min(200, page_content.len())]);
-                debug!("📊 Webpage statistics: {} characters, {} words", page_content.len(), page_content.split_whitespace().count());
-                debug!("💾 HTML file path: {}", html_file_path);
-                trace!("🔍 Webpage content success: length={}, word_count={}, preview_chars={}, file_path={}, command_uuid={}", 
-                       page_content.len(), page_content.split_whitespace().count(), std::cmp::min(200, page_content.len()), html_file_path, command_uuid);
-                
-                // Enhanced logging for successful web page processing
-                log::info!("✅ === WEBPAGE CONTENT SUCCESS DETAILS ===");
-                log::info!("✅ Content length: {} characters", page_content.len());
-                log::info!("✅ Word count: {} words", page_content.split_whitespace().count());
-                log::info!("✅ HTML file path: {}", html_file_path);
-                log::info!("✅ File exists: {}", std::path::Path::new(&html_file_path).exists());
-                log::info!("✅ Content preview: {}", &page_content[..std::cmp::min(300, page_content.len())]);
-                log::info!("✅ Processing will use RAG with file: {}", html_file_path);
-                
-                content = page_content;
-                Some(html_file_path)
-            },
-            Err(e) => {
-                error!("❌ === WEBPAGE CONTENT ERROR ===");
-                error!("❌ Failed to fetch webpage content: {}", e);
-                debug!("🔍 Webpage content error details: {:?}", e);
-                debug!("🔍 Webpage content error type: {:?}", std::any::type_name_of_val(&e));
-                trace!("🔍 Webpage content error: error_type={}, command_uuid={}", 
-                       std::any::type_name_of_val(&e), command_uuid);
-                response_msg.edit(ctx, |m| {
-                    m.content(format!("❌ Failed to fetch webpage: {}", e))
-                }).await?;
-                debug!("✅ Webpage content error message sent to Discord");
-                return Ok(());
-            }
-        }
-    };
-    
-    // Update status
-    debug!("📝 === DISCORD MESSAGE UPDATE ===");
-    debug!("📝 Updating Discord message to show AI processing...");
-    trace!("🔍 Discord message update: changing content to '🤖 Generating ranking analysis...', command_uuid={}", command_uuid);
-    response_msg.edit(ctx, |m| {
-        m.content("🤖 Generating ranking analysis...")
-    }).await?;
-    debug!("✅ Discord message updated to show AI processing");
-    trace!("🔍 Discord message update completed: command_uuid={}", command_uuid);
-    
-    // Stream the ranking analysis
-    info!("🧠 === AI RANKING ANALYSIS PHASE ===");
-    info!("🧠 Starting AI ranking analysis process with streaming...");
-    debug!("🚀 AI ranking analysis phase initiated");
-    
-    let content_length = if let Some(ref path) = subtitle_file_path {
-        debug!("📏 === CONTENT LENGTH CALCULATION ===");
-        debug!("📏 Calculating content length from subtitle file...");
-        match fs::read_to_string(path) {
-            Ok(content) => {
-                let cleaned_length = clean_vtt_content(&content).len();
-                debug!("📏 Content length from subtitle file: {} characters", cleaned_length);
-                trace!("🔍 Content length calculation: path={}, length={}, command_uuid={}", path, cleaned_length, command_uuid);
-                cleaned_length
-            },
-            Err(e) => {
-                warn!("⚠️ Could not read subtitle file for length calculation: {}", e);
-                debug!("🔍 Content length calculation error: path={}, error={}", path, e);
-                trace!("🔍 Content length calculation error: path={}, error_type={}, command_uuid={}", 
-                       path, std::any::type_name_of_val(&e), command_uuid);
-                0
-            }
-        }
-    } else {
-        debug!("📏 Content length from direct content: {} characters", content.len());
-        trace!("🔍 Content length calculation: direct_length={}, command_uuid={}", content.len(), command_uuid);
-        content.len()
-    };
-    
-    trace!("🔍 AI ranking analysis phase: content_length={}, url={}, is_youtube={}, command_uuid={}", 
-           content_length, url, is_youtube, command_uuid);
-    let processing_start = std::time::Instant::now();
-    debug!("⏱️ AI processing start time: {:?}", processing_start);
-    
-    match stream_ranking_analysis(&content, url, &config, &mut response_msg, ctx, is_youtube, subtitle_file_path.as_deref(), &command_args.mode).await {
-        Ok(stats) => {
-            let processing_time = processing_start.elapsed();
-            info!("✅ === AI RANKING ANALYSIS SUCCESS ===");
-            info!("✅ Ranking analysis streaming completed successfully in {:.2}s", processing_time.as_secs_f64());
-            debug!("📊 AI processing statistics: {:.2}s processing time", processing_time.as_secs_f64());
-            debug!("📊 Processing time in milliseconds: {} ms", processing_time.as_millis());
-            debug!("📊 Streaming stats: {} total chars, {} messages, {} filtered chars", 
-                   stats.total_characters, stats.message_count, stats.filtered_characters);
-            trace!("🔍 AI ranking analysis success: processing_time_ms={}, content_length={}, total_chars={}, messages={}, filtered_chars={}, command_uuid={}", 
-                   processing_time.as_millis(), content_length, stats.total_characters, stats.message_count, stats.filtered_characters, command_uuid);
-        },
-        Err(e) => {
-            error!("❌ === AI RANKING ANALYSIS ERROR ===");
-            error!("❌ Ranking analysis generation failed: {}", e);
-            debug!("🔍 AI ranking analysis error details: {:?}", e);
-            debug!("🔍 AI ranking analysis error type: {:?}", std::any::type_name_of_val(&e));
-            trace!("🔍 AI ranking analysis error: error_type={}, command_uuid={}", 
-                   std::any::type_name_of_val(&e), command_uuid);
-            response_msg.edit(ctx, |m| {
-                m.content(format!("❌ Failed to generate ranking analysis: {}", e))
-            }).await?;
-            debug!("✅ AI ranking analysis error message sent to Discord");
-        }
-    }
-    
-    let total_time = start_time.elapsed();
-    info!("⏱️ === COMMAND COMPLETION ===");
-    info!("⏱️ Rank command completed in {:.2}s for user {} ({})", 
-          total_time.as_secs_f64(), msg.author.name, msg.author.id);
-    debug!("📊 === FINAL COMMAND STATISTICS ===");
-    debug!("📊 Total execution time: {:.2}s", total_time.as_secs_f64());
-    debug!("📊 Total execution time in milliseconds: {} ms", total_time.as_millis());
-    debug!("📊 Content length: {} characters", content_length);
-    debug!("📊 URL type: {}", if is_youtube { "YouTube" } else { "Webpage" });
-    debug!("📊 User: {} ({})", msg.author.name, msg.author.id);
-    debug!("📊 Channel: {} ({})", msg.channel_id, msg.channel_id.0);
-    debug!("📊 Command UUID: {}", command_uuid);
-    trace!("🔍 Final command trace: total_time_ms={}, content_length={}, url_type={}, user_id={}, channel_id={}, command_uuid={}", 
-           total_time.as_millis(), content_length, if is_youtube { "youtube" } else { "webpage" }, 
-           msg.author.id, msg.channel_id, command_uuid);
-    
-    // Final comprehensive logging summary
-    log::info!("🎯 === RANK COMMAND COMPLETION SUMMARY ===");
-    log::info!("🎯 Command UUID: {}", command_uuid);
-    log::info!("🎯 Total execution time: {:.2}s", total_time.as_secs_f64());
-    log::info!("🎯 Content type: {}", if is_youtube { "YouTube" } else { "Webpage" });
-    log::info!("🎯 Content length: {} characters", content_length);
-    log::info!("🎯 User: {} ({})", msg.author.name, msg.author.id);
-    log::info!("🎯 Channel: {} ({})", msg.channel_id, msg.channel_id.0);
-    log::info!("🎯 URL: {}", url);
-    log::info!("🎯 Processing method: {}", if subtitle_file_path.is_some() { "RAG with file" } else { "Direct processing" });
-    
-    // TEMPORARILY BYPASS CLEANUP - Keep temporary files for debugging
-    if let Some(file_path) = subtitle_file_path {
-        // Log file path
-        log::info!("🎯 File path used: {}", file_path);
-        log::info!("🔄 === CLEANUP BYPASSED ===");
-        log::info!("🔄 Temporary file preserved for debugging: {}", file_path);
-        log::info!("🔄 File exists: {}", std::path::Path::new(&file_path).exists());
-        log::info!("🔄 Command UUID: {}", command_uuid);
-        log::info!("🔄 Status: Temporary file preserved (cleanup bypassed)");
-        
-        debug!("🔄 === CLEANUP BYPASSED ===");
-        debug!("🔄 Preserving temporary file for debugging: {}", file_path);
-        trace!("🔍 Cleanup bypassed: path={}, command_uuid={}", file_path, command_uuid);
-    }
-    
-    log::info!("🎯 Status: SUCCESS");
-    
-    Ok(())
-} 
-
-
-
-// Generate cache key from YouTube URL for consistent caching
+/// Generate cache key for YouTube URL
 fn generate_youtube_cache_key(url: &str) -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    
-    let mut hasher = DefaultHasher::new();
-    url.hash(&mut hasher);
-    format!("{:x}", hasher.finish())
+    let mut hasher = Sha256::new();
+    hasher.update(url.as_bytes());
+    format!("{:x}", hasher.finalize())
 }
 
-// Enhanced YouTube transcript fetcher using yt-dlp with detailed logging and caching
-// Downloads and cleans VTT subtitles for a given YouTube URL
+/// Fetch YouTube transcript using yt-dlp
 async fn fetch_youtube_transcript(url: &str) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let process_uuid = Uuid::new_v4();
-    
-    info!("🎥 === YOUTUBE TRANSCRIPT EXTRACTION STARTED ===");
-    info!("🆔 Process UUID: {}", process_uuid);
-    info!("📍 Target URL: {}", url);
-    
-    // TEMPORARILY BYPASS CACHING - Use direct yt_transcript files
-    let subtitles_dir = "subtitles";
-    info!("🔄 === CACHING BYPASSED ===");
-    info!("🔄 Using direct yt_transcript files for RAG processing");
-    debug!("🔄 Cache system temporarily disabled");
-    trace!("🔍 Cache bypass: process_uuid={}", process_uuid);
-    
-    let temp_file = format!("yt_transcript_{}", Uuid::new_v4());
-    info!("📁 Temp file base: {}", temp_file);
-    
-    debug!("🔧 === YOUTUBE TRANSCRIPT INITIALIZATION ===");
-    debug!("🔧 URL length: {} characters", url.len());
-    debug!("🔧 Temp file length: {} characters", temp_file.len());
-    debug!("🔧 Process UUID: {}", process_uuid);
-    trace!("🔍 YouTube transcript extraction details: url_length={}, temp_file_length={}, uuid={}", 
-           url.len(), temp_file.len(), process_uuid);
+    trace!("[TRACE][RANK][fetch_youtube_transcript] === FUNCTION ENTRY ===");
+    trace!("[TRACE][RANK][fetch_youtube_transcript] Function: fetch_youtube_transcript()");
+    trace!("[TRACE][RANK][fetch_youtube_transcript] Process UUID: {}", process_uuid);
+    trace!("[TRACE][RANK][fetch_youtube_transcript] Input URL: '{}'", url);
+    trace!("[TRACE][RANK][fetch_youtube_transcript] Current working dir: {:?}", std::env::current_dir());
     
     // Create subtitles directory if it doesn't exist
-    debug!("📁 === DIRECTORY SETUP ===");
     let subtitles_dir = "subtitles";
-    debug!("📁 Checking subtitles directory: {}", subtitles_dir);
-    debug!("📁 Directory exists: {}", std::path::Path::new(subtitles_dir).exists());
-    trace!("🔍 Directory check: path={}, exists={}, process_uuid={}", subtitles_dir, std::path::Path::new(subtitles_dir).exists(), process_uuid);
-    
     if !std::path::Path::new(subtitles_dir).exists() {
-        debug!("📁 Creating subtitles directory: {}", subtitles_dir);
-        trace!("🔍 Directory creation started: path={}, process_uuid={}", subtitles_dir, process_uuid);
-        std::fs::create_dir(subtitles_dir)?;
-        debug!("✅ Subtitles directory created successfully");
-        trace!("🔍 Directory creation completed: path={}, process_uuid={}", subtitles_dir, process_uuid);
-    } else {
-        debug!("📁 Subtitles directory already exists: {}", subtitles_dir);
-        trace!("🔍 Directory already exists: path={}, process_uuid={}", subtitles_dir, process_uuid);
+        fs::create_dir_all(subtitles_dir)?;
+        println!("Created subtitles directory: {}", subtitles_dir);
     }
     
-    // Check if yt-dlp is available and get version
-    debug!("🔍 === YT-DLP VERSION CHECK ===");
-    debug!("🔍 Checking yt-dlp availability and version...");
-    trace!("🔍 yt-dlp version check started: process_uuid={}", process_uuid);
+    // Generate cache key and file path
+    let cache_key = generate_youtube_cache_key(url);
+    let subtitle_file_path = format!("{}/{}.vtt", subtitles_dir, cache_key);
     
-    let version_output = Command::new("yt-dlp")
-        .arg("--version")
-        .output()
-        .map_err(|e| {
-            error!("❌ === YT-DLP NOT FOUND ERROR ===");
-            error!("❌ yt-dlp is not installed or not in PATH: {}", e);
-            debug!("🔍 yt-dlp PATH error details: {:?}", e);
-            debug!("🔍 yt-dlp PATH error type: {:?}", std::any::type_name_of_val(&e));
-            trace!("🔍 yt-dlp PATH error: error_type={}, process_uuid={}", 
-                   std::any::type_name_of_val(&e), process_uuid);
-            "yt-dlp is not installed. Please install yt-dlp to use YouTube ranking analysis."
-        })?;
-    
-    debug!("📊 === YT-DLP VERSION CHECK RESULTS ===");
-    debug!("📊 yt-dlp version check exit status: {}", version_output.status);
-    debug!("📊 yt-dlp version check success: {}", version_output.status.success());
-    debug!("📊 yt-dlp stdout length: {} bytes", version_output.stdout.len());
-    debug!("📊 yt-dlp stderr length: {} bytes", version_output.stderr.len());
-    trace!("🔍 yt-dlp version check details: success={}, stdout_len={}, stderr_len={}, process_uuid={}", 
-           version_output.status.success(), version_output.stdout.len(), version_output.stderr.len(), process_uuid);
-    
-    if !version_output.status.success() {
-        error!("❌ === YT-DLP VERSION CHECK FAILED ===");
-        error!("❌ yt-dlp version check failed");
-        debug!("🔍 yt-dlp version check stderr: {}", String::from_utf8_lossy(&version_output.stderr));
-        debug!("🔍 yt-dlp version check exit code: {:?}", version_output.status.code());
-        trace!("🔍 yt-dlp version check failure: exit_code={:?}, process_uuid={}", version_output.status.code(), process_uuid);
-        return Err("yt-dlp is not working properly".into());
-    }
-    
-    let version_str = String::from_utf8_lossy(&version_output.stdout);
-    info!("✅ === YT-DLP VERSION CHECK SUCCESS ===");
-    info!("✅ yt-dlp version: {}", version_str.trim());
-    debug!("🔧 yt-dlp version check completed successfully");
-    debug!("🔧 Version string length: {} characters", version_str.trim().len());
-    trace!("🔍 yt-dlp version check success: version={}, version_length={}, process_uuid={}", 
-           version_str.trim(), version_str.trim().len(), process_uuid);
-    
-    // Try multiple subtitle extraction methods with retry logic
-    info!("🔄 === SUBTITLE EXTRACTION PHASE ===");
-    debug!("🔄 Starting subtitle extraction with retry logic...");
-    trace!("🔍 Subtitle extraction phase started: process_uuid={}", process_uuid);
-    
-    let mut success = false;
-    let mut last_error = String::new();
-    let max_retries = 3;
-    
-    debug!("📊 === EXTRACTION CONFIGURATION ===");
-    debug!("📊 Max retries: {}", max_retries);
-    debug!("📊 Sleep interval: 2 seconds");
-    debug!("📊 Max sleep interval: 5 seconds");
-    debug!("📊 Temp file: {}", temp_file);
-    debug!("📊 Subtitles directory: {}", subtitles_dir);
-    trace!("🔍 Extraction configuration details: max_retries={}, temp_file={}, subtitles_dir={}, process_uuid={}", 
-           max_retries, temp_file, subtitles_dir, process_uuid);
-    
-    for attempt in 1..=max_retries {
-        info!("🔄 === ATTEMPT {}/{} STARTED ===", attempt, max_retries);
-        debug!("🔄 Attempt {} of {} started", attempt, max_retries);
-        trace!("🔍 Attempt {} started: attempt_number={}, max_retries={}, process_uuid={}", 
-               attempt, attempt, max_retries, process_uuid);
-        
-        // Method 1: Try automatic subtitles first
-        debug!("🔄 === METHOD 1: AUTOMATIC SUBTITLES ===");
-        debug!("🔄 Method 1: Trying automatic subtitles...");
-        trace!("🔍 Method 1 (automatic subtitles) started: attempt={}, process_uuid={}", attempt, process_uuid);
-        
-        let mut command = Command::new("yt-dlp");
-        command
-            .arg("--write-auto-sub")
-            .arg("--write-sub")
-            .arg("--sub-langs").arg("en")
-            .arg("--sub-format").arg("vtt")
-            .arg("--skip-download")
-            .arg("--no-warnings")
-            .arg("--no-playlist")
-            .arg("--sleep-interval").arg("2")  // Add 2 second delay between requests
-            .arg("--max-sleep-interval").arg("5")  // Max 5 second delay
-            .arg("--output").arg(&format!("{}/{}", subtitles_dir, temp_file))
-            .arg(url);
-        
-        debug!("📋 === YT-DLP COMMAND ARGUMENTS ===");
-        debug!("📋 yt-dlp command arguments:");
-        debug!("📋   - --write-auto-sub");
-        debug!("📋   - --write-sub");
-        debug!("📋   - --sub-langs en");
-        debug!("📋   - --sub-format vtt");
-        debug!("📋   - --skip-download");
-        debug!("📋   - --no-warnings");
-        debug!("📋   - --no-playlist");
-        debug!("📋   - --sleep-interval 2");
-        debug!("📋   - --max-sleep-interval 5");
-        debug!("📋   - --output {}/{}", subtitles_dir, temp_file);
-        debug!("📋   - URL: {}", url);
-        trace!("🔍 yt-dlp command details: attempt={}, output_path={}/{}, url_length={}, process_uuid={}", 
-               attempt, subtitles_dir, temp_file, url.len(), process_uuid);
-        
-        debug!("🚀 === YT-DLP COMMAND EXECUTION ===");
-        debug!("🚀 Executing yt-dlp command...");
-        trace!("🔍 yt-dlp command execution started: attempt={}, process_uuid={}", attempt, process_uuid);
-        
-        let output = command.output()?;
-        
-        debug!("📊 === YT-DLP COMMAND RESULTS ===");
-        debug!("📊 yt-dlp command completed with exit status: {}", output.status);
-        debug!("📊 yt-dlp command success: {}", output.status.success());
-        debug!("📊 yt-dlp stdout length: {} bytes", output.stdout.len());
-        debug!("📊 yt-dlp stderr length: {} bytes", output.stderr.len());
-        trace!("🔍 yt-dlp command execution completed: success={}, stdout_len={}, stderr_len={}, attempt={}, process_uuid={}", 
-               output.status.success(), output.stdout.len(), output.stderr.len(), attempt, process_uuid);
-        
-        if output.status.success() {
-            success = true;
-            info!("✅ === METHOD 1 SUCCESS ===");
-            info!("✅ Method 1 (automatic subtitles) succeeded on attempt {}", attempt);
-            debug!("📄 yt-dlp stdout: {}", String::from_utf8_lossy(&output.stdout));
-            trace!("🔍 Method 1 success details: attempt={}, stdout_length={}, process_uuid={}", 
-                   attempt, output.stdout.len(), process_uuid);
-            break;
-        } else {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            last_error = stderr.to_string();
-            
-            warn!("❌ === METHOD 1 FAILED ===");
-            warn!("❌ Method 1 failed on attempt {}", attempt);
-            debug!("📄 yt-dlp stdout: {}", stdout);
-            debug!("❌ yt-dlp stderr: {}", stderr);
-            debug!("❌ stderr length: {} characters", stderr.len());
-            debug!("❌ stdout length: {} characters", stdout.len());
-            trace!("🔍 Method 1 failure details: attempt={}, stderr_length={}, stdout_length={}, process_uuid={}", 
-                   attempt, stderr.len(), stdout.len(), process_uuid);
-            
-            // Check if it's a rate limit error
-            debug!("🔍 === RATE LIMIT CHECK ===");
-            debug!("🔍 Checking for rate limit errors...");
-            debug!("🔍 stderr contains '429': {}", stderr.contains("429"));
-            debug!("🔍 stderr contains 'Too Many Requests': {}", stderr.contains("Too Many Requests"));
-            trace!("🔍 Rate limit detection: stderr_contains_429={}, stderr_contains_too_many_requests={}, attempt={}, process_uuid={}", 
-                   stderr.contains("429"), stderr.contains("Too Many Requests"), attempt, process_uuid);
-            
-            if stderr.contains("429") || stderr.contains("Too Many Requests") {
-                warn!("🚨 === RATE LIMIT DETECTED ===");
-                warn!("🚨 Rate limit detected (429/Too Many Requests)");
-                trace!("🔍 Rate limit detection: stderr_contains_429={}, stderr_contains_too_many_requests={}, attempt={}, process_uuid={}", 
-                       stderr.contains("429"), stderr.contains("Too Many Requests"), attempt, process_uuid);
-                
-                if attempt < max_retries {
-                    let delay = attempt * 5; // Exponential backoff: 5s, 10s, 15s
-                    warn!("⏳ === RATE LIMIT DELAY ===");
-                    warn!("⏳ Rate limited. Waiting {} seconds before retry...", delay);
-                    debug!("⏳ Delay calculation: attempt={}, delay_seconds={}", attempt, delay);
-                    trace!("🔍 Rate limit delay: delay_seconds={}, attempt={}, max_retries={}, process_uuid={}", 
-                           delay, attempt, max_retries, process_uuid);
-                    
-                    tokio::time::sleep(tokio::time::Duration::from_secs(delay)).await;
-                    debug!("✅ Wait completed, proceeding to retry");
-                    trace!("🔍 Rate limit delay completed, continuing to next attempt: process_uuid={}", process_uuid);
-                    continue;
-                } else {
-                    warn!("❌ === MAX RETRIES REACHED ===");
-                    warn!("❌ Max retries reached, cannot retry rate limit");
-                    debug!("❌ Final attempt reached: attempt={}, max_retries={}", attempt, max_retries);
-                    trace!("🔍 Max retries reached: attempt={}, max_retries={}, process_uuid={}", attempt, max_retries, process_uuid);
+    // Check if we have a cached version
+    if std::path::Path::new(&subtitle_file_path).exists() {
+        println!("Using cached subtitle file: {}", subtitle_file_path);
+        match fs::read_to_string(&subtitle_file_path) {
+            Ok(content) => {
+                let cleaned_content = clean_vtt_content(&content);
+                if !cleaned_content.trim().is_empty() {
+                    trace!("[TRACE][RANK][fetch_youtube_transcript] Using cached content: {} chars", cleaned_content.len());
+                    return Ok(cleaned_content);
                 }
             }
-            
-            // Method 2: Try manual subtitles only
-            debug!("🔄 === METHOD 2: MANUAL SUBTITLES ===");
-            debug!("🔄 Method 2: Trying manual subtitles only...");
-            trace!("🔍 Method 2 (manual subtitles) started: attempt={}, process_uuid={}", attempt, process_uuid);
-            
-            let mut command2 = Command::new("yt-dlp");
-            command2
-                .arg("--write-sub")
-                .arg("--sub-langs").arg("en")
-                .arg("--sub-format").arg("vtt")
-                .arg("--skip-download")
-                .arg("--no-warnings")
-                .arg("--no-playlist")
-                .arg("--sleep-interval").arg("2")  // Add 2 second delay between requests
-                .arg("--max-sleep-interval").arg("5")  // Max 5 second delay
-                .arg("--output").arg(&format!("{}/{}", subtitles_dir, temp_file))
-                .arg(url);
-            
-            debug!("📋 === METHOD 2 COMMAND ARGUMENTS ===");
-            debug!("📋 Method 2 yt-dlp command arguments:");
-            debug!("📋   - --write-sub");
-            debug!("📋   - --sub-langs en");
-            debug!("📋   - --sub-format vtt");
-            debug!("📋   - --skip-download");
-            debug!("📋   - --no-warnings");
-            debug!("📋   - --no-playlist");
-            debug!("📋   - --sleep-interval 2");
-            debug!("📋   - --max-sleep-interval 5");
-            debug!("📋   - --output {}/{}", subtitles_dir, temp_file);
-            debug!("📋   - URL: {}", url);
-            trace!("🔍 Method 2 command details: attempt={}, output_path={}/{}, url_length={}, process_uuid={}", 
-                   attempt, subtitles_dir, temp_file, url.len(), process_uuid);
-            
-            debug!("🚀 === METHOD 2 COMMAND EXECUTION ===");
-            debug!("🚀 Executing Method 2 yt-dlp command...");
-            trace!("🔍 Method 2 command execution started: attempt={}, process_uuid={}", attempt, process_uuid);
-            
-            let output2 = command2.output()?;
-            
-            debug!("📊 === METHOD 2 COMMAND RESULTS ===");
-            debug!("📊 Method 2 yt-dlp command completed with exit status: {}", output2.status);
-            debug!("📊 Method 2 yt-dlp command success: {}", output2.status.success());
-            debug!("📊 Method 2 yt-dlp stdout length: {} bytes", output2.stdout.len());
-            debug!("📊 Method 2 yt-dlp stderr length: {} bytes", output2.stderr.len());
-            trace!("🔍 Method 2 command execution completed: success={}, stdout_len={}, stderr_len={}, attempt={}, process_uuid={}", 
-                   output2.status.success(), output2.stdout.len(), output2.stderr.len(), attempt, process_uuid);
-            
-            if output2.status.success() {
-                success = true;
-                info!("✅ === METHOD 2 SUCCESS ===");
-                info!("✅ Method 2 (manual subtitles) succeeded on attempt {}", attempt);
-                debug!("📄 Method 2 yt-dlp stdout: {}", String::from_utf8_lossy(&output2.stdout));
-                trace!("🔍 Method 2 success details: attempt={}, stdout_length={}, process_uuid={}", 
-                       attempt, output2.stdout.len(), process_uuid);
-                break;
-            } else {
-                let stderr2 = String::from_utf8_lossy(&output2.stderr);
-                last_error = stderr2.to_string();
-                
-                warn!("❌ === METHOD 2 FAILED ===");
-                warn!("❌ Method 2 failed on attempt {}: {}", attempt, stderr2);
-                debug!("📄 Method 2 yt-dlp stdout: {}", String::from_utf8_lossy(&output2.stdout));
-                debug!("❌ Method 2 yt-dlp stderr: {}", stderr2);
-                debug!("❌ Method 2 stderr length: {} characters", stderr2.len());
-                debug!("❌ Method 2 stdout length: {} characters", output2.stdout.len());
-                trace!("🔍 Method 2 failure details: attempt={}, stderr_length={}, stdout_length={}, process_uuid={}", 
-                       attempt, stderr2.len(), output2.stdout.len(), process_uuid);
-                
-                // Check if it's a rate limit error
-                debug!("🔍 === METHOD 2 RATE LIMIT CHECK ===");
-                debug!("🔍 Checking Method 2 for rate limit errors...");
-                debug!("🔍 Method 2 stderr contains '429': {}", stderr2.contains("429"));
-                debug!("🔍 Method 2 stderr contains 'Too Many Requests': {}", stderr2.contains("Too Many Requests"));
-                trace!("🔍 Method 2 rate limit detection: stderr_contains_429={}, stderr_contains_too_many_requests={}, attempt={}, process_uuid={}", 
-                       stderr2.contains("429"), stderr2.contains("Too Many Requests"), attempt, process_uuid);
-                
-                if stderr2.contains("429") || stderr2.contains("Too Many Requests") {
-                    if attempt < max_retries {
-                        let delay = attempt * 5; // Exponential backoff: 5s, 10s, 15s
-                        warn!("⏳ === METHOD 2 RATE LIMIT DELAY ===");
-                        warn!("⏳ Rate limited. Waiting {} seconds before retry...", delay);
-                        debug!("⏳ Method 2 delay calculation: attempt={}, delay_seconds={}", attempt, delay);
-                        trace!("🔍 Method 2 rate limit delay: delay_seconds={}, attempt={}, max_retries={}, process_uuid={}", 
-                               delay, attempt, max_retries, process_uuid);
-                        
-                        tokio::time::sleep(tokio::time::Duration::from_secs(delay)).await;
-                        debug!("✅ Method 2 wait completed, proceeding to retry");
-                        trace!("🔍 Method 2 rate limit delay completed, continuing to next attempt: process_uuid={}", process_uuid);
-                        continue;
-                    }
-                }
+            Err(e) => {
+                println!("Failed to read cached subtitle file: {}", e);
             }
         }
     }
     
-    if !success {
-        error!("❌ === ALL SUBTITLE EXTRACTION METHODS FAILED ===");
-        error!("❌ All subtitle extraction methods failed");
-        error!("❌ Last error: {}", last_error);
-        debug!("🔍 Final failure summary: success={}, last_error_length={}, process_uuid={}", 
-               success, last_error.len(), process_uuid);
-        trace!("🔍 All methods failed: success={}, last_error={}, process_uuid={}", 
-               success, last_error, process_uuid);
-        
-        // Check for common error patterns and provide helpful messages
-        debug!("🔍 === ERROR PATTERN ANALYSIS ===");
-        debug!("🔍 Analyzing error patterns for helpful messages...");
-        debug!("🔍 Error contains 'Did not get any data blocks': {}", last_error.contains("Did not get any data blocks"));
-        debug!("🔍 Error contains 'Sign in to confirm you're not a bot': {}", last_error.contains("Sign in to confirm you're not a bot"));
-        debug!("🔍 Error contains 'Private video': {}", last_error.contains("Private video"));
-        debug!("🔍 Error contains 'Video unavailable': {}", last_error.contains("Video unavailable"));
-        debug!("🔍 Error contains '429': {}", last_error.contains("429"));
-        debug!("🔍 Error contains 'Too Many Requests': {}", last_error.contains("Too Many Requests"));
-        debug!("🔍 Error contains 'No subtitles': {}", last_error.contains("No subtitles"));
-        debug!("🔍 Error contains 'no automatic captions': {}", last_error.contains("no automatic captions"));
-        debug!("🔍 Error contains 'This video is not available': {}", last_error.contains("This video is not available"));
-        trace!("🔍 Error pattern analysis: data_blocks={}, bot_confirmation={}, private_video={}, video_unavailable={}, rate_limit={}, no_subtitles={}, not_available={}, process_uuid={}", 
-               last_error.contains("Did not get any data blocks"), last_error.contains("Sign in to confirm you're not a bot"), 
-               last_error.contains("Private video"), last_error.contains("Video unavailable"), 
-               last_error.contains("429") || last_error.contains("Too Many Requests"),
-               last_error.contains("No subtitles") || last_error.contains("no automatic captions"),
-               last_error.contains("This video is not available"), process_uuid);
-        
-        if last_error.contains("Did not get any data blocks") {
-            return Err("YouTube subtitles extraction failed: 'Did not get any data blocks'. This is usually caused by YouTube's anti-bot measures or an outdated yt-dlp version. Try updating yt-dlp with: yt-dlp -U".into());
-        }
-        
-        if last_error.contains("Sign in to confirm you're not a bot") {
-            return Err("YouTube is blocking requests: 'Sign in to confirm you're not a bot'. This is a temporary YouTube restriction. Try again later or use a different video.".into());
-        }
-        
-        if last_error.contains("Private video") || last_error.contains("Video unavailable") {
-            return Err("Video is private or unavailable. Please check the URL and try again.".into());
-        }
-        
-        if last_error.contains("429") || last_error.contains("Too Many Requests") {
-            return Err("YouTube is rate limiting requests. Please wait a few minutes and try again, or try a different video.".into());
-        }
-        
-        if last_error.contains("No subtitles") || last_error.contains("no automatic captions") {
-            return Err("This video has no automatic captions or subtitles available.".into());
-        }
-        
-        if last_error.contains("Video unavailable") {
-            return Err("This video is unavailable or has been removed.".into());
-        }
-        
-        if last_error.contains("This video is not available") {
-            return Err("This video is not available in your region or has been made private.".into());
-        }
-        
-        return Err(format!("yt-dlp failed to extract subtitles: {}", last_error).into());
+    // Download transcript using yt-dlp
+    println!("Downloading transcript for: {}", url);
+    
+    let output = Command::new("yt-dlp")
+        .args(&[
+            "--write-sub",
+            "--write-auto-sub",
+            "--sub-format", "vtt",
+            "--skip-download",
+            "--output", &subtitle_file_path,
+            url
+        ])
+        .output()?;
+    
+    if !output.status.success() {
+        let error_output = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("yt-dlp failed: {}\n\nError output:\n{}", output.status, error_output).into());
     }
     
-    info!("✅ === YT-DLP SUBTITLE EXTRACTION SUCCESS ===");
-    info!("✅ yt-dlp subtitle extraction completed successfully");
-    debug!("🔧 Subtitle extraction phase completed: success={}, process_uuid={}", success, process_uuid);
-    trace!("🔍 yt-dlp subtitle extraction success: process_uuid={}", process_uuid);
-    
-    // Look for the subtitle file with multiple possible naming patterns
-    debug!("📄 === SUBTITLE FILE SEARCH ===");
-    debug!("📄 Looking for subtitle files with multiple naming patterns...");
-    
-    let possible_vtt_files = vec![
-        format!("{}/{}.en.vtt", subtitles_dir, temp_file),
-        format!("{}/{}.en-auto.vtt", subtitles_dir, temp_file),
-        format!("{}/{}.en-manual.vtt", subtitles_dir, temp_file),
-        format!("{}/{}.vtt", subtitles_dir, temp_file),
-    ];
-    
-    debug!("📄 Possible VTT file patterns: {:?}", possible_vtt_files);
-    trace!("🔍 Subtitle file search: patterns={:?}, process_uuid={}", possible_vtt_files, process_uuid);
-    
-    // List all files in the subtitles directory that match the temp_file pattern
-    debug!("📁 === DIRECTORY SCAN ===");
-    debug!("📁 Scanning subtitles directory for matching files...");
-    if let Ok(entries) = std::fs::read_dir(subtitles_dir) {
-        let files: Vec<String> = entries
-            .filter_map(|e| e.ok())
-            .map(|e| e.file_name().to_string_lossy().to_string())
-            .filter(|name| name.contains(&temp_file) && name.ends_with(".vtt"))
-            .collect();
-        debug!("📁 Found VTT files in subtitles directory: {:?}", files);
-        debug!("📁 Total matching files found: {}", files.len());
-        trace!("🔍 Directory scan: found_files={:?}, file_count={}, process_uuid={}", files, files.len(), process_uuid);
-    } else {
-        warn!("⚠️ Could not read subtitles directory for file listing");
-        debug!("🔍 Directory read error: path={}, process_uuid={}", subtitles_dir, process_uuid);
-    }
-    
-    let mut vtt_file = None;
-    debug!("🔍 === FILE PATTERN MATCHING ===");
-    for (i, file_path) in possible_vtt_files.iter().enumerate() {
-        debug!("🔍 Checking pattern {}: {}", i+1, file_path);
-        debug!("🔍 File exists: {}", std::path::Path::new(file_path).exists());
-        trace!("🔍 File check: pattern={}, exists={}, process_uuid={}", file_path, std::path::Path::new(file_path).exists(), process_uuid);
-        
-        if std::path::Path::new(file_path).exists() {
-            vtt_file = Some(file_path.clone());
-            info!("✅ === SUBTITLE FILE FOUND ===");
-            info!("✅ Found subtitle file: {}", file_path);
-            debug!("📄 Selected subtitle file: {}", file_path);
-            debug!("📄 File size: {} bytes", std::fs::metadata(file_path).map(|m| m.len()).unwrap_or(0));
-            trace!("🔍 Subtitle file selected: path={}, size={}, process_uuid={}", 
-                   file_path, std::fs::metadata(file_path).map(|m| m.len()).unwrap_or(0), process_uuid);
-            break;
-        } else {
-            trace!("🔍 Subtitle file not found: path={}, process_uuid={}", file_path, process_uuid);
-        }
-    }
-    
-    let vtt_file = match vtt_file {
-        Some(path) => path,
-        None => {
-            error!("❌ === NO SUBTITLE FILE FOUND ===");
-            error!("❌ No subtitle file found with any expected pattern");
-            debug!("🔍 File search failed: checked_patterns={}, process_uuid={}", possible_vtt_files.len(), process_uuid);
-            
-            // List files in subtitles directory for debugging
-            debug!("📁 === DEBUGGING DIRECTORY CONTENTS ===");
-            if let Ok(entries) = std::fs::read_dir(subtitles_dir) {
-                let files: Vec<String> = entries
-                    .filter_map(|e| e.ok())
-                    .map(|e| e.file_name().to_string_lossy().to_string())
-                    .filter(|name| name.contains(&temp_file) && name.ends_with(".vtt"))
-                    .collect();
-                debug!("📁 Found VTT files in subtitles directory: {:?}", files);
-                debug!("📁 Total matching files found: {}", files.len());
-                trace!("🔍 Directory scan (on error): found_files={:?}, file_count={}, process_uuid={}", files, files.len(), process_uuid);
+    // Read the downloaded subtitle file
+    match fs::read_to_string(&subtitle_file_path) {
+        Ok(content) => {
+            let cleaned_content = clean_vtt_content(&content);
+            if cleaned_content.trim().is_empty() {
+                return Err("No subtitle content found after cleaning".into());
             }
-            return Err("Subtitle file was not created by yt-dlp. The video may not have automatic captions available.".into());
+            println!("Successfully extracted transcript: {} characters", cleaned_content.len());
+            trace!("[TRACE][RANK][fetch_youtube_transcript] Successfully extracted transcript: {} chars", cleaned_content.len());
+            Ok(cleaned_content)
         }
-    };
-    
-    debug!("📖 === SUBTITLE FILE READING ===");
-    debug!("📖 Reading subtitle file: {}", vtt_file);
-    trace!("🔍 Subtitle file read started: path={}, process_uuid={}", vtt_file, process_uuid);
-    
-    let content = fs::read_to_string(&vtt_file)?;
-    
-    debug!("📖 === SUBTITLE FILE READ SUCCESS ===");
-    debug!("📖 Read subtitle file: {} characters from {}", content.len(), vtt_file);
-    debug!("📖 File content preview: {}", &content[..std::cmp::min(100, content.len())]);
-    debug!("📖 File content contains 'WEBVTT': {}", content.contains("WEBVTT"));
-    debug!("📖 File content is empty: {}", content.trim().is_empty());
-    trace!("🔍 Subtitle file read: path={}, length={}, preview='{}', process_uuid={}", 
-           vtt_file, content.len(), &content[..std::cmp::min(100, content.len())], process_uuid);
-    
-    // Check if content is valid
-    debug!("🔍 === SUBTITLE CONTENT VALIDATION ===");
-    debug!("🔍 Validating subtitle file content...");
-    
-    if content.trim().is_empty() {
-        error!("❌ === EMPTY SUBTITLE FILE ERROR ===");
-        error!("❌ Downloaded subtitle file is empty: {}", vtt_file);
-        debug!("🔍 Subtitle file empty: path={}, content_length={}", vtt_file, content.len());
-        trace!("🔍 Subtitle file empty: path={}, process_uuid={}", vtt_file, process_uuid);
-        return Err("Downloaded subtitle file is empty".into());
+        Err(e) => {
+            Err(format!("Failed to read subtitle file: {}", e).into())
+        }
     }
-    
-    if !content.contains("WEBVTT") {
-        error!("❌ === INVALID VTT FILE ERROR ===");
-        error!("❌ Downloaded file is not a valid VTT subtitle file: {}", vtt_file);
-        debug!("🔍 Subtitle file missing WEBVTT header: path={}", vtt_file);
-        debug!("🔍 File content starts with: {}", &content[..std::cmp::min(50, content.len())]);
-        trace!("🔍 Subtitle file missing WEBVTT header: path={}, process_uuid={}", vtt_file, process_uuid);
-        return Err("Downloaded file is not a valid VTT subtitle file".into());
-    }
-    
-    debug!("✅ Subtitle content validation passed");
-    trace!("🔍 Subtitle content validation success: path={}, process_uuid={}", vtt_file, process_uuid);
-    
-    // Clean VTT content
-    debug!("🧹 === VTT CONTENT CLEANING ===");
-    debug!("🧹 Cleaning VTT content from file: {}", vtt_file);
-    trace!("🔍 VTT cleaning started: original_length={}, process_uuid={}", content.len(), process_uuid);
-    
-    let cleaned = clean_vtt_content(&content);
-    
-    debug!("✅ === VTT CLEANING COMPLETED ===");
-    debug!("✅ VTT content cleaned: {} characters", cleaned.len());
-    debug!("✅ Cleaning ratio: {:.2}%", (cleaned.len() as f64 / content.len() as f64) * 100.0);
-    debug!("✅ Cleaned content preview: {}", &cleaned[..std::cmp::min(100, cleaned.len())]);
-    trace!("🔍 VTT cleaning completed: cleaned_length={}, preview='{}', process_uuid={}", 
-           cleaned.len(), &cleaned[..std::cmp::min(100, cleaned.len())], process_uuid);
-    
-    if cleaned.trim().is_empty() {
-        error!("❌ === EMPTY CLEANED CONTENT ERROR ===");
-        error!("❌ No readable text found in subtitle file after cleaning: {}", vtt_file);
-        debug!("🔍 Cleaned subtitle file empty: path={}, original_length={}, cleaned_length={}", vtt_file, content.len(), cleaned.len());
-        trace!("🔍 Cleaned subtitle file empty: path={}, process_uuid={}", vtt_file, process_uuid);
-        return Err("No readable text found in subtitle file after cleaning".into());
-    }
-    
-    info!("✅ === YOUTUBE TRANSCRIPT EXTRACTION COMPLETED ===");
-    info!("✅ YouTube transcript extraction completed successfully");
-    debug!("📄 Final subtitle file: {}", vtt_file);
-    debug!("📄 Original content: {} characters", content.len());
-    debug!("📄 Cleaned content: {} characters", cleaned.len());
-    debug!("📄 Process UUID: {}", process_uuid);
-    trace!("🔍 YouTube transcript extraction success: file_path={}, original_length={}, cleaned_length={}, process_uuid={}", 
-           vtt_file, content.len(), cleaned.len(), process_uuid);
-    
-    // TEMPORARILY BYPASS CACHING - Return temporary file directly
-    info!("🔄 === RETURNING TEMPORARY FILE PATH ===");
-    info!("🔄 Returning temporary file path for RAG processing: {}", vtt_file);
-    debug!("📄 Temporary file path: {}", vtt_file);
-    trace!("🔍 Returning temporary path: temp={}, process_uuid={}", vtt_file, process_uuid);
-    
-    Ok(vtt_file)
-} 
+}
 
-// Enhanced VTT cleaner
-// Removes timestamps, tags, and empty lines from VTT subtitle content
+/// Clean VTT subtitle content
 fn clean_vtt_content(vtt: &str) -> String {
-    debug!("🧹 === VTT CLEANING STARTED ===");
-    debug!("🧹 Cleaning VTT content...");
-    debug!("🧹 Original VTT content length: {} characters", vtt.len());
-    debug!("🧹 Original VTT line count: {}", vtt.lines().count());
-    trace!("🔍 VTT cleaning started: original_length={}, line_count={}", vtt.len(), vtt.lines().count());
+    let lines: Vec<&str> = vtt.lines().collect();
+    let mut cleaned_lines = Vec::new();
+    let mut in_cue = false;
     
-    let mut lines = Vec::new();
-    let mut processed_lines = 0;
-    let mut skipped_lines = 0;
-    let mut kept_lines = 0;
-    
-    debug!("📝 === LINE PROCESSING ===");
-    for (line_num, line) in vtt.lines().enumerate() {
-        processed_lines += 1;
-        let original_line = line;
+    for line in lines {
         let line = line.trim();
         
-        // Skip headers, timestamps, and empty lines
-        let is_empty = line.is_empty();
-        let is_webvtt = line.starts_with("WEBVTT");
-        let is_note = line.starts_with("NOTE");
-        let is_timestamp = line.contains("-->");
-        let is_numeric = line.chars().all(|c| c.is_numeric() || c == ':' || c == '.' || c == ' ');
-        
-        if is_empty || is_webvtt || is_note || is_timestamp || is_numeric {
-            skipped_lines += 1;
-            trace!("🔍 Line {} skipped: empty={}, webvtt={}, note={}, timestamp={}, numeric={}, content='{}'", 
-                   line_num + 1, is_empty, is_webvtt, is_note, is_timestamp, is_numeric, original_line);
+        // Skip empty lines and VTT header
+        if line.is_empty() || line == "WEBVTT" || line.starts_with("NOTE") {
             continue;
         }
         
-        // Clean various subtitle tags
-        debug!("🧹 === TAG CLEANING ===");
-        let mut cleaned = line.to_string();
-        
-        // Track tag removals
-        let original_cleaned = cleaned.clone();
-        let mut tags_removed = 0;
-        
-        // Remove various subtitle tags
-        if cleaned.contains("<c>") {
-            cleaned = cleaned.replace("<c>", "");
-            tags_removed += 1;
-        }
-        if cleaned.contains("</c>") {
-            cleaned = cleaned.replace("</c>", "");
-            tags_removed += 1;
-        }
-        if cleaned.contains("<v ") {
-            cleaned = cleaned.replace("<v ", "");
-            tags_removed += 1;
-        }
-        if cleaned.contains("</v>") {
-            cleaned = cleaned.replace("</v>", "");
-            tags_removed += 1;
-        }
-        if cleaned.contains("<b>") {
-            cleaned = cleaned.replace("<b>", "");
-            tags_removed += 1;
-        }
-        if cleaned.contains("</b>") {
-            cleaned = cleaned.replace("</b>", "");
-            tags_removed += 1;
-        }
-        if cleaned.contains("<i>") {
-            cleaned = cleaned.replace("<i>", "");
-            tags_removed += 1;
-        }
-        if cleaned.contains("</i>") {
-            cleaned = cleaned.replace("</i>", "");
-            tags_removed += 1;
-        }
-        if cleaned.contains("<u>") {
-            cleaned = cleaned.replace("<u>", "");
-            tags_removed += 1;
-        }
-        if cleaned.contains("</u>") {
-            cleaned = cleaned.replace("</u>", "");
-            tags_removed += 1;
+        // Skip timestamp lines
+        if line.contains("-->") {
+            in_cue = true;
+            continue;
         }
         
-        cleaned = cleaned.trim().to_string();
-        
-        if tags_removed > 0 {
-            trace!("🔍 Line {} tag cleaning: removed {} tags, '{}' -> '{}'", 
-                   line_num + 1, tags_removed, original_cleaned, cleaned);
+        // Skip cue identifier lines (numbers)
+        if line.chars().all(|c| c.is_numeric()) {
+            continue;
         }
         
-        if !cleaned.is_empty() {
-            lines.push(cleaned.clone());
-            kept_lines += 1;
-            trace!("🔍 Line {} kept: '{}'", line_num + 1, cleaned);
-        } else {
-            skipped_lines += 1;
-            trace!("🔍 Line {} skipped after cleaning: was '{}'", line_num + 1, original_line);
+        // Add content lines
+        if in_cue && !line.is_empty() {
+            cleaned_lines.push(line);
         }
     }
     
-    debug!("📊 === LINE PROCESSING STATISTICS ===");
-    debug!("📊 Total lines processed: {}", processed_lines);
-    debug!("📊 Lines skipped: {}", skipped_lines);
-    debug!("📊 Lines kept: {}", kept_lines);
-    debug!("📊 Keep ratio: {:.2}%", (kept_lines as f64 / processed_lines as f64) * 100.0);
-    
-    let result = lines.join(" ");
-    debug!("🔗 === LINE JOINING ===");
-    debug!("🔗 Joined {} lines into single string", lines.len());
-    debug!("🔗 Result length: {} characters", result.len());
-    trace!("🔍 Line joining completed: line_count={}, result_length={}", lines.len(), result.len());
-    
-    // Additional cleanup: remove excessive whitespace
-    debug!("🧹 === WHITESPACE CLEANUP ===");
-    let _original_result = result.clone();
-    let final_result = result
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
-    
-    debug!("🧹 === FINAL VTT CLEANING COMPLETED ===");
-    debug!("🧹 VTT cleaning complete: {} lines -> {} characters", lines.len(), result.len());
-    debug!("🧹 Final VTT cleaning: {} -> {} characters", result.len(), final_result.len());
-    debug!("🧹 Total reduction: {:.2}%", (final_result.len() as f64 / vtt.len() as f64) * 100.0);
-    debug!("🧹 Final result preview: {}", &final_result[..std::cmp::min(100, final_result.len())]);
-    
-    trace!("🔍 VTT cleaning final: original_length={}, processed_lines={}, kept_lines={}, final_length={}, reduction_percent={:.2}%", 
-           vtt.len(), processed_lines, kept_lines, final_result.len(), 
-           (final_result.len() as f64 / vtt.len() as f64) * 100.0);
-    
-    final_result
+    cleaned_lines.join(" ")
 }
 
-// Simple webpage fetcher
-// Downloads and cleans HTML content for a given URL
+/// Fetch webpage content
 async fn fetch_webpage_content(url: &str) -> Result<(String, String), Box<dyn std::error::Error + Send + Sync>> {
-    let fetch_uuid = Uuid::new_v4();
+    let client = get_http_client().await;
     
-    info!("🌐 === WEBPAGE FETCHING STARTED ===");
-    info!("🆔 Fetch UUID: {}", fetch_uuid);
-    info!("📍 Target URL: {}", url);
-    
-    debug!("🔧 === WEBPAGE FETCH INITIALIZATION ===");
-    debug!("🔧 URL length: {} characters", url.len());
-    debug!("🔧 Fetch UUID: {}", fetch_uuid);
-    trace!("🔍 Webpage fetch started: url_length={}, fetch_uuid={}", url.len(), fetch_uuid);
-    
-    debug!("🌐 Starting webpage fetch for URL: {}", url);
-    
-    debug!("🔧 === HTTP CLIENT SETUP ===");
-    debug!("🔧 Creating HTTP client with timeout...");
-    trace!("🔍 HTTP client creation started: fetch_uuid={}", fetch_uuid);
-    
-    let client = reqwest::Client::builder()
+    let response = client
+        .get(url)
         .timeout(Duration::from_secs(30))
-        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
-        .build()?;
-    
-    debug!("✅ HTTP client created successfully");
-    debug!("🔧 Timeout: 30 seconds");
-    debug!("🔧 User agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36");
-    trace!("🔍 HTTP client created: timeout=30s, fetch_uuid={}", fetch_uuid);
-    
-    debug!("📡 === HTTP REQUEST EXECUTION ===");
-    debug!("📡 Sending HTTP request...");
-    trace!("🔍 HTTP request started: url={}, fetch_uuid={}", url, fetch_uuid);
-    
-    let response = client.get(url).send().await?;
-    let status = response.status();
-    
-    debug!("📡 === HTTP RESPONSE RECEIVED ===");
-    debug!("📡 HTTP Response Status: {}", status);
-    debug!("📡 HTTP Response Status Code: {}", status.as_u16());
-    debug!("📡 HTTP Response Success: {}", status.is_success());
-    debug!("📡 HTTP Response Headers: {:?}", response.headers());
-    trace!("🔍 HTTP response received: status={}, status_code={}, success={}, fetch_uuid={}", 
-           status, status.as_u16(), status.is_success(), fetch_uuid);
+        .send()
+        .await?;
     
     if !response.status().is_success() {
-        error!("❌ === HTTP ERROR RESPONSE ===");
-        error!("❌ HTTP error: {}", status);
-        debug!("🔍 HTTP error details: status_code={}, status_text={}", status.as_u16(), status.as_str());
-        trace!("🔍 HTTP error: status={}, fetch_uuid={}", status, fetch_uuid);
-        return Err(format!("HTTP error: {}", response.status()).into());
+        return Err(format!("HTTP {}: {}", response.status(), response.status().as_str()).into());
     }
-    
-    debug!("📄 === HTML CONTENT DOWNLOAD ===");
-    debug!("📄 Downloading HTML content...");
-    trace!("🔍 HTML content download started: fetch_uuid={}", fetch_uuid);
     
     let html = response.text().await?;
+    let cleaned_content = clean_html(&html);
     
-    debug!("📄 === HTML CONTENT DOWNLOADED ===");
-    debug!("📄 Downloaded HTML content: {} characters", html.len());
-    debug!("📄 HTML content preview: {}", &html[..std::cmp::min(200, html.len())]);
-    debug!("📄 HTML contains '<html': {}", html.contains("<html"));
-    debug!("📄 HTML contains '<body': {}", html.contains("<body"));
-    debug!("📄 HTML contains '<head': {}", html.contains("<head"));
-    trace!("🔍 HTML content downloaded: length={}, preview_length={}, fetch_uuid={}", 
-           html.len(), std::cmp::min(200, html.len()), fetch_uuid);
+    // Extract title from HTML
+    let title = extract_title_from_html(&html).unwrap_or_else(|| "Unknown Title".to_string());
     
-    // Save HTML to temporary file for RAG processing
-    debug!("💾 === HTML FILE SAVING ===");
-    debug!("💾 Saving HTML content to temporary file...");
-    trace!("🔍 HTML file saving started: html_length={}, fetch_uuid={}", html.len(), fetch_uuid);
-    
-    let temp_dir = std::env::temp_dir();
-    let file_name = format!("webpage_{}.html", fetch_uuid);
-    let file_path = temp_dir.join(&file_name);
-    
-    debug!("💾 Temporary file path: {:?}", file_path);
-    debug!("💾 File name: {}", file_name);
-    trace!("🔍 File path created: path={:?}, fetch_uuid={}", file_path, fetch_uuid);
-    
-    match fs::write(&file_path, &html) {
-        Ok(_) => {
-            debug!("✅ HTML file saved successfully");
-            debug!("💾 File size: {} bytes", html.len());
-            debug!("💾 File path: {:?}", file_path);
-            trace!("🔍 HTML file saved: path={:?}, size={}, fetch_uuid={}", file_path, html.len(), fetch_uuid);
-        },
-        Err(e) => {
-            error!("❌ === HTML FILE SAVE ERROR ===");
-            error!("❌ Failed to save HTML file: {}", e);
-            debug!("🔍 File save error: path={:?}, error={}", file_path, e);
-            trace!("🔍 File save error: path={:?}, error_type={}, fetch_uuid={}", 
-                   file_path, std::any::type_name_of_val(&e), fetch_uuid);
-            return Err(format!("Failed to save HTML file: {}", e).into());
-        }
-    }
-    
-    // Basic HTML cleaning for immediate use
-    debug!("🧹 === HTML CLEANING PHASE ===");
-    debug!("🧹 Starting HTML content cleaning...");
-    trace!("🔍 HTML cleaning started: original_length={}, fetch_uuid={}", html.len(), fetch_uuid);
-    
-    let cleaned = clean_html(&html);
-    
-    debug!("✅ === HTML CLEANING COMPLETED ===");
-    debug!("✅ HTML content cleaned: {} characters", cleaned.len());
-    debug!("✅ Cleaning ratio: {:.2}%", (cleaned.len() as f64 / html.len() as f64) * 100.0);
-    debug!("✅ Cleaned content preview: {}", &cleaned[..std::cmp::min(200, cleaned.len())]);
-    trace!("🔍 HTML cleaning completed: original_length={}, cleaned_length={}, reduction_percent={:.2}%, fetch_uuid={}", 
-           html.len(), cleaned.len(), (cleaned.len() as f64 / html.len() as f64) * 100.0, fetch_uuid);
-    
-    info!("✅ === WEBPAGE FETCHING COMPLETED ===");
-    info!("✅ Webpage content fetched, saved to file, and cleaned successfully");
-    debug!("📄 Final content length: {} characters", cleaned.len());
-    debug!("💾 HTML file saved: {:?}", file_path);
-    debug!("📄 Fetch UUID: {}", fetch_uuid);
-    trace!("🔍 Webpage fetch success: final_length={}, file_path={:?}, fetch_uuid={}", cleaned.len(), file_path, fetch_uuid);
-    
-    Ok((cleaned, file_path.to_string_lossy().to_string()))
+    Ok((title, cleaned_content))
 }
 
-// Simple HTML cleaner
-// Removes script/style tags and all HTML tags, returns plain text
+/// Extract title from HTML
+fn extract_title_from_html(html: &str) -> Option<String> {
+    let title_regex = Regex::new(r"<title[^>]*>(.*?)</title>").ok()?;
+    title_regex.captures(html)
+        .and_then(|caps| caps.get(1))
+        .map(|m| clean_html(&m.as_str()))
+}
+
+/// Clean HTML content
 fn clean_html(html: &str) -> String {
-    let clean_uuid = Uuid::new_v4();
+    // Remove HTML tags
+    let tag_regex = Regex::new(r"<[^>]+>").unwrap();
+    let mut cleaned = tag_regex.replace_all(html, " ").to_string();
     
-    debug!("🧹 === HTML CLEANING STARTED ===");
-    debug!("🆔 Clean UUID: {}", clean_uuid);
-    debug!("🧹 Cleaning HTML content...");
-    debug!("🧹 Original HTML length: {} characters", html.len());
-    trace!("🔍 HTML cleaning started: original_length={}, clean_uuid={}", html.len(), clean_uuid);
+    // Decode HTML entities
+    cleaned = cleaned.replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&nbsp;", " ");
     
-    // Remove script and style tags
-    let mut result = html.to_string();
-    let _original_result = result.clone();
+    // Remove extra whitespace
+    let whitespace_regex = Regex::new(r"\s+").unwrap();
+    cleaned = whitespace_regex.replace_all(&cleaned, " ").to_string();
     
-    debug!("🧹 === SCRIPT TAG REMOVAL ===");
-    debug!("🧹 Removing script tags...");
-    let mut script_removals = 0;
-    let mut script_removal_rounds = 0;
-    
-    // Remove script tags
-    while let Some(start) = result.find("<script") {
-        script_removal_rounds += 1;
-        if let Some(end) = result[start..].find("</script>") {
-            let script_content = &result[start..start + end + 9];
-            script_removals += 1;
-            debug!("🧹 Removed script tag {}: {} characters", script_removals, script_content.len());
-            trace!("🔍 Script removal: round={}, removal={}, script_length={}, clean_uuid={}", 
-                   script_removal_rounds, script_removals, script_content.len(), clean_uuid);
-            result.replace_range(start..start + end + 9, "");
-        } else {
-            debug!("🧹 Found incomplete script tag, stopping removal");
-            trace!("🔍 Incomplete script tag found: round={}, clean_uuid={}", script_removal_rounds, clean_uuid);
-            break;
-        }
-    }
-    
-    debug!("✅ Script tag removal completed: {} removals in {} rounds", script_removals, script_removal_rounds);
-    
-    debug!("🧹 === STYLE TAG REMOVAL ===");
-    debug!("🧹 Removing style tags...");
-    let mut style_removals = 0;
-    let mut style_removal_rounds = 0;
-    
-    // Remove style tags
-    while let Some(start) = result.find("<style") {
-        style_removal_rounds += 1;
-        if let Some(end) = result[start..].find("</style>") {
-            let style_content = &result[start..start + end + 8];
-            style_removals += 1;
-            debug!("🧹 Removed style tag {}: {} characters", style_removals, style_content.len());
-            trace!("🔍 Style removal: round={}, removal={}, style_length={}, clean_uuid={}", 
-                   style_removal_rounds, style_removals, style_content.len(), clean_uuid);
-            result.replace_range(start..start + end + 8, "");
-        } else {
-            debug!("🧹 Found incomplete style tag, stopping removal");
-            trace!("🔍 Incomplete style tag found: round={}, clean_uuid={}", style_removal_rounds, clean_uuid);
-            break;
-        }
-    }
-    
-    debug!("✅ Style tag removal completed: {} removals in {} rounds", style_removals, style_removal_rounds);
-    
-    debug!("🧹 === HTML TAG REMOVAL ===");
-    debug!("🧹 Removing all remaining HTML tags...");
-    trace!("🔍 HTML tag removal started: current_length={}, clean_uuid={}", result.len(), clean_uuid);
-    
-    // Remove all HTML tags
-    let tag_regex = regex::Regex::new(r"<[^>]+>").unwrap();
-    let cleaned = tag_regex.replace_all(&result, " ");
-    
-    debug!("✅ HTML tag removal completed");
-    debug!("🧹 Content after tag removal: {} characters", cleaned.len());
-    debug!("🧹 Tag removal reduction: {:.2}%", (cleaned.len() as f64 / result.len() as f64) * 100.0);
-    trace!("🔍 HTML tag removal completed: before_length={}, after_length={}, reduction_percent={:.2}%, clean_uuid={}", 
-           result.len(), cleaned.len(), (cleaned.len() as f64 / result.len() as f64) * 100.0, clean_uuid);
-    
-    debug!("🧹 === WHITESPACE CLEANUP ===");
-    debug!("🧹 Cleaning whitespace...");
-    let before_whitespace = cleaned.len();
-    
-    // Clean whitespace
-    let final_result: String = cleaned
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .chars()
-        .take(15000)
-        .collect();
-    
-    debug!("✅ Whitespace cleanup completed");
-    debug!("🧹 Content after whitespace cleanup: {} characters", final_result.len());
-    debug!("🧹 Whitespace cleanup reduction: {:.2}%", (final_result.len() as f64 / before_whitespace as f64) * 100.0);
-    debug!("🧹 Content truncated to 15000 characters: {}", final_result.len() >= 15000);
-    trace!("🔍 Whitespace cleanup: before_length={}, after_length={}, truncated={}, clean_uuid={}", 
-           before_whitespace, final_result.len(), final_result.len() >= 15000, clean_uuid);
-    
-    debug!("🧹 === FINAL HTML CLEANING COMPLETED ===");
-    debug!("🧹 HTML cleaning complete: {} -> {} characters", html.len(), final_result.len());
-    debug!("🧹 Total reduction: {:.2}%", (final_result.len() as f64 / html.len() as f64) * 100.0);
-    debug!("🧹 Final result preview: {}", &final_result[..std::cmp::min(100, final_result.len())]);
-    debug!("🧹 Clean UUID: {}", clean_uuid);
-    
-    trace!("🔍 HTML cleaning final: original_length={}, script_removals={}, style_removals={}, final_length={}, total_reduction_percent={:.2}%, clean_uuid={}", 
-           html.len(), script_removals, style_removals, final_result.len(), 
-           (final_result.len() as f64 / html.len() as f64) * 100.0, clean_uuid);
-    
-    final_result
+    cleaned.trim().to_string()
 }
 
-// Simple and reliable thinking tag filter
-// Removes all <think>...</think> blocks from the content
-fn filter_thinking_tags(content: &str) -> String {
-    // Use pre-compiled regex to remove thinking tags and their content
-    let filtered = THINKING_TAG_REGEX.replace_all(content, "");
-    
-    // Clean up whitespace and empty lines
-    let lines: Vec<&str> = filtered
-        .lines()
-        .map(|line| line.trim())
-        .filter(|line| !line.is_empty())
-        .collect();
-    
-    lines.join("\n").trim().to_string()
-}
-
-// Simple processing function that just filters thinking tags
-// Returns filtered content or a message if only thinking content remains
-fn process_ranking_content(content: &str) -> String {
-    let filtered = filter_thinking_tags(content);
-    
-    // If we have filtered content, return it
-    if !filtered.trim().is_empty() {
-        return filtered;
-    }
-    
-    // If no content after filtering, return a message
-    "The AI response appears to contain only thinking content.".to_string()
-}
-
-// Helper function to update Discord message with new content for ranking
-// Handles chunking and message creation if content exceeds Discord's limit
-#[allow(unused_variables)]
-async fn update_discord_message(
-    state: &mut MessageState,
-    new_content: &str,
-    ctx: &Context,
-    config: &LMConfig,
-    ranking_mode: &RankingMode,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    println!("[DEBUG][RANKING_UPDATE] Updating Discord message with {} chars", new_content.len());
-    
-    println!("[DEBUG][RANKING_UPDATE] New content to add: '{}' ({} chars)", new_content, new_content.len());
-    
-    // First, add the new content to the state
-    if state.current_content.is_empty() {
-        println!("[DEBUG][RANKING_UPDATE] State content was empty, setting to new content");
-        state.current_content = new_content.to_string();
-    } else {
-        println!("[DEBUG][RANKING_UPDATE] State content was not empty, appending new content");
-        state.current_content.push_str(new_content);
-    }
-    
-    println!("[DEBUG][RANKING_UPDATE] State content after adding: '{}' ({} chars)", state.current_content, state.current_content.len());
-    
-    // Then create the formatted content for Discord
-    let potential_content = format!("📊 **{} (Part {}):**\n\n{}", 
-        ranking_mode.display_name(), state.message_index, state.current_content);
-    
-    println!("[DEBUG][RANKING_UPDATE] Formatted content for Discord: '{}' ({} chars)", potential_content, potential_content.len());
-
-    // Check if we need to create a new message
-    if potential_content.len() > state.char_limit {
-        println!("[DEBUG][RANKING_UPDATE] Content exceeds limit ({} > {}), creating new message", 
-            potential_content.len(), state.char_limit);
-        
-        // Finalize current message
-        let final_content = format!("📊 **{} (Part {}):**\n\n{}", 
-            ranking_mode.display_name(), state.message_index, state.current_content);
-        let edit_result = state.current_message.edit(&ctx.http, |m| {
-            m.content(final_content)
-        }).await;
-        if let Err(e) = edit_result {
-            eprintln!("[ERROR][RANKING_UPDATE] Failed to finalize message part {}: {}", state.message_index, e);
-        } else {
-            println!("[DEBUG][RANKING_UPDATE] Finalized message part {}", state.message_index);
-        }
-
-        // Create new message
-        state.message_index += 1;
-        // Reset current_content for the new message
-        state.current_content = new_content.to_string();
-        let new_msg_content = format!("📊 **{} (Part {}):**\n\n{}", 
-            ranking_mode.display_name(), state.message_index, state.current_content);
-        let send_result = state.current_message.channel_id.send_message(&ctx.http, |m| {
-            m.content(new_msg_content)
-        }).await;
-        match send_result {
-            Ok(new_message) => {
-                println!("[DEBUG][RANKING_UPDATE] Created new message part {}", state.message_index);
-                state.current_message = new_message;
-            }
-            Err(e) => {
-                eprintln!("[ERROR][RANKING_UPDATE] Failed to create new message part {}: {}", state.message_index, e);
-            }
-        }
-    } else {
-        // Update current message
-        println!("[DEBUG][RANKING_UPDATE] Updating existing message part {}", state.message_index);
-        let edit_result = state.current_message.edit(&ctx.http, |m| {
-            m.content(&potential_content)
-        }).await;
-        if let Err(e) = edit_result {
-            eprintln!("[ERROR][RANKING_UPDATE] Failed to update existing message part {}: {}", state.message_index, e);
-        }
-    }
-
-    Ok(())
-}
-
-// Helper function to finalize message content at the end of streaming for ranking
-// Ensures all remaining content is posted and marks the message as complete
-#[allow(unused_variables)]
-async fn finalize_message_content(
-    state: &mut MessageState,
-    remaining_content: &str,
-    ctx: &Context,
-    config: &LMConfig,
-    ranking_mode: &RankingMode,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    println!("[DEBUG][RANKING_FINALIZE] Finalizing message with {} chars", remaining_content.len());
-    println!("[DEBUG][RANKING_FINALIZE] Current state content: {} chars", state.current_content.len());
-    
-    // Check for zero content error condition - this should catch cases where API returned content but it wasn't streamed properly
-    if remaining_content.is_empty() && state.current_content.trim().is_empty() {
-        eprintln!("[DEBUG][RANKING_FINALIZE] ERROR: Attempting to finalize message with 0 total characters");
-        eprintln!("[DEBUG][RANKING_FINALIZE] Remaining content: '{}' ({} chars)", remaining_content, remaining_content.len());
-        eprintln!("[DEBUG][RANKING_FINALIZE] State content: '{}' ({} chars)", state.current_content, state.current_content.len());
-        eprintln!("[DEBUG][RANKING_FINALIZE] This indicates either:");
-        eprintln!("[DEBUG][RANKING_FINALIZE] 1. No content was received from the API");
-        eprintln!("[DEBUG][RANKING_FINALIZE] 2. Content was received but not properly streamed to Discord");
-        eprintln!("[DEBUG][RANKING_FINALIZE] 3. The update_discord_message function failed to populate current_content");
-        return Err("Cannot finalize message with 0 characters - this indicates no content was received from the API or streaming failed".into());
-    }
-    
-    // Add any remaining content if provided
-    if !remaining_content.trim().is_empty() {
-        update_discord_message(state, remaining_content, ctx, config, ranking_mode).await?;
-    }
-    
-    // Check if we have any content to finalize (either from remaining_content or existing state)
-    if state.current_content.trim().is_empty() {
-        println!("[DEBUG][RANKING_FINALIZE] No content to finalize");
-        return Ok(());
-    }
-    
-    // Mark the final message as complete
-    let final_display = if state.message_index == 1 {
-        format!("📊 **{} Complete**\n\n{}", ranking_mode.display_name(), state.current_content)
-    } else {
-        format!("📊 **{} Complete (Part {}/{})**\n\n{}", 
-            ranking_mode.display_name(), state.message_index, state.message_index, state.current_content)
-    };
-
-    println!("[DEBUG][RANKING_FINALIZE] Marking message as complete - Part {}", state.message_index);
-    let edit_result = state.current_message.edit(&ctx.http, |m| {
-        m.content(final_display)
-    }).await;
-    if let Err(e) = edit_result {
-        eprintln!("[ERROR][RANKING_FINALIZE] Failed to finalize Discord message part {}: {}", state.message_index, e);
-    }
-
-    Ok(())
-}
-
-// Main streaming function that handles real-time response with Discord message editing
-// Streams the AI's ranking analysis response, filtering <think> tags in real time
-// Handles chunking, message updates, and finalization
+/// Stream ranking analysis to Discord
 async fn stream_ranking_analysis(
     content: &str,
     url: &str,
     config: &LMConfig,
-    initial_msg: &mut Message,
+    selected_model: &str,
+    msg: &mut Message,
     ctx: &Context,
     is_youtube: bool,
     file_path: Option<&str>,
-    ranking_mode: &RankingMode,
-) -> Result<StreamingStats, Box<dyn std::error::Error + Send + Sync>> {
-    println!("[DEBUG][RANKING] === STARTING RANKING STREAM RESPONSE ===");
-    println!("[DEBUG][RANKING] URL: {}", url);
-    println!("[DEBUG][RANKING] Content length: {} characters", content.len());
-    println!("[DEBUG][RANKING] Is YouTube: {}", is_youtube);
-    println!("[DEBUG][RANKING] File path: {:?}", file_path);
-    println!("[DEBUG][RANKING] Base URL: {}", config.base_url);
-    println!("[DEBUG][RANKING] Timeout: {} seconds", config.timeout);
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let stream_uuid = Uuid::new_v4();
+    let _content_to_process = content.to_string();
     
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(60))
-        .build()?;
-    println!("[DEBUG][RANKING] HTTP client created");
+    trace!("[TRACE][RANK][stream_ranking_analysis] === FUNCTION ENTRY ===");
+    trace!("[TRACE][RANK][stream_ranking_analysis] Function: stream_ranking_analysis()");
+    trace!("[TRACE][RANK][stream_ranking_analysis] Stream UUID: {}", stream_uuid);
+    trace!("[TRACE][RANK][stream_ranking_analysis] Input content length: {} chars", content.len());
+    trace!("[TRACE][RANK][stream_ranking_analysis] URL: '{}'", url);
+    trace!("[TRACE][RANK][stream_ranking_analysis] Is YouTube: {}", is_youtube);
+    trace!("[TRACE][RANK][stream_ranking_analysis] File path: {:?}", file_path);
+    trace!("[TRACE][RANK][stream_ranking_analysis] Selected model: {}", selected_model);
+    trace!("[TRACE][RANK][stream_ranking_analysis] Config base URL: {}", config.base_url);
+    trace!("[TRACE][RANK][stream_ranking_analysis] Config timeout: {} seconds", config.timeout);
     
-    // Load appropriate system prompt for the ranking mode
-    let system_prompt = match load_ranking_mode_prompt(ranking_mode, is_youtube).await {
-        Ok(prompt) => {
-            println!("[DEBUG][RANKING] Loaded {} prompt for {} content", ranking_mode.display_name(), if is_youtube { "YouTube" } else { "webpage" });
-            prompt
-        },
-        Err(e) => {
-            eprintln!("Failed to load {} prompt: {}", ranking_mode.display_name(), e);
-            return Err(e);
-        }
-    };
-    
-    // Process content based on file path
-    let (user_prompt, _content_to_process) = if let Some(path) = file_path {
-        // Read and process file content
-        let file_content = fs::read_to_string(path)?;
-        let cleaned_content = if is_youtube {
-            clean_vtt_content(&file_content)
-        } else {
-            clean_html(&file_content)
-        };
-        
-        let prompt = format!(
-            "Please perform a {} on this {} from {}:\n\n{}",
-            ranking_mode.display_name(),
-            if is_youtube { "YouTube video subtitle file" } else { "webpage HTML content" },
-            url, cleaned_content
-        );
-        
-        (prompt, cleaned_content)
+    // Load appropriate prompt
+    let system_prompt = if is_youtube {
+        load_youtube_ranking_prompt().await?
     } else {
-        // Use direct content
-        let max_content_length = 20000;
-        let truncated_content = if content.len() > max_content_length {
-            format!("{} [Content truncated due to length]", &content[0..max_content_length])
-        } else {
-            content.to_string()
-        };
-        
-        let prompt = format!(
-            "Please perform a {} on this {} from {}:\n\n{}",
-            ranking_mode.display_name(),
-            if is_youtube { "YouTube video transcript" } else { "webpage content" },
-            url, truncated_content
-        );
-        
-        (prompt, truncated_content)
+        load_ranking_prompt().await?
     };
     
-    // Build message list
+    // Prepare content for analysis
+    let content_preview = if content.len() > 1000 {
+        format!("{}...", &content[..1000])
+    } else {
+        content.to_string()
+    };
+    
+    let user_prompt = format!(
+        "Please analyze and rank the following content:\n\n\
+Content Type: {}\n\
+URL: {}\n\n\
+Content:\n{}\n\n\
+Provide a comprehensive ranking analysis with:\n\
+1. Overall Score (1-10)\n\
+2. Detailed breakdown by category\n\
+3. Strengths and weaknesses\n\
+4. Recommendations for improvement\n\
+5. Summary conclusion",
+        if is_youtube { "YouTube Video" } else { "Webpage" },
+        url,
+        content_preview
+    );
+    
     let messages = vec![
-        ChatMessage { role: "system".to_string(), content: system_prompt },
-        ChatMessage { role: "user".to_string(), content: user_prompt },
+        ChatMessage {
+            role: "system".to_string(),
+            content: system_prompt,
+        },
+        ChatMessage {
+            role: "user".to_string(),
+            content: user_prompt,
+        },
     ];
     
-    // Check if the model supports streaming (reranker models typically don't)
-    let should_stream = !config.default_ranking_model.contains("reranker");
-    
-    let chat_request = ChatRequest {
-        model: config.default_ranking_model.clone(),
-        messages,
-        temperature: config.default_temperature,
-        max_tokens: config.default_max_tokens,
-        stream: should_stream,
-        seed: config.default_seed,
-    };
-    
-    let api_url = format!("{}/v1/chat/completions", config.base_url);
-    println!("[DEBUG][RANKING] API URL: {}", api_url);
-    
-    // Test basic connectivity
-    match client.get(&config.base_url).send().await {
-        Ok(response) => {
-            println!("[DEBUG][RANKING] Basic connectivity test successful - Status: {}", response.status());
+    // Use chat completion for ranking analysis
+    match chat_completion(messages, selected_model, config, Some(4000)).await {
+        Ok(analysis) => {
+            // Split the analysis into Discord-friendly chunks
+            let chunks = split_message(&analysis, config.max_discord_message_length - config.response_format_padding);
+            
+            for (i, chunk) in chunks.iter().enumerate() {
+                let chunk_content = if chunks.len() == 1 {
+                    format!("**📊 Content Ranking Analysis**\n\n{}", chunk)
+                } else {
+                    format!("**📊 Content Ranking Analysis (Part {}/{})**\n\n{}", i + 1, chunks.len(), chunk)
+                };
+                
+                if i == 0 {
+                    // Update the first message
+                    msg.edit(&ctx.http, |m| m.content(&chunk_content)).await?;
+                } else {
+                    // Send additional messages for remaining chunks
+                    msg.channel_id.send_message(&ctx.http, |m| m.content(&chunk_content)).await?;
+                }
+            }
+            
+            Ok(())
         }
         Err(e) => {
-            println!("[DEBUG][RANKING] Basic connectivity test failed: {}", e);
-            return Err(format!("Cannot reach remote server {}: {}", config.base_url, e).into());
+            Err(format!("Ranking analysis failed: {}", e).into())
         }
     }
-    
-    // Make API request (streaming or non-streaming)
-    let response = match client
-        .post(&api_url)
-        .json(&chat_request)
-        .send()
-        .await
-    {
-        Ok(resp) => {
-            println!("[DEBUG][RANKING] API request sent successfully - Status: {}", resp.status());
-            resp
-        }
-        Err(e) => {
-            println!("[DEBUG][RANKING] API request failed: {}", e);
-            return Err(format!("API request to {} failed: {}", api_url, e).into());
-        }
-    };
-    
-    // Handle non-streaming response for reranker models
-    if !should_stream {
-        println!("[DEBUG][RANKING] Using non-streaming mode for reranker model");
-        let response_text = response.text().await?;
-        println!("[DEBUG][RANKING] Received non-streaming response: {} chars", response_text.len());
-        println!("[DEBUG][RANKING] Response preview: {}", &response_text[..std::cmp::min(200, response_text.len())]);
-        
-        // Parse the JSON response - handle both streaming and non-streaming formats
-        let mut raw_response = String::new();
-        
-        if let Ok(chat_response) = serde_json::from_str::<ChatResponse>(&response_text) {
-            // Streaming format
-            for choice in chat_response.choices {
-                if let Some(delta) = choice.delta {
-                    if let Some(content) = delta.content {
-                        raw_response.push_str(&content);
-                    }
-                }
-            }
-        } else {
-            // Non-streaming format - try to extract content directly
-            println!("[DEBUG][RANKING] Trying non-streaming format parsing");
-            if let Ok(json_value) = serde_json::from_str::<serde_json::Value>(&response_text) {
-                if let Some(choices) = json_value.get("choices").and_then(|c| c.as_array()) {
-                    for choice in choices {
-                        if let Some(message) = choice.get("message") {
-                            if let Some(content) = message.get("content").and_then(|c| c.as_str()) {
-                                raw_response.push_str(content);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        
-        if raw_response.is_empty() {
-            return Err("API returned empty response".into());
-        }
-        
-        // Continue with processing and streaming to Discord
-        println!("[DEBUG][RANKING] === PROCESSING NON-STREAMING RESPONSE ===");
-        
-        // Apply thinking tag filtering to the complete response
-        let filtered_response = filter_thinking_tags(&raw_response);
-        println!("[DEBUG][RANKING] Filtered response length: {} chars", filtered_response.len());
-        
-        // Apply ranking content processing
-        let processed_response = process_ranking_content(&filtered_response);
-        println!("[DEBUG][RANKING] Processed response length: {} chars", processed_response.len());
-        
-        if processed_response.is_empty() {
-            println!("[DEBUG][RANKING] Processed response is empty, sending fallback message");
-            let _ = initial_msg.edit(&ctx.http, |m| {
-                m.content("📊 **Ranking Analysis Complete**\n\nThe AI completed its ranking analysis, but the response appears to contain only thinking content.")
-            }).await;
-            
-            let stats = StreamingStats {
-                total_characters: raw_response.len(),
-                message_count: 1,
-                filtered_characters: raw_response.len() - filtered_response.len(),
-            };
-            return Ok(stats);
-        }
-        
-        let mut message_state = MessageState {
-            current_content: String::new(),
-            current_message: initial_msg.clone(),
-            message_index: 1,
-            char_limit: config.max_discord_message_length - config.response_format_padding,
-        };
-        
-        // Stream the processed response to Discord in chunks
-        let chunk_size = 100;
-        let mut chars_processed = 0;
-        
-        while chars_processed < processed_response.len() {
-            let end_pos = std::cmp::min(chars_processed + chunk_size, processed_response.len());
-            let chunk = &processed_response[chars_processed..end_pos];
-            
-            if let Err(e) = update_discord_message(&mut message_state, chunk, ctx, config, ranking_mode).await {
-                eprintln!("[DEBUG][RANKING] Failed to update Discord message: {}", e);
-                return Err(e);
-            }
-            
-            chars_processed = end_pos;
-            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-        }
-        
-        // Finalize the message
-        finalize_message_content(&mut message_state, "", ctx, config, ranking_mode).await?;
-        
-        let stats = StreamingStats {
-            total_characters: raw_response.len(),
-            message_count: message_state.message_index,
-            filtered_characters: raw_response.len() - filtered_response.len(),
-        };
-        return Ok(stats);
-    }
-    
-    if !response.status().is_success() {
-        let status = response.status();
-        let error_text = response.text().await.unwrap_or_else(|_| "Unable to read error response".to_string());
-        println!("[DEBUG][RANKING] API returned error status {}: {}", status, error_text);
-        return Err(format!("Streaming API request failed: HTTP {} - {}", status, error_text).into());
-    }
-    
-    println!("[DEBUG][RANKING] === BUFFERING COMPLETE RESPONSE ===");
-    let mut stream = response.bytes_stream();
-    
-    let mut raw_response = String::new();
-    let mut chunk_count = 0;
-    let mut line_buffer = String::new();
-    let mut received_any_content = false;
-    let mut stream_complete = false;
-    
-    println!("[DEBUG][RANKING] Starting to buffer response from API...");
-    
-    // STEP 1: Buffer the complete response from the API
-    while let Some(chunk) = stream.next().await {
-        if stream_complete {
-            println!("[DEBUG][RANKING] Stream marked as complete, stopping buffering");
-            break;
-        }
-        
-        match chunk {
-            Ok(bytes) => {
-                chunk_count += 1;
-                if chunk_count == 1 {
-                    println!("[DEBUG][RANKING] Received first chunk ({} bytes)", bytes.len());
-                } else if chunk_count % 10 == 0 {
-                    println!("[DEBUG][RANKING] Buffered {} chunks, total response: {} chars", chunk_count, raw_response.len());
-                }
-                
-                line_buffer.push_str(&String::from_utf8_lossy(&bytes));
-                
-                while let Some(i) = line_buffer.find('\n') {
-                    let line = line_buffer.drain(..=i).collect::<String>();
-                    let line = line.trim();
-                    
-                    if let Some(json_str) = line.strip_prefix("data: ") {
-                        if json_str.trim() == "[DONE]" {
-                            println!("[DEBUG][RANKING] Received [DONE] signal, marking stream complete");
-                            stream_complete = true;
-                            break;
-                        }
-                        
-                        if let Ok(response_chunk) = serde_json::from_str::<ChatResponse>(json_str) {
-                            for choice in response_chunk.choices {
-                                if let Some(finish_reason) = choice.finish_reason {
-                                    if finish_reason == "stop" {
-                                        println!("[DEBUG][RANKING] Received finish_reason=stop, marking stream complete");
-                                        stream_complete = true;
-                                        break;
-                                    }
-                                }
-                                
-                                if let Some(delta) = choice.delta {
-                                    if let Some(content) = delta.content {
-                                        received_any_content = true;
-                                        raw_response.push_str(&content);
-                                        println!("[DEBUG][RANKING] Added content chunk: '{}' (total: {} chars)", 
-                                            content, raw_response.len());
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                
-                if stream_complete {
-                    println!("[DEBUG][RANKING] Breaking out of chunk processing loop");
-                    break;
-                }
-            }
-            Err(e) => {
-                eprintln!("[DEBUG][RANKING] Stream error: {}", e);
-                return Err(e.into());
-            }
-        }
-    }
-    
-    println!("[DEBUG][RANKING] === BUFFERING COMPLETE ===");
-    println!("[DEBUG][RANKING] Buffered {} chunks, total response: {} chars", chunk_count, raw_response.len());
-    
-    if !received_any_content {
-        eprintln!("[DEBUG][RANKING] No content received from API stream");
-        return Err("No content received from API stream".into());
-    }
-    
-    if raw_response.is_empty() {
-        eprintln!("[DEBUG][RANKING] ERROR: API returned 0 characters in response");
-        return Err("API returned 0 characters in response - this indicates a problem with the API or model".into());
-    }
-    
-    // STEP 2: Process the buffered content and stream to Discord
-    println!("[DEBUG][RANKING] === PROCESSING AND STREAMING TO DISCORD ===");
-    
-    // Apply thinking tag filtering to the complete response
-    let filtered_response = filter_thinking_tags(&raw_response);
-    println!("[DEBUG][RANKING] Filtered response length: {} chars", filtered_response.len());
-    
-    // Apply ranking content processing
-    let processed_response = process_ranking_content(&filtered_response);
-    println!("[DEBUG][RANKING] Processed response length: {} chars", processed_response.len());
-    
-    if processed_response.is_empty() {
-        println!("[DEBUG][RANKING] Processed response is empty, sending fallback message");
-        let _ = initial_msg.edit(&ctx.http, |m| {
-            m.content("📊 **Ranking Analysis Complete**\n\nThe AI completed its ranking analysis, but the response appears to contain only thinking content.")
-        }).await;
-        
-        let stats = StreamingStats {
-            total_characters: raw_response.len(),
-            message_count: 1,
-            filtered_characters: raw_response.len() - filtered_response.len(),
-        };
-        return Ok(stats);
-    }
-    
-    let mut message_state = MessageState {
-        current_content: String::new(),
-        current_message: initial_msg.clone(),
-        message_index: 1,
-        char_limit: config.max_discord_message_length - config.response_format_padding,
-    };
-    println!("[DEBUG][RANKING] Message state initialized - Char limit: {}", message_state.char_limit);
-    
-    // Split the processed response into chunks for Discord streaming
-    let chunk_size = 100; // Characters per Discord update
-    let mut chars_processed = 0;
-    
-    while chars_processed < processed_response.len() {
-        let end_pos = std::cmp::min(chars_processed + chunk_size, processed_response.len());
-        let chunk = &processed_response[chars_processed..end_pos];
-        
-        println!("[DEBUG][RANKING] Streaming chunk {} chars to Discord", chunk.len());
-        
-        if let Err(e) = update_discord_message(&mut message_state, chunk, ctx, config, ranking_mode).await {
-            eprintln!("[DEBUG][RANKING] Failed to update Discord message: {}", e);
-            return Err(e);
-        }
-        
-        chars_processed = end_pos;
-        
-        // Small delay to make streaming visible
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-    }
-    
-    // Finalize the message
-    println!("[DEBUG][RANKING] === FINALIZING DISCORD MESSAGE ===");
-    
-    if processed_response.is_empty() {
-        eprintln!("[DEBUG][RANKING] ERROR: Cannot finalize - no content was processed from API");
-        return Err("No content was processed from API - cannot finalize empty message".into());
-    }
-    
-    if message_state.current_content.trim().is_empty() {
-        eprintln!("[DEBUG][RANKING] ERROR: Message state has no content despite processed response");
-        return Err("Message state has no content despite processed response - streaming to Discord failed".into());
-    }
-    
-    if let Err(e) = finalize_message_content(&mut message_state, "", ctx, config, ranking_mode).await {
-        eprintln!("[DEBUG][RANKING] Failed to finalize Discord message: {}", e);
-        return Err(e);
-    }
-    
-    let stats = StreamingStats {
-        total_characters: raw_response.len(),
-        message_count: message_state.message_index,
-        filtered_characters: raw_response.len() - filtered_response.len(),
-    };
-    
-    println!("[DEBUG][RANKING] === RANKING STREAMING COMPLETED ===");
-    println!("[DEBUG][RANKING] Final stats - Total chars: {}, Messages: {}, Filtered chars: {}", 
-        stats.total_characters, stats.message_count, stats.filtered_characters);
-    Ok(stats)
 }
 
-// Helper function to split messages for Discord's character limit
+/// Split message content into Discord-friendly chunks
 fn split_message(content: &str, max_len: usize) -> Vec<String> {
-    let mut messages = Vec::new();
-    let mut current_message = String::new();
+    let lines: Vec<&str> = content.lines().collect();
+    let mut chunks = Vec::new();
+    let mut current_chunk = String::new();
     
-    for line in content.lines() {
-        if current_message.len() + line.len() + 1 > max_len {
-            if !current_message.is_empty() {
-                messages.push(current_message.trim().to_string());
-                current_message = String::new();
-            }
-            
-            // If a single line is too long, split it
-            if line.len() > max_len {
-                let mut remaining = line;
-                while remaining.len() > max_len {
-                    let split_point = remaining[..max_len].rfind(' ').unwrap_or(max_len);
-                    messages.push(remaining[..split_point].to_string());
-                    remaining = &remaining[split_point..];
-                }
-                if !remaining.is_empty() {
-                    current_message.push_str(remaining);
-                    current_message.push('\n');
-                }
-            } else {
-                current_message.push_str(line);
-                current_message.push('\n');
-            }
+    for line in lines {
+        let potential_chunk = if current_chunk.is_empty() {
+            line.to_string()
         } else {
-            current_message.push_str(line);
-            current_message.push('\n');
+            format!("{}\n{}", current_chunk, line)
+        };
+        
+        if potential_chunk.len() <= max_len {
+            current_chunk = potential_chunk;
+        } else {
+            if !current_chunk.is_empty() {
+                chunks.push(current_chunk.clone());
+            }
+            current_chunk = line.to_string();
         }
     }
     
-    if !current_message.is_empty() {
-        messages.push(current_message.trim().to_string());
+    if !current_chunk.is_empty() {
+        chunks.push(current_chunk);
     }
     
-    messages
+    chunks
 }
 
+// ============================================================================
+// COMMAND GROUP
+// ============================================================================
 
+// Commands are auto-registered by the #[command] macro
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
+    
     #[test]
     fn test_clean_vtt() {
-        let vtt_content = r#"WEBVTT
-
-00:00:01.000 --> 00:00:04.000
-Hello world, this is a test
-
-00:00:05.000 --> 00:00:08.000
-<c>This is some content</c>
-
-00:00:09.000 --> 00:00:12.000
-<v Speaker>This is spoken content</v>
-"#;
-        
+        let vtt_content = "WEBVTT\n\n1\n00:00:01.000 --> 00:00:05.000\nHello world\n\n2\n00:00:06.000 --> 00:00:10.000\nThis is a test";
         let cleaned = clean_vtt_content(vtt_content);
-        assert!(!cleaned.contains("WEBVTT"));
-        assert!(!cleaned.contains("-->"));
-        assert!(!cleaned.contains("<c>"));
-        assert!(!cleaned.contains("</c>"));
-        assert!(!cleaned.contains("<v"));
-        assert!(!cleaned.contains("</v>"));
-        assert!(cleaned.contains("Hello world"));
-        assert!(cleaned.contains("This is some content"));
-        assert!(cleaned.contains("This is spoken content"));
+        assert_eq!(cleaned, "Hello world This is a test");
     }
-
+    
     #[test]
     fn test_clean_html() {
-        let html_content = r#"<html><head><title>Test</title></head><body><script>alert('test');</script><style>body { color: red; }</style><p>This is <b>bold</b> text</p></body></html>"#;
-        
-        let cleaned = clean_html(html_content);
-        assert!(!cleaned.contains("<script>"));
-        assert!(!cleaned.contains("<style>"));
-        assert!(!cleaned.contains("<html>"));
-        assert!(!cleaned.contains("<p>"));
-        assert!(!cleaned.contains("<b>"));
-        assert!(!cleaned.contains("</b>"));
-        assert!(cleaned.contains("This is bold text"));
+        let html = "<html><body><h1>Title</h1><p>Content with <strong>bold</strong> text</p></body></html>";
+        let cleaned = clean_html(html);
+        assert_eq!(cleaned, "Title Content with bold text");
     }
-
+    
     #[test]
     fn test_webpage_content_processing() {
-        // Test that webpage content processing works correctly
-        let test_content = "This is a test webpage content with some text to analyze and rank.";
-        let test_url = "https://example.com";
+        let html = r#"
+        <html>
+        <head><title>Test Page</title></head>
+        <body>
+            <h1>Main Title</h1>
+            <p>This is some content with <strong>bold</strong> text.</p>
+            <p>Another paragraph with <em>italic</em> text.</p>
+        </body>
+        </html>
+        "#;
         
-        // Test content truncation
-        let long_content = "A".repeat(25000);
-        let truncated = if long_content.len() > 20000 {
-            format!("{} [Content truncated due to length]", &long_content[0..20000])
-        } else {
-            long_content.clone()
-        };
-        
-        assert!(truncated.len() <= 20000 + 30); // 30 chars for truncation message
-        assert!(truncated.contains("[Content truncated due to length]"));
-        
-        // Test normal content
-        let normal_content = "Normal length content";
-        let normal_truncated = if normal_content.len() > 20000 {
-            format!("{} [Content truncated due to length]", &normal_content[0..20000])
-        } else {
-            normal_content.to_string()
-        };
-        
-        assert_eq!(normal_truncated, normal_content);
+        let cleaned = clean_html(html);
+        assert!(cleaned.contains("Test Page"));
+        assert!(cleaned.contains("Main Title"));
+        assert!(cleaned.contains("This is some content with bold text"));
+        assert!(cleaned.contains("Another paragraph with italic text"));
     }
-
+    
     #[test]
-    fn test_html_file_processing() {
-        // Test HTML file processing functionality
-        let test_html = r#"<html><head><title>Test Page</title></head><body><h1>Test Content</h1><p>This is a test paragraph with <b>bold</b> text and <i>italic</i> text.</p><script>console.log('test');</script><style>body { font-family: Arial; }</style></body></html>"#;
+    fn test_lm_config_structure() {
+        let config = LMConfig {
+            base_url: "http://localhost:1234".to_string(),
+            timeout: 300,
+            default_model: "test-model".to_string(),
+            default_reason_model: "reason-model".to_string(),
+            default_summarization_model: "sum-model".to_string(),
+            default_ranking_model: "rank-model".to_string(),
+            default_temperature: 0.8,
+            default_max_tokens: 4000,
+            max_discord_message_length: 2000,
+            response_format_padding: 100,
+            default_vision_model: "vision-model".to_string(),
+            default_seed: Some(42),
+        };
         
-        let cleaned = clean_html(test_html);
+        assert_eq!(config.base_url, "http://localhost:1234");
+        assert_eq!(config.timeout, 300);
+        assert_eq!(config.default_ranking_model, "rank-model");
+        assert_eq!(config.default_temperature, 0.8);
+        assert_eq!(config.default_max_tokens, 4000);
+        assert_eq!(config.max_discord_message_length, 2000);
+        assert_eq!(config.response_format_padding, 100);
+        assert_eq!(config.default_seed, Some(42));
+    }
+    
+    #[test]
+    fn test_chat_message_structure() {
+        let message = ChatMessage {
+            role: "user".to_string(),
+            content: "Test message".to_string(),
+        };
         
-        // Should remove HTML tags
-        assert!(!cleaned.contains("<html>"));
-        assert!(!cleaned.contains("<head>"));
-        assert!(!cleaned.contains("<body>"));
-        assert!(!cleaned.contains("<h1>"));
-        assert!(!cleaned.contains("<p>"));
-        assert!(!cleaned.contains("<b>"));
-        assert!(!cleaned.contains("<i>"));
-        assert!(!cleaned.contains("<script>"));
-        assert!(!cleaned.contains("<style>"));
+        assert_eq!(message.role, "user");
+        assert_eq!(message.content, "Test message");
         
-        // Should preserve text content
-        assert!(cleaned.contains("Test Content"));
-        assert!(cleaned.contains("This is a test paragraph"));
-        assert!(cleaned.contains("bold"));
-        assert!(cleaned.contains("italic"));
+        // Test serialization/deserialization
+        let json = serde_json::to_string(&message).unwrap();
+        let deserialized: ChatMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.role, message.role);
+        assert_eq!(deserialized.content, message.content);
+    }
+    
+    #[test]
+    fn test_split_message_functionality() {
+        let short_content = "This is a short message.";
+        let chunks = split_message(short_content, 50);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0], short_content);
         
-        // Should not contain script or style content
-        assert!(!cleaned.contains("console.log"));
-        assert!(!cleaned.contains("font-family"));
+        let long_content = vec![
+            "This is the first line of a longer message.",
+            "This is the second line with more content.",
+            "This is the third line that should be split.",
+            "This is the fourth line to test chunking.",
+            "This is the fifth line to complete the test."
+        ].join("\n");
+        
+        let chunks = split_message(&long_content, 80);
+        assert!(chunks.len() > 1, "Long content should be split into multiple chunks");
+        
+        // Test that each chunk is within the limit
+        for chunk in &chunks {
+            assert!(chunk.len() <= 80, "Chunk exceeds maximum length: {}", chunk.len());
+        }
+        
+        // Test single long line
+        let single_long_line = "This is a very long line that should not be split because it exceeds the maximum length but we want to keep it as one chunk for testing purposes.";
+        let chunks = split_message(single_long_line, 50);
+        assert_eq!(chunks.len(), 1, "Single long line should remain as one chunk");
     }
 }
+
+// ============================================================================
+// MAIN RANK COMMAND
+// ============================================================================
+
+#[command]
+#[aliases("analyze", "evaluate")]
+/// Main ^rank command handler
+/// Analyzes and ranks webpage content or YouTube videos using AI
+/// Supports:
+///   - ^rank <url> (rank webpage or YouTube video)
+///   - ^rank --help (show help)
+pub async fn rank(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
+    let command_uuid = Uuid::new_v4();
+    let start_time = Instant::now();
+    
+    // Generate trace logging for function entry
+    trace!("[TRACE][RANK] === FUNCTION ENTRY: rank() ===");
+    trace!("[TRACE][RANK] Function: rank(), UUID: {}", command_uuid);
+    trace!("[TRACE][RANK] Entry timestamp: {:?}", start_time);
+    
+    // Get context data for logging
+    {
+        let _data_map = ctx.data.read().await;
+        trace!("[TRACE][RANK] Context data lock acquired successfully");
+    }
+    
+    trace!("[TRACE][RANK] Message author: {} (ID: {})", msg.author.name, msg.author.id);
+    trace!("[TRACE][RANK] Channel ID: {}", msg.channel_id);
+    trace!("[TRACE][RANK] Guild ID: {:?}", msg.guild_id);
+    
+    let input = args.message().trim();
+    trace!("[TRACE][RANK] Raw input: '{}' ({} chars)", input, input.len());
+    
+    // Check for help command
+    if input.is_empty() || input == "--help" || input == "-h" {
+        let help_message = "**📊 Content Ranking Command**\n\n\
+**Usage:** `^rank <url>`\n\n\
+**Features:**\n\
+• **Multi-dimensional ranking** across 5 key factors\n\
+• **1-10 scale scoring** with detailed explanations\n\
+• **YouTube and webpage support** with specialized analysis\n\
+• **RAG processing** for comprehensive content analysis\n\
+• **Streaming responses** with real-time ranking updates\n\
+• **Actionable feedback** with strengths and improvement suggestions\n\n\
+**Examples:**\n\
+• `^rank https://youtube.com/watch?v=...`\n\
+• `^rank https://example.com`\n\n\
+**Requirements:** yt-dlp installed for YouTube support";
+        
+        msg.reply(ctx, help_message).await?;
+        
+        trace!("[TRACE][RANK] === FUNCTION EXIT: rank() ===");
+        trace!("[TRACE][RANK] Function: rank(), UUID: {}", command_uuid);
+        trace!("[TRACE][RANK] Exit status: HELP_REQUESTED");
+        trace!("[TRACE][RANK] Total execution time: {:.3}s", start_time.elapsed().as_secs_f64());
+        trace!("[TRACE][RANK] Exit timestamp: {:?}", Instant::now());
+        
+        return Ok(());
+    }
+    
+    // Validate URL format
+    if !input.starts_with("http://") && !input.starts_with("https://") {
+        let error_message = "**❌ Invalid URL Format**\n\n\
+Please provide a valid URL starting with `http://` or `https://`\n\n\
+**Examples:**\n\
+• `^rank https://youtube.com/watch?v=...`\n\
+• `^rank https://example.com`\n\
+• `^rank https://github.com/username/repo`";
+        
+        msg.reply(ctx, error_message).await?;
+        
+        trace!("[TRACE][RANK] === FUNCTION EXIT: rank() ===");
+        trace!("[TRACE][RANK] Function: rank(), UUID: {}", command_uuid);
+        trace!("[TRACE][RANK] Exit status: INVALID_URL_FORMAT");
+        trace!("[TRACE][RANK] Total execution time: {:.3}s", start_time.elapsed().as_secs_f64());
+        trace!("[TRACE][RANK] Exit timestamp: {:?}", Instant::now());
+        
+        return Ok(());
+    }
+    
+    let url = input;
+    trace!("[TRACE][RANK] Validated URL: '{}'", url);
+    
+    // Determine if this is a YouTube URL
+    let is_youtube = url.contains("youtube.com") || url.contains("youtu.be");
+    trace!("[TRACE][RANK] Content type: {}", if is_youtube { "YouTube" } else { "Webpage" });
+    
+    // Load LM Studio configuration
+    let config = match load_lm_config().await {
+        Ok(config) => {
+            trace!("[TRACE][RANK] Configuration loaded successfully");
+            config
+        },
+        Err(e) => {
+            error!("Failed to load LM Studio configuration: {}", e);
+            let error_message = format!("**❌ Configuration Error**\n\n\
+Failed to load LM Studio configuration: {}\n\n\
+**Solutions:**\n\
+• **Check lmapiconf.txt**: Ensure the file exists and contains all required settings\n\
+• **Verify Settings**: Check that all required configuration values are present\n\
+• **File Location**: Make sure lmapiconf.txt is in the project root directory\n\n\
+**Required Settings:**\n\
+• LM_STUDIO_BASE_URL\n\
+• LM_STUDIO_TIMEOUT\n\
+• DEFAULT_RANKING_MODEL\n\
+• DEFAULT_TEMPERATURE\n\
+• DEFAULT_MAX_TOKENS\n\
+• MAX_DISCORD_MESSAGE_LENGTH\n\
+• RESPONSE_FORMAT_PADDING", e);
+            
+            msg.reply(ctx, &error_message).await?;
+            
+            trace!("[TRACE][RANK] === FUNCTION EXIT: rank() ===");
+            trace!("[TRACE][RANK] Function: rank(), UUID: {}", command_uuid);
+            trace!("[TRACE][RANK] Exit status: CONFIGURATION_ERROR");
+            trace!("[TRACE][RANK] Total execution time: {:.3}s", start_time.elapsed().as_secs_f64());
+            trace!("[TRACE][RANK] Exit timestamp: {:?}", Instant::now());
+            
+            return Ok(());
+        }
+    };
+    
+    // Always use the ranking model for all content types
+    let selected_model = &config.default_ranking_model;
+    
+    // Log the model selection
+    info!("🎯 === RANKING MODEL SELECTION ===");
+    info!("🎯 Using ranking model: {}", selected_model);
+    debug!("🎯 Ranking model selected: {}", selected_model);
+    trace!("🔍 Ranking model configuration: model={}, command_uuid={}", selected_model, command_uuid);
+    
+    // Send initial processing message
+    let mut response_msg = match msg.channel_id.send_message(&ctx.http, |m| {
+        m.content(if is_youtube {
+            "🎥 **YouTube Video Ranking**\n\nProcessing YouTube video for ranking analysis..."
+        } else {
+            "📄 **Webpage Ranking**\n\nProcessing webpage for ranking analysis..."
+        })
+    }).await {
+        Ok(message) => {
+            trace!("[TRACE][RANK] Initial response message sent successfully");
+            message
+        },
+        Err(e) => {
+            error!("Failed to send initial response message: {}", e);
+            msg.reply(ctx, "Failed to send response message!").await?;
+            
+            trace!("[TRACE][RANK] === FUNCTION EXIT: rank() ===");
+            trace!("[TRACE][RANK] Function: rank(), UUID: {}", command_uuid);
+            trace!("[TRACE][RANK] Exit status: MESSAGE_SEND_ERROR");
+            trace!("[TRACE][RANK] Total execution time: {:.3}s", start_time.elapsed().as_secs_f64());
+            trace!("[TRACE][RANK] Exit timestamp: {:?}", Instant::now());
+            
+            return Ok(());
+        }
+    };
+    
+    // Fetch content based on URL type
+    let (content_for_ranking, subtitle_file_path) = if is_youtube {
+        trace!("[TRACE][RANK] Starting YouTube transcript extraction");
+        
+        // Update message to show YouTube processing
+        if let Err(e) = response_msg.edit(&ctx.http, |m| {
+            m.content("🎥 **YouTube Video Ranking**\n\n📥 Downloading video transcript...")
+        }).await {
+            warn!("Failed to update message for YouTube processing: {}", e);
+        }
+        
+        match fetch_youtube_transcript(url).await {
+            Ok(transcript) => {
+                trace!("[TRACE][RANK] YouTube transcript extracted successfully: {} chars", transcript.len());
+                (transcript, None::<String>)
+            },
+            Err(e) => {
+                error!("Failed to fetch YouTube transcript: {}", e);
+                let error_message = format!("**❌ YouTube Processing Error**\n\n\
+Failed to extract video transcript: {}\n\n\
+**Solutions:**\n\
+• **Install yt-dlp**: `pip install yt-dlp` or download from https://github.com/yt-dlp/yt-dlp\n\
+• **Check Video**: Ensure the video is public and has captions/subtitles\n\
+• **Try Again**: Some videos may have temporary issues\n\
+• **Alternative**: Try a different video or webpage\n\n\
+**URL:** {}", e, url);
+                
+                response_msg.edit(&ctx.http, |m| m.content(&error_message)).await?;
+                
+                trace!("[TRACE][RANK] === FUNCTION EXIT: rank() ===");
+                trace!("[TRACE][RANK] Function: rank(), UUID: {}", command_uuid);
+                trace!("[TRACE][RANK] Exit status: YOUTUBE_EXTRACTION_ERROR");
+                trace!("[TRACE][RANK] Total execution time: {:.3}s", start_time.elapsed().as_secs_f64());
+                trace!("[TRACE][RANK] Exit timestamp: {:?}", Instant::now());
+                
+                return Ok(());
+            }
+        }
+    } else {
+        trace!("[TRACE][RANK] Starting webpage content extraction");
+        
+        // Update message to show webpage processing
+        if let Err(e) = response_msg.edit(&ctx.http, |m| {
+            m.content("📄 **Webpage Ranking**\n\n📥 Fetching webpage content...")
+        }).await {
+            warn!("Failed to update message for webpage processing: {}", e);
+        }
+        
+        match fetch_webpage_content(url).await {
+            Ok((title, content)) => {
+                trace!("[TRACE][RANK] Webpage content extracted successfully: title='{}', content={} chars", title, content.len());
+                (content, None)
+            },
+            Err(e) => {
+                error!("Failed to fetch webpage content: {}", e);
+                let error_message = format!("**❌ Webpage Processing Error**\n\n\
+Failed to fetch webpage content: {}\n\n\
+**Solutions:**\n\
+• **Check URL**: Ensure the URL is accessible and valid\n\
+• **Network**: Verify your internet connection\n\
+• **Try Again**: Some websites may have temporary issues\n\
+• **Alternative**: Try a different webpage\n\n\
+**URL:** {}", e, url);
+                
+                response_msg.edit(&ctx.http, |m| m.content(&error_message)).await?;
+                
+                trace!("[TRACE][RANK] === FUNCTION EXIT: rank() ===");
+                trace!("[TRACE][RANK] Function: rank(), UUID: {}", command_uuid);
+                trace!("[TRACE][RANK] Exit status: WEBPAGE_EXTRACTION_ERROR");
+                trace!("[TRACE][RANK] Total execution time: {:.3}s", start_time.elapsed().as_secs_f64());
+                trace!("[TRACE][RANK] Exit timestamp: {:?}", Instant::now());
+                
+                return Ok(());
+            }
+        }
+    };
+    
+    let content_length = content_for_ranking.len();
+    trace!("[TRACE][RANK] Content prepared for ranking: {} chars", content_length);
+    
+    // Update message to show ranking analysis
+    if let Err(e) = response_msg.edit(&ctx.http, |m| {
+        m.content(format!("🎯 **Content Ranking Analysis**\n\n📊 Analyzing {} characters of content...", content_length))
+    }).await {
+        warn!("Failed to update message for ranking analysis: {}", e);
+    }
+    
+    // Stream the ranking analysis
+    match stream_ranking_analysis(&content_for_ranking, url, &config, selected_model, &mut response_msg, ctx, is_youtube, subtitle_file_path.as_deref()).await {
+        Ok(()) => {
+            let total_time = start_time.elapsed();
+            info!("✅ Ranking analysis completed successfully in {:.2}s", total_time.as_secs_f32());
+            
+            trace!("[TRACE][RANK] === FUNCTION EXIT: rank() ===");
+            trace!("[TRACE][RANK] Function: rank(), UUID: {}", command_uuid);
+            trace!("[TRACE][RANK] Exit status: SUCCESS");
+            trace!("[TRACE][RANK] Total execution time: {:.3}s", total_time.as_secs_f64());
+            trace!("[TRACE][RANK] Final content length: {} chars", content_length);
+            trace!("[TRACE][RANK] Processing method used: {}", 
+                   if let Some(ref _path) = subtitle_file_path { "RAG with file" } else { "Direct processing" });
+            trace!("[TRACE][RANK] Exit timestamp: {:?}", Instant::now());
+        },
+        Err(e) => {
+            error!("Failed to stream ranking analysis: {}", e);
+            let error_message = format!("**❌ Ranking Analysis Error**\n\n\
+Failed to complete ranking analysis: {}\n\n\
+**Solutions:**\n\
+• **Check LM Studio**: Ensure LM Studio is running and responsive\n\
+• **Model Loaded**: Verify the ranking model is loaded\n\
+• **Try Again**: Some content may be too complex for analysis\n\
+• **Reduce Content**: Try a shorter video or webpage\n\n\
+**URL:** {}", e, url);
+            
+            response_msg.edit(&ctx.http, |m| m.content(&error_message)).await?;
+            
+            trace!("[TRACE][RANK] === FUNCTION EXIT: rank() ===");
+            trace!("[TRACE][RANK] Function: rank(), UUID: {}", command_uuid);
+            trace!("[TRACE][RANK] Exit status: RANKING_ANALYSIS_ERROR");
+            trace!("[TRACE][RANK] Total execution time: {:.3}s", start_time.elapsed().as_secs_f64());
+            trace!("[TRACE][RANK] Exit timestamp: {:?}", Instant::now());
+        }
+    }
+    
+    Ok(())
+}
+
+// Command group exports
+#[group]
+#[commands(rank)]
+pub struct Rank;
+
+impl Rank {
+    pub const fn new() -> Self {
+        Rank
+    }
+}
+
+
+

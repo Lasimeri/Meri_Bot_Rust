@@ -21,7 +21,7 @@
 
 use serenity::{
     client::Context,
-    framework::standard::{macros::command, Args, CommandResult},
+    framework::standard::{macros::command, macros::group, Args, CommandResult},
     model::channel::Message,
 };
 use std::fs;
@@ -83,6 +83,7 @@ struct MessageState {
     current_message: Message,   // Current Discord message object
     message_index: usize,       // Part number (for chunked output)
     char_limit: usize,          // Discord message length limit
+    total_messages: Vec<Message>, // Track all messages for multi-part responses
 }
 
 // Helper function to safely get the reason context map
@@ -287,6 +288,22 @@ pub async fn reason(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
     println!("[REASON] Total messages prepared for API: {} (including system prompt)", messages.len());
     println!("[REASON] First message (system): role='{}', content='{}'", 
         messages[0].role, &messages[0].content[..std::cmp::min(100, messages[0].content.len())]);
+    
+    // Enhanced debug: Show more of the system prompt to verify it's loaded correctly
+    let system_content = &messages[0].content;
+    println!("[REASON] System prompt length: {} characters", system_content.len());
+    if system_content.len() > 200 {
+        println!("[REASON] System prompt preview (first 200 chars): {}", &system_content[..200]);
+        println!("[REASON] System prompt preview (last 200 chars): {}", &system_content[system_content.len()-200..]);
+    } else {
+        println!("[REASON] Full system prompt: {}", system_content);
+    }
+    
+    // Verify the system prompt contains key reasoning elements
+    let has_reasoning_keywords = system_content.to_lowercase().contains("reasoning") || 
+                                system_content.to_lowercase().contains("analytical") ||
+                                system_content.to_lowercase().contains("step-by-step");
+    println!("[REASON] System prompt contains reasoning keywords: {}", has_reasoning_keywords);
 
     // Safety check: ensure messages were built correctly
     println!("[REASON] Messages built successfully for API call");
@@ -323,7 +340,7 @@ pub async fn reason(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
 
     // Send initial "thinking" message
     let mut current_msg = match msg.channel_id.send_message(&ctx.http, |m| {
-        m.content("**Part 1:**\n```\nThinking...\n```")
+        m.content("🤔 **AI is reasoning...**")
     }).await {
         Ok(message) => message,
         Err(e) => {
@@ -350,22 +367,21 @@ pub async fn reason(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
 
     // Stream the reasoning response
     match stream_reasoning_response(messages, &config.default_reason_model, &config, ctx, &mut current_msg).await {
-        Ok(final_stats) => {
+        Ok((final_stats, full_response_content)) => {
             println!("Reasoning command: Streaming complete - {} total characters across {} messages", 
                 final_stats.total_characters, final_stats.message_count);
             
             // Safety check: ensure streaming was completed successfully
             println!("[REASON] Streaming completed successfully for user {}", msg.author.name);
             
-            // Record AI response in per-user context history
-            let response_content = current_msg.content.clone();
-            let response_content_clone = response_content.clone(); // Clone for later use
+            // Record AI response in per-user context history with the full content
+            let response_content_clone = full_response_content.clone(); // Clone for later use
             let mut data_map = ctx.data.write().await;
             let reason_map = get_reason_context_map(&mut data_map)?;
             if let Some(context) = reason_map.get_mut(&msg.author.id) {
                 context.add_assistant_message(ChatMessage { 
                     role: "assistant".to_string(), 
-                    content: response_content 
+                    content: full_response_content,
                 });
                 
                 println!("[REASON] AI response recorded: {} total messages in context", 
@@ -575,6 +591,13 @@ async fn load_reasoning_config() -> Result<LMConfig, Box<dyn std::error::Error +
     };
 
     println!("Reasoning command: Successfully loaded config from {} with reasoning model: '{}'", config_source, config.default_reason_model);
+    
+    // Debug: Log the seed value
+    match &config.default_seed {
+        Some(seed) => println!("[DEBUG] Reasoning command: Seed loaded from config: {}", seed),
+        None => println!("[DEBUG] Reasoning command: No seed specified in config (will use random)"),
+    }
+    
     Ok(config)
 }
 
@@ -594,19 +617,50 @@ async fn load_reasoning_system_prompt() -> Result<String, Box<dyn std::error::Er
         "src/system_prompt.txt",
     ];
     
+    let mut attempted_paths = Vec::new();
+    
     for path in &reasoning_prompt_paths {
+        attempted_paths.push(path.to_string());
         match fs::read_to_string(path) {
             Ok(content) => {
                 // Remove BOM if present
                 let content = content.strip_prefix('\u{feff}').unwrap_or(&content);
-                println!("Reasoning command: Loaded prompt from {}", path);
-                return Ok(content.trim().to_string());
+                let trimmed_content = content.trim();
+                
+                // Validate that we got meaningful content
+                if trimmed_content.is_empty() {
+                    println!("[WARNING] Reasoning prompt file {} is empty", path);
+                    continue;
+                }
+                
+                if trimmed_content.len() < 50 {
+                    println!("[WARNING] Reasoning prompt file {} seems too short ({} chars)", path, trimmed_content.len());
+                    continue;
+                }
+                
+                println!("[SUCCESS] Reasoning command: Loaded prompt from {} ({} chars)", path, trimmed_content.len());
+                println!("[DEBUG] Prompt preview: {}", &trimmed_content[..std::cmp::min(200, trimmed_content.len())]);
+                return Ok(trimmed_content.to_string());
             }
-            Err(_) => continue,
+            Err(e) => {
+                println!("[DEBUG] Failed to load prompt from {}: {}", path, e);
+                continue;
+            }
         }
     }
     
-    Err("No reasoning prompt file found in any expected location".into())
+    // If we get here, no file was found or all files were invalid
+    let error_msg = format!(
+        "No valid reasoning prompt file found in any expected location.\n\n\
+        Attempted paths:\n{}\n\n\
+        Please ensure one of these files exists and contains a proper reasoning system prompt:\n\
+        - reasoning_prompt.txt (preferred)\n\
+        - system_prompt.txt (fallback)\n\n\
+        The prompt should contain instructions for analytical reasoning and step-by-step thinking.",
+        attempted_paths.join("\n")
+    );
+    
+    Err(error_msg.into())
 }
 
 // Simple and reliable thinking tag filter
@@ -679,7 +733,7 @@ async fn stream_reasoning_response(
     config: &LMConfig,
     ctx: &Context,
     initial_msg: &mut Message,
-) -> Result<StreamingStats, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<(StreamingStats, String), Box<dyn std::error::Error + Send + Sync>> {
     println!("[DEBUG][REASONING] === STARTING REASONING STREAM RESPONSE ===");
     println!("[DEBUG][REASONING] Model: {}", model);
     println!("[DEBUG][REASONING] Messages count: {}", messages.len());
@@ -707,6 +761,12 @@ async fn stream_reasoning_response(
     };
     println!("[DEBUG][REASONING] Chat request created - Temperature: {}, Max tokens: {}, Stream: {}", 
         chat_request.temperature, chat_request.max_tokens, chat_request.stream);
+    
+    // Debug: Log the seed being used
+    match &chat_request.seed {
+        Some(seed) => println!("[DEBUG][REASONING] Using seed: {} for reproducible responses", seed),
+        None => println!("[DEBUG][REASONING] No seed specified (will use random responses)"),
+    }
 
     // Safety check: ensure chat request is valid
     if chat_request.messages.is_empty() {
@@ -1011,105 +1071,50 @@ async fn stream_reasoning_response(
             message_count: 1,
             filtered_characters: raw_response.len() - filtered_response.len(),
         };
-        return Ok(stats);
-    }
-    
-    let mut message_state = MessageState {
-        current_content: String::new(),
-        current_message: initial_msg.clone(),
-        message_index: 1,
-        char_limit: config.max_discord_message_length - config.response_format_padding,
-    };
-    println!("[DEBUG][REASONING] Message state initialized - Char limit: {}", message_state.char_limit);
-    
-    // Safety check: ensure message state is properly initialized
-    if message_state.char_limit == 0 {
-        eprintln!("[DEBUG][REASONING] ERROR: Invalid character limit: {}", message_state.char_limit);
-        let _ = initial_msg.edit(&ctx.http, |m| {
-            m.content("**Error:** Invalid message configuration. Check your lmapiconf.txt file.")
-        }).await;
-        return Err("Invalid character limit".into());
+        return Ok((stats, processed_response));
     }
 
-    // Split the processed response into chunks for Discord streaming
-    let chunk_size = 100; // Characters per Discord update
-    let mut chars_processed = 0;
+    // Split content into Discord-friendly chunks
+    let chunks = split_message(&processed_response, config.max_discord_message_length - config.response_format_padding);
+    println!("[DEBUG][REASONING] Split response into {} chunks", chunks.len());
     
-    // Safety check: ensure chunk size is valid
-    if chunk_size == 0 {
-        eprintln!("[DEBUG][REASONING] ERROR: Invalid chunk size: {}", chunk_size);
-        let _ = initial_msg.edit(&ctx.http, |m| {
-            m.content("**Error:** Invalid chunk configuration. Please try again.")
-        }).await;
-        return Err("Invalid chunk size".into());
-    }
-
-    while chars_processed < processed_response.len() {
-        let end_pos = std::cmp::min(chars_processed + chunk_size, processed_response.len());
-        let chunk = &processed_response[chars_processed..end_pos];
+    // Handle multiple messages if content is too long
+    if chunks.len() == 1 {
+        // Single message - update the initial message
+        let formatted_content = format!(
+            "**Reasoning Analysis:**\n```\n{}\n```",
+            chunks[0]
+        );
         
-        println!("[DEBUG][REASONING] Streaming chunk {} chars to Discord", chunk.len());
-        println!("[DEBUG][REASONING] Chunk content: '{}'", chunk);
-        println!("[DEBUG][REASONING] Current state content before update: {} chars", message_state.current_content.len());
-        println!("[DEBUG][REASONING] Current state content before update: '{}'", message_state.current_content);
-        
-        if let Err(e) = update_discord_message(&mut message_state, chunk, ctx, config).await {
-            eprintln!("[DEBUG][REASONING] Failed to update Discord message: {}", e);
-            return Err(e);
+        initial_msg.edit(&ctx.http, |m| {
+            m.content(&formatted_content)
+        }).await?;
+    } else {
+        // Multiple messages - update first message and send additional ones
+        for (i, chunk) in chunks.iter().enumerate() {
+            let formatted_content = if chunks.len() == 1 {
+                format!("**Reasoning Analysis:**\n```\n{}\n```", chunk)
+            } else {
+                format!("**Reasoning Analysis (Part {}/{})**\n```\n{}\n```", i + 1, chunks.len(), chunk)
+            };
+            
+            if i == 0 {
+                // Update the first message
+                initial_msg.edit(&ctx.http, |m| {
+                    m.content(&formatted_content)
+                }).await?;
+            } else {
+                // Send additional messages for remaining chunks
+                initial_msg.channel_id.send_message(&ctx.http, |m| {
+                    m.content(&formatted_content)
+                }).await?;
+            }
         }
-        
-        println!("[DEBUG][REASONING] Current state content after update: {} chars", message_state.current_content.len());
-        println!("[DEBUG][REASONING] Current state content after update: '{}'", message_state.current_content);
-        
-        chars_processed = end_pos;
-        
-        // Small delay to make streaming visible
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-    }
-
-    // Finalize the message
-    println!("[DEBUG][REASONING] === FINALIZING DISCORD MESSAGE ===");
-    println!("[DEBUG][REASONING] About to finalize with processed content length: {} chars", processed_response.len());
-    println!("[DEBUG][REASONING] Final message state content: {} chars", message_state.current_content.len());
-    println!("[DEBUG][REASONING] Final message state content: '{}'", message_state.current_content);
-    
-    // Check if we have content to finalize
-    if processed_response.is_empty() {
-        eprintln!("[DEBUG][REASONING] ERROR: Cannot finalize - no content was processed from API");
-        return Err("No content was processed from API - cannot finalize empty message".into());
-    }
-    
-    // Check if the message state has content (this should catch streaming issues)
-    if message_state.current_content.trim().is_empty() {
-        eprintln!("[DEBUG][REASONING] ERROR: Message state has no content despite processed response");
-        eprintln!("[DEBUG][REASONING] Processed response length: {} chars", processed_response.len());
-        eprintln!("[DEBUG][REASONING] Message state content length: {} chars", message_state.current_content.len());
-        return Err("Message state has no content despite processed response - streaming to Discord failed".into());
-    }
-    
-    // Safety check: ensure final message state has valid content
-    if message_state.current_content.len() > message_state.char_limit * 10 {
-        eprintln!("[DEBUG][REASONING] ERROR: Message state content is too large: {} chars", message_state.current_content.len());
-        let _ = initial_msg.edit(&ctx.http, |m| {
-            m.content("**Error:** Response is too large. Please try a shorter question.")
-        }).await;
-        return Err("Message state content is too large".into());
-    }
-    
-    if let Err(e) = finalize_message_content(&mut message_state, "", ctx, config).await {
-        eprintln!("[DEBUG][REASONING] Failed to finalize Discord message: {}", e);
-        return Err(e);
-    }
-
-    // Safety check: ensure final message was sent successfully
-    if message_state.current_message.content.is_empty() {
-        eprintln!("[DEBUG][REASONING] ERROR: Final message has empty content");
-        return Err("Final message has empty content".into());
     }
 
     let stats = StreamingStats {
         total_characters: raw_response.len(),
-        message_count: message_state.message_index,
+        message_count: chunks.len(),
         filtered_characters: raw_response.len() - filtered_response.len(),
     };
 
@@ -1127,7 +1132,7 @@ async fn stream_reasoning_response(
     println!("[DEBUG][REASONING] === REASONING STREAMING COMPLETED ===");
     println!("[DEBUG][REASONING] Final stats - Total chars: {}, Messages: {}, Filtered chars: {}", 
         stats.total_characters, stats.message_count, stats.filtered_characters);
-    Ok(stats)
+    Ok((stats, processed_response))
 }
 
 // Helper function to update Discord message with new content for reasoning
@@ -1606,19 +1611,42 @@ async fn load_reasoning_search_analysis_prompt() -> Result<String, Box<dyn std::
         "src/example_summarize_search_prompt.txt",
     ];
     
+    let mut attempted_paths = Vec::new();
+    
     for path in &prompt_paths {
+        attempted_paths.push(path.to_string());
         match fs::read_to_string(path) {
             Ok(content) => {
                 // Remove BOM if present  
                 let content = content.strip_prefix('\u{feff}').unwrap_or(&content);
-                println!("Reasoning analysis: Loaded prompt from {}", path);
-                return Ok(content.trim().to_string());
+                let trimmed_content = content.trim();
+                
+                // Validate that we got meaningful content
+                if trimmed_content.is_empty() {
+                    println!("[WARNING] Search analysis prompt file {} is empty", path);
+                    continue;
+                }
+                
+                if trimmed_content.len() < 50 {
+                    println!("[WARNING] Search analysis prompt file {} seems too short ({} chars)", path, trimmed_content.len());
+                    continue;
+                }
+                
+                println!("[SUCCESS] Reasoning analysis: Loaded prompt from {} ({} chars)", path, trimmed_content.len());
+                println!("[DEBUG] Prompt preview: {}", &trimmed_content[..std::cmp::min(200, trimmed_content.len())]);
+                return Ok(trimmed_content.to_string());
             }
-            Err(_) => continue,
+            Err(e) => {
+                println!("[DEBUG] Failed to load search analysis prompt from {}: {}", path, e);
+                continue;
+            }
         }
     }
     
-    // Final fallback prompt
+    // Final fallback prompt with detailed error information
+    println!("[WARNING] No valid search analysis prompt file found, using fallback prompt");
+    println!("[DEBUG] Attempted paths: {}", attempted_paths.join(", "));
+    
     Ok("You are an expert analytical reasoner. Analyze these web search results to provide a comprehensive, logical analysis. Focus on reasoning through the information, identifying patterns, and providing insights. Use Discord formatting and embed relevant links naturally using [title](URL) format.".to_string())
 }
 
@@ -1670,5 +1698,172 @@ async fn chat_completion_reasoning(
     
     Err("Failed to extract content from reasoning API response".into())
 } 
+
+/// Split message content into Discord-friendly chunks
+fn split_message(content: &str, max_len: usize) -> Vec<String> {
+    let lines: Vec<&str> = content.lines().collect();
+    let mut chunks = Vec::new();
+    let mut current_chunk = String::new();
+    
+    for line in lines {
+        let potential_chunk = if current_chunk.is_empty() {
+            line.to_string()
+        } else {
+            format!("{}\n{}", current_chunk, line)
+        };
+        
+        if potential_chunk.len() <= max_len {
+            current_chunk = potential_chunk;
+        } else {
+            if !current_chunk.is_empty() {
+                chunks.push(current_chunk.clone());
+            }
+            current_chunk = line.to_string();
+        }
+    }
+    
+    if !current_chunk.is_empty() {
+        chunks.push(current_chunk);
+    }
+    
+    chunks
+}
+
+// ============================================================================
+// COMMAND GROUP
+// ============================================================================
+
+// Commands are auto-registered by the #[command] macro
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_split_message_short_content() {
+        let short_content = "This is a short reasoning response that should fit in one chunk.";
+        let chunks = split_message(short_content, 100);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0], short_content);
+    }
+
+    #[test]
+    fn test_split_message_long_content() {
+        let long_content = "This is the first line of reasoning.\nThis is the second line with more details.\nThis is the third line that should be split.\nThis is the fourth line to test chunking.";
+        let chunks = split_message(&long_content, 50);
+        assert!(chunks.len() > 1, "Long content should be split into multiple chunks");
+        
+        // Test that each chunk is within the limit
+        for chunk in &chunks {
+            assert!(chunk.len() <= 50, "Chunk exceeds maximum length: {}", chunk.len());
+        }
+    }
+
+    #[test]
+    fn test_split_message_single_long_line() {
+        let single_long_line = "This is a very long line of reasoning that should not be split because it exceeds the maximum length but we want to keep it as one chunk for testing purposes.";
+        let chunks = split_message(single_long_line, 50);
+        assert_eq!(chunks.len(), 1, "Single long line should remain as one chunk");
+    }
+
+    #[test]
+    fn test_split_message_empty_content() {
+        let chunks = split_message("", 100);
+        assert_eq!(chunks.len(), 0);
+    }
+
+    #[test]
+    fn test_split_message_exact_limit() {
+        let content = "This is exactly 25 characters";
+        let chunks = split_message(content, 25);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0], content);
+    }
+
+    #[test]
+    fn test_filter_thinking_tags() {
+        let content_with_tags = "Here is some content <think>This is internal thinking</think> and more content <think>More thinking</think>.";
+        let filtered = filter_thinking_tags(content_with_tags);
+        assert_eq!(filtered, "Here is some content  and more content .");
+    }
+
+    #[test]
+    fn test_filter_thinking_tags_no_tags() {
+        let content = "This is normal content without any thinking tags.";
+        let filtered = filter_thinking_tags(content);
+        assert_eq!(filtered, content);
+    }
+
+    #[tokio::test]
+    async fn test_load_reasoning_system_prompt() {
+        // Test that the reasoning system prompt loads correctly
+        match load_reasoning_system_prompt().await {
+            Ok(prompt) => {
+                // Verify the prompt is not empty
+                assert!(!prompt.trim().is_empty(), "System prompt should not be empty");
+                
+                // Verify the prompt contains reasoning-related content
+                let prompt_lower = prompt.to_lowercase();
+                assert!(
+                    prompt_lower.contains("reasoning") || 
+                    prompt_lower.contains("analytical") || 
+                    prompt_lower.contains("step-by-step"),
+                    "System prompt should contain reasoning-related keywords"
+                );
+                
+                // Verify the prompt is substantial (not just a few words)
+                assert!(prompt.len() > 100, "System prompt should be substantial (got {} chars)", prompt.len());
+                
+                println!("[TEST] Successfully loaded reasoning system prompt ({} chars)", prompt.len());
+                println!("[TEST] Prompt preview: {}", &prompt[..std::cmp::min(200, prompt.len())]);
+            }
+            Err(e) => {
+                panic!("Failed to load reasoning system prompt: {}", e);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_load_reasoning_config_seed() {
+        // Test that the reasoning config loads the seed correctly
+        match load_reasoning_config().await {
+            Ok(config) => {
+                // Verify that the seed is loaded (should be 666 from lmapiconf.txt)
+                match config.default_seed {
+                    Some(seed) => {
+                        println!("[TEST] Successfully loaded seed: {}", seed);
+                        // The seed should be 666 as configured in lmapiconf.txt
+                        assert_eq!(seed, 666, "Seed should be 666 as configured in lmapiconf.txt");
+                    }
+                    None => {
+                        panic!("Seed should be loaded from lmapiconf.txt but was None");
+                    }
+                }
+                
+                // Verify other required fields are loaded
+                assert!(!config.default_reason_model.is_empty(), "Reason model should be loaded");
+                assert!(!config.base_url.is_empty(), "Base URL should be loaded");
+                assert!(config.default_temperature > 0.0, "Temperature should be positive");
+                assert!(config.default_max_tokens > 0, "Max tokens should be positive");
+                
+                println!("[TEST] Successfully loaded reasoning config with seed: {:?}", config.default_seed);
+            }
+            Err(e) => {
+                panic!("Failed to load reasoning config: {}", e);
+            }
+        }
+    }
+}
+
+// Command group exports
+#[group]
+#[commands(reason, clearreasoncontext)]
+pub struct Reason;
+
+impl Reason {
+    pub const fn new() -> Self {
+        Reason
+    }
+}
 
  

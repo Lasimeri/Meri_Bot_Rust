@@ -20,7 +20,7 @@
 
 use serenity::{
     client::Context,
-    framework::standard::{macros::command, Args, CommandResult},
+    framework::standard::{macros::command, macros::group, Args, CommandResult},
     model::channel::Message,
 };
 use std::time::Duration;
@@ -3301,6 +3301,12 @@ fn split_message(content: &str, max_len: usize) -> Vec<String> {
     chunks
 }
 
+// ============================================================================
+// COMMAND GROUP
+// ============================================================================
+
+// Commands are auto-registered by the #[command] macro
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3482,5 +3488,16 @@ This is a test"#;
         let single_long_line = "This is a very long single line that exceeds the max_len but has no line breaks so it cannot be split by the line-based splitting algorithm.".repeat(5);
         let single_line_chunks = split_message(&single_long_line, max_len);
         assert_eq!(single_line_chunks.len(), 1, "Single long line should not be split");
+    }
+}
+
+// Command group exports
+#[group]
+#[commands(sum)]
+pub struct Sum;
+
+impl Sum {
+    pub const fn new() -> Self {
+        Sum
     }
 } 

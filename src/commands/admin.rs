@@ -4,7 +4,7 @@
 
 use serenity::{
     client::Context,
-    framework::standard::{macros::command, Args, CommandResult},
+    framework::standard::{macros::command, macros::group, Args, CommandResult},
     model::channel::Message,
 };
 use std::env;
@@ -614,5 +614,19 @@ fn analyze_connection_error(error: &reqwest::Error) -> ConnectionError {
             issue: "General network connectivity issue".to_string(),
             solutions: "• Check network connection\n• Verify server URL in lmapiconf.txt\n• Ensure firewall allows connections\n• Try restarting LM Studio".to_string(),
         }
+    }
+}
+
+// ============================================================================
+// COMMAND GROUP
+// ============================================================================
+
+#[group]
+#[commands(restart, shutdown, adminhelp, forcerestart, diagnose)]
+pub struct Admin;
+
+impl Admin {
+    pub const fn new() -> Self {
+        Admin
     }
 } 

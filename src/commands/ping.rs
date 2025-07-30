@@ -13,7 +13,7 @@
 
 use serenity::{
     client::Context,
-    framework::standard::{macros::command, Args, CommandResult},
+    framework::standard::{macros::command, macros::group, Args, CommandResult},
     model::channel::Message,
 };
 
@@ -47,6 +47,20 @@ pub async fn ping(ctx: &Context, msg: &Message, _args: Args) -> CommandResult {
     
     Ok(())
 } 
+// ============================================================================
+// COMMAND GROUP
+// ============================================================================
+
+#[group]
+#[commands(ping)]
+pub struct Ping;
+
+impl Ping {
+    pub const fn new() -> Self {
+        Ping
+    }
+}
+
 // ============================================================================
 // TODO: Add more diagnostics or latency breakdown in future versions
 // ============================================================================ 

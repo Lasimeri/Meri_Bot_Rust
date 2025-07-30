@@ -8,6 +8,7 @@ pub mod help;           // Help system and command documentation
 pub mod ping;           // Basic ping/pong functionality
 pub mod lm;             // Language model integration (AI chat)
 pub mod reason;         // Reasoning and analysis capabilities
+pub mod agent;          // LLM Agent with function calling using js-code-sandbox
 pub mod search;         // Web search and RAG (Retrieval-Augmented Generation) - Minimal placeholder
 pub mod sum;            // Text summarization capabilities
 pub mod rank;           // Content ranking and analysis capabilities

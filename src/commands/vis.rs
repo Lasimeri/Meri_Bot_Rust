@@ -207,7 +207,7 @@ pub async fn stream_vision_response(
     
     let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(60)).build()?;
     
-    let chat_request = crate::commands::lm::ChatRequest {
+    let chat_request = crate::commands::lm::MultimodalChatRequest {
         model: config.default_vision_model.clone(),
         messages,
         temperature: config.default_temperature,
@@ -251,6 +251,7 @@ pub async fn stream_vision_response(
         current_message: initial_msg.clone(),
         message_index: 1,
         char_limit: config.max_discord_message_length - config.response_format_padding,
+        total_messages: Vec::new(),
     };
     
     let mut raw_response = String::new();
