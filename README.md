@@ -57,6 +57,12 @@ The bot includes administrative commands that can only be used by the bot owner:
 - **Function**: Lists all available administrative commands
 - **Usage**: `^adminhelp`
 
+### `^leaveserver` / `^leave` / `^exit` / `^quit`
+- **Owner Only**: Makes the bot leave the current server
+- **Function**: Gracefully leaves the server where the command was used
+- **Usage**: `^leaveserver`
+- **Note**: This action cannot be undone - the bot will need to be re-invited to rejoin
+
 ### Configuration
 To use admin commands, add your Discord user ID to `botconfig.txt`:
 ```
@@ -64,6 +70,28 @@ BOT_OWNER_ID=YOUR_DISCORD_USER_ID_HERE
 ```
 
 **Note**: If `BOT_OWNER_ID` is not set, the bot will fall back to using `BOT_USER_ID` as the owner.
+
+## 🚫 Server Blacklist
+
+The bot includes a server blacklist feature that prevents it from joining specific servers. This is useful for avoiding unwanted servers or maintaining a controlled bot presence.
+
+### Configuration
+The blacklist is stored in `server_blacklist.txt` in the project root:
+```
+# Server Blacklist
+# This file contains Discord server IDs that the bot should not join
+# One server ID per line
+# Lines starting with # are comments and will be ignored
+
+465706274751774721
+```
+
+### Automatic Protection
+- When the bot joins a blacklisted server, it will automatically leave immediately
+- All blacklist actions are logged for audit purposes
+- The blacklist is loaded on bot startup and persists across restarts
+
+
 
 ## 🤖 AI Commands
 
@@ -353,7 +381,7 @@ subtitles/
 ## Inviting the Bot to Your Server
 
 ### Automatic Invite Link (Recommended)
-When you start the bot, it will automatically display an invite link in the terminal:
+When you start the bot, it will automatically display an invite link:
 
 ```
 🎉 Bot is ready! Invite link:
@@ -428,8 +456,7 @@ meri_bot_rust/
 │   │   ├── search.rs          # DuckDuckGo web search functionality
 │   │   ├── vis.rs             # Vision analysis and image processing
 │   │   └── help.rs            # Help command system
-│   ├── terminal.rs            # External command execution and system management
-│   └── terminal_manager.rs    # Terminal output management and prompt handling
+
 ├── contexts/                  # Persistent conversation history storage
 ├── subtitles/                 # YouTube subtitle cache directory
 ├── target/                    # Rust build artifacts

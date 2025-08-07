@@ -180,6 +180,7 @@ pub async fn adminhelp(ctx: &Context, msg: &Message, _args: Args) -> CommandResu
                     `^restart` - Restart the bot gracefully\n\
                     `^shutdown` - Shutdown the bot gracefully\n\
                     `^forcerestart` - Force restart the bot (immediate shutdown)\n\
+                    `^leaveserver` - Make the bot leave the current server\n\
                     `^adminhelp` - Show this help message\n\n\
                     **Note:** These commands can only be used by the bot owner.";
     
@@ -617,12 +618,76 @@ fn analyze_connection_error(error: &reqwest::Error) -> ConnectionError {
     }
 }
 
+#[command]
+#[aliases("leave", "exit", "quit")]
+/// Make the bot leave the current server (owner only)
+/// This command will make the bot leave the server where it was used
+/// Only the bot owner can use this command
+pub async fn leaveserver(ctx: &Context, msg: &Message, _args: Args) -> CommandResult {
+    // Get the bot owner ID from configuration
+    let bot_owner_id = env::var("BOT_OWNER_ID").unwrap_or_else(|_| {
+        // Fallback to bot user ID if owner ID not set
+        env::var("BOT_USER_ID").unwrap_or_else(|_| "1385309017881968761".to_string())
+    });
+    
+    // Check if the user is the bot owner
+    if msg.author.id.to_string() != bot_owner_id {
+        msg.reply(ctx, "❌ **Access Denied**\nThis command can only be used by the bot owner.").await?;
+        return Ok(());
+    }
+    
+    // Get the guild (server) ID from the message
+    let guild_id = match msg.guild_id {
+        Some(id) => id,
+        None => {
+            msg.reply(ctx, "❌ **Error**\nThis command can only be used in a server, not in DMs.").await?;
+            return Ok(());
+        }
+    };
+    
+    // Get the guild name for logging
+    let guild_name = match guild_id.name(&ctx.cache) {
+        Some(name) => name,
+        None => "Unknown Server".to_string(),
+    };
+    
+    // Send confirmation message
+    let mut confirmation_msg = msg.reply(ctx, format!("🔄 **Leaving Server**\n\nPreparing to leave **{}**...\nThis action cannot be undone.", guild_name)).await?;
+    
+    // Log the leave request
+    println!("[ADMIN] Bot leave server requested by owner {} ({}) for server: {} ({})", 
+        msg.author.name, msg.author.id, guild_name, guild_id);
+    
+    // Small delay to ensure the message is sent
+    tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
+    
+    // Leave the server
+    match guild_id.leave(&ctx.http).await {
+        Ok(_) => {
+            println!("[ADMIN] Successfully left server: {} ({})", guild_name, guild_id);
+            
+            // Try to update the confirmation message (may fail if we've already left)
+            let _ = confirmation_msg.edit(&ctx.http, |m| {
+                m.content(format!("✅ **Successfully Left Server**\n\nThe bot has left **{}**.\n\n👋 **Goodbye!**", guild_name))
+            }).await;
+        }
+        Err(e) => {
+            eprintln!("[ADMIN] Failed to leave server {} ({}): {}", guild_name, guild_id, e);
+            
+            // Try to send error message (may fail if we've already left)
+            let _ = msg.reply(ctx, format!("❌ **Error Leaving Server**\n\nFailed to leave **{}**: {}", guild_name, e)).await;
+        }
+    }
+    
+    Ok(())
+}
+
 // ============================================================================
 // COMMAND GROUP
 // ============================================================================
 
 #[group]
-#[commands(restart, shutdown, adminhelp, forcerestart, diagnose)]
+#[commands(restart, shutdown, adminhelp, forcerestart, diagnose, leaveserver)]
 pub struct Admin;
 
 impl Admin {

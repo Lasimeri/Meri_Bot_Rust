@@ -245,3 +245,5 @@ ANTI_PROPAGANDA_FIX.md
 COMPILATION_FIXES.md
 CONTEXT_PERSISTENCE_FIX.md
 agentlog.txt
+staged_responses/
+server_blacklist.txt

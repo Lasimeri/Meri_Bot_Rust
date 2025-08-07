@@ -28,9 +28,97 @@ use serde::{Deserialize, Serialize};
 use serde_json;
 use regex::Regex;
 use once_cell::sync::Lazy;
+use futures_util::StreamExt;
 use tokio::sync::OnceCell;
 use chrono::{DateTime, Utc};
 use log::{debug, info, warn, error, trace};
+
+// ============================================================================
+// STAGED PROCESSING INFRASTRUCTURE
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentStage {
+    pub stage_id: u8,
+    pub name: String,
+    pub description: String,
+    pub status: StageStatus,
+    pub input: Option<String>,
+    pub output: Option<String>,
+    pub timestamp: DateTime<Utc>,
+    pub duration: Option<Duration>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum StageStatus {
+    Pending,
+    InProgress,
+    Completed,
+    Failed,
+    Skipped,
+}
+
+impl std::fmt::Display for StageStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StageStatus::Pending => write!(f, "⏳ Pending"),
+            StageStatus::InProgress => write!(f, "🔄 In Progress"),
+            StageStatus::Completed => write!(f, "✅ Completed"),
+            StageStatus::Failed => write!(f, "❌ Failed"),
+            StageStatus::Skipped => write!(f, "⏭️ Skipped"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StagedTask {
+    pub task_id: String,
+    pub user_id: UserId,
+    pub original_request: String,
+    pub stages: Vec<AgentStage>,
+    pub current_stage: u8,
+    pub overall_status: TaskStatus,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum TaskStatus {
+    Planning,
+    CodeGeneration,
+    Execution,
+    Analysis,
+    Complete,
+    Failed,
+    Paused,
+    InProgress,
+}
+
+impl std::fmt::Display for TaskStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TaskStatus::Planning => write!(f, "📋 Planning"),
+            TaskStatus::CodeGeneration => write!(f, "💻 Code Generation"),
+            TaskStatus::Execution => write!(f, "🚀 Execution"),
+            TaskStatus::Analysis => write!(f, "📊 Analysis"),
+            TaskStatus::Complete => write!(f, "✅ Complete"),
+            TaskStatus::Failed => write!(f, "❌ Failed"),
+            TaskStatus::Paused => write!(f, "⏸️ Paused"),
+            TaskStatus::InProgress => write!(f, "🔄 In Progress"),
+        }
+    }
+}
+
+// Global staged task store
+static STAGED_TASKS: OnceCell<std::sync::Mutex<HashMap<String, StagedTask>>> = OnceCell::const_new();
+
+// Initialize and get staged tasks
+async fn get_staged_tasks() -> &'static std::sync::Mutex<HashMap<String, StagedTask>> {
+    STAGED_TASKS.get_or_init(|| async {
+        info!("[STAGED_TASKS] Initializing staged task storage");
+        std::sync::Mutex::new(HashMap::new())
+    }).await
+}
 
 // ============================================================================
 // LOGGING INFRASTRUCTURE
@@ -547,12 +635,12 @@ async fn execute_js_code(
         code.len(),
         if features_detected.is_empty() { 
             "Basic JavaScript code".to_string() 
-        } else { 
+        } else {
             features_detected.join(", ") 
         },
         if potential_issues.is_empty() { 
             String::new() 
-        } else { 
+    } else {
             format!("⚠️  **Potential Issues Found:**\n{}\n\n", potential_issues.join("\n"))
         },
         code
@@ -713,7 +801,7 @@ async fn update_thinking_message(
     match thinking_msg.edit(&ctx.http, |m| m.content(&content)).await {
         Ok(_) => {
             agent_trace!(user_id, "update_thinking_message", "Updated thinking message with step: {}", step);
-            Ok(())
+    Ok(())
         }
         Err(e) => {
             agent_warn!(user_id, "update_thinking_message", "Failed to update thinking message: {}", e);
@@ -748,7 +836,7 @@ async fn delete_thinking_message(
     match thinking_msg.delete(&ctx.http).await {
         Ok(_) => {
             agent_trace!(user_id, "delete_thinking_message", "Successfully deleted thinking message");
-            Ok(())
+    Ok(())
         }
         Err(e) => {
             agent_warn!(user_id, "delete_thinking_message", "Failed to delete thinking message: {}", e);
@@ -891,10 +979,10 @@ async fn execute_agent_task(
     
     // Build messages for function calling with context
     let mut messages = vec![
-        ChatMessage {
-            role: "system".to_string(),
-            content: system_prompt,
-        },
+            ChatMessage {
+                role: "system".to_string(),
+                content: system_prompt,
+            },
     ];
     
     // Add previous context (excluding system messages to avoid duplication)
@@ -957,7 +1045,7 @@ async fn execute_agent_task(
         role: "assistant".to_string(),
         content: result.clone(),
     }).await;
-    
+
     // Write final result to file
     write_to_response_file(Some(&mut response_file), "=== FINAL RESULT ===", user_id);
     write_to_response_file(Some(&mut response_file), &result, user_id);
@@ -976,11 +1064,11 @@ async fn execute_agent_task(
             return Ok(());
         }
     };
-    
+
     // Create a summary for Discord message
     let summary = if result.len() > 500 {
         format!("{}...", &result[..500])
-    } else {
+                    } else {
         result.clone()
     };
     
@@ -995,8 +1083,8 @@ async fn execute_agent_task(
     }).await {
         Ok(_) => {
             agent_info!(user_id, "execute_agent_task", "Successfully uploaded response file to Discord");
-        }
-        Err(e) => {
+                }
+                Err(e) => {
             agent_error!(user_id, "execute_agent_task", "Failed to upload response file: {}", e);
             // Fallback to regular message
             let fallback_message = format!("✅ **Agent Task Complete**\n\n{}\n\n📝 **Context Saved**", summary);
@@ -1045,23 +1133,23 @@ async fn execute_function_calling(
     write_to_response_file(response_file.as_deref_mut(), "🔄 Connecting to AI model and preparing request", user_id);
     
     agent_trace!(user_id, "execute_function_calling", "Getting HTTP client...");
-    let client = get_http_client().await;
+        let client = get_http_client().await;
     agent_trace!(user_id, "execute_function_calling", "HTTP client obtained successfully");
         
     // Set stream: true for function calling
-    let chat_request = ChatRequest {
+        let chat_request = ChatRequest {
         model: config.default_model.clone(),
         messages: messages.to_vec(),
-        temperature: config.default_temperature,
-        max_tokens: config.default_max_tokens,
+            temperature: config.default_temperature,
+            max_tokens: config.default_max_tokens,
         stream: true, // Enable streaming for function calling
-        seed: config.default_seed,
+            seed: config.default_seed,
         tools: Some(functions.to_vec()),
         tool_choice: Some("auto".to_string()),
-    };
+        };
 
     // For Ollama, we need to use the OpenAI-compatible endpoint
-    let api_url = format!("{}/v1/chat/completions", config.base_url);
+        let api_url = format!("{}/v1/chat/completions", config.base_url);
     agent_trace!(user_id, "execute_function_calling", "API URL: {}", api_url);
     agent_trace!(user_id, "execute_function_calling", "Using Ollama OpenAI-compatible endpoint for model: {}", config.default_model);
     agent_trace!(user_id, "execute_function_calling", "Request timeout: {} seconds", config.timeout);
@@ -1088,31 +1176,31 @@ async fn execute_function_calling(
     
     // Instead of waiting for the full response, process the stream
     let response = match tokio::time::timeout(Duration::from_secs(config.timeout as u64), client
-        .post(&api_url)
-        .json(&chat_request)
-        .timeout(Duration::from_secs(config.timeout as u64))
-        .send()
+            .post(&api_url)
+            .json(&chat_request)
+            .timeout(Duration::from_secs(config.timeout as u64))
+            .send()
     ).await {
         Ok(Ok(resp)) => {
             agent_trace!(user_id, "execute_function_calling", "HTTP request completed successfully");
             agent_debug!(user_id, "execute_function_calling", "Received response with status: {}", resp.status());
-            resp
-        }
+                resp
+            }
         Ok(Err(e)) => {
             agent_trace!(user_id, "execute_function_calling", "HTTP request failed with error");
             agent_error!(user_id, "execute_function_calling", "HTTP request failed: {}", e);
-            return Err(e.into());
-        }
+                return Err(e.into());
+            }
         Err(_) => {
             agent_trace!(user_id, "execute_function_calling", "HTTP request timed out");
             agent_error!(user_id, "execute_function_calling", "HTTP request timed out after {} seconds", config.timeout);
             return Err("HTTP request timed out".into());
         }
-    };
+        };
 
-    if !response.status().is_success() {
-        let status = response.status();
-        let error_text = response.text().await.unwrap_or_else(|_| "Unable to read error response".to_string());
+        if !response.status().is_success() {
+            let status = response.status();
+            let error_text = response.text().await.unwrap_or_else(|_| "Unable to read error response".to_string());
         agent_error!(user_id, "execute_function_calling", "API returned error status {}: {}", status, error_text);
         return Err(format!("Function calling failed: HTTP {} - {}", status, error_text).into());
     }
@@ -1278,7 +1366,7 @@ async fn execute_function_calling(
                                                     let code_chars = code_preview.len();
                                                     let preview_code = if code_preview.len() > 800 {
                                                         format!("{}...", &code_preview[..800])
-                                                    } else {
+        } else {
                                                         code_preview.clone()
                                                     };
                                                     
@@ -1522,8 +1610,8 @@ async fn execute_function_calling(
                     agent_info!(user_id, "execute_function_calling", "Function '{}' executed successfully", tool_call.function.name);
                     agent_trace!(user_id, "execute_function_calling", "Function result: {}", result);
                     function_results.push(format!("✅ {}: {}", tool_call.function.name, result));
-                }
-                Err(e) => {
+            }
+            Err(e) => {
                     agent_error!(user_id, "execute_function_calling", "Function '{}' failed: {}", tool_call.function.name, e);
                     function_results.push(format!("❌ {}: Error - {}", tool_call.function.name, e));
                 }
@@ -1592,7 +1680,7 @@ async fn execute_function_calling(
                     function_results.join("\n\n"),
                     executed_code
                 )
-            } else {
+                    } else {
                 format!("**Execution Results:**\n{}", function_results.join("\n\n"))
             }
         } else {
@@ -1614,8 +1702,8 @@ async fn execute_function_calling(
         };
         
         Ok(comprehensive_response)
-            }
-            Err(e) => {
+                }
+                Err(e) => {
                 agent_warn!(user_id, "execute_function_calling", "Failed to get final response, using function results only: {}", e);
                 
                 // Extract code for fallback as well
@@ -1681,39 +1769,39 @@ async fn get_final_response(
     
     // Update thinking message if available
     write_to_response_file(response_file.as_deref_mut(), "🤖 AI is analyzing function results and preparing final answer...", user_id);
-    
-    let client = get_http_client().await;
-    
-    let chat_request = ChatRequest {
+        
+        let client = get_http_client().await;
+        
+        let chat_request = ChatRequest {
         model: config.default_model.clone(),
         messages: messages.to_vec(),
-        temperature: config.default_temperature,
-        max_tokens: config.default_max_tokens,
+            temperature: config.default_temperature,
+            max_tokens: config.default_max_tokens,
         stream: true, // Enable streaming for final response
-        seed: config.default_seed,
+            seed: config.default_seed,
         tools: None, // No tools for final response
         tool_choice: None,
-    };
+        };
 
-    let api_url = format!("{}/v1/chat/completions", config.base_url);
-    
-    let response = match client
-        .post(&api_url)
-        .json(&chat_request)
-        .timeout(Duration::from_secs(config.timeout as u64))
-        .send()
-        .await
-    {
+        let api_url = format!("{}/v1/chat/completions", config.base_url);
+        
+        let response = match client
+            .post(&api_url)
+            .json(&chat_request)
+            .timeout(Duration::from_secs(config.timeout as u64))
+            .send()
+            .await
+        {
         Ok(resp) => resp,
-        Err(e) => {
+            Err(e) => {
             agent_error!(user_id, "get_final_response", "HTTP request failed: {}", e);
-            return Err(e.into());
-        }
-    };
+                return Err(e.into());
+            }
+        };
 
-    if !response.status().is_success() {
-        let status = response.status();
-        let error_text = response.text().await.unwrap_or_else(|_| "Unable to read error response".to_string());
+        if !response.status().is_success() {
+            let status = response.status();
+            let error_text = response.text().await.unwrap_or_else(|_| "Unable to read error response".to_string());
         agent_error!(user_id, "get_final_response", "API returned error status {}: {}", status, error_text);
         return Err(format!("Final response failed: HTTP {} - {}", status, error_text).into());
     }
@@ -1844,6 +1932,1057 @@ Remember: You have the power to execute JavaScript code safely in a sandboxed en
 }
 
 // ============================================================================
+// STAGE-SPECIFIC SYSTEM PROMPTS
+// ============================================================================
+
+fn create_stage_1_planning_prompt() -> String {
+    r#"You are a task analysis and planning agent. Your job is to analyze user requests and create detailed execution plans.
+
+**STAGE 1: TASK ANALYSIS & PLANNING**
+
+**Your Role:**
+- Analyze the user's request thoroughly
+- Break down complex tasks into clear, actionable steps
+- Identify the best approach for solving the problem
+- Create a structured plan with expected outcomes
+- Consider potential challenges and solutions
+
+**Planning Guidelines:**
+1. **Understand the Core Task**: What exactly does the user want to accomplish?
+2. **Identify Requirements**: What inputs, outputs, and constraints are involved?
+3. **Choose the Right Tools**: Which functions (execute_js_code, calculate_math, process_text, analyze_data) are needed?
+4. **Plan the Execution**: What steps will lead to the desired outcome?
+5. **Consider Edge Cases**: What could go wrong and how to handle it?
+6. **Estimate Complexity**: How complex is this task and what resources will be needed?
+
+**Output Format:**
+Provide a structured plan with:
+- **Task Summary**: Brief description of what needs to be done
+- **Requirements**: What inputs and outputs are expected
+- **Execution Steps**: Detailed step-by-step plan
+- **Tools Needed**: Which functions will be used and why
+- **Expected Outcome**: What the final result should look like
+- **Potential Issues**: Any challenges that might arise
+
+**Example Plan:**
+```
+TASK: Calculate the factorial of 10 and display it with formatting
+
+REQUIREMENTS:
+- Input: Number 10
+- Output: Formatted factorial result
+- Tools: calculate_math for computation, process_text for formatting
+
+EXECUTION STEPS:
+1. Use calculate_math to compute 10!
+2. Format the result with process_text for better display
+3. Present the final formatted result
+
+EXPECTED OUTCOME: "The factorial of 10 is: 3,628,800"
+
+POTENTIAL ISSUES: Large numbers might need scientific notation
+```
+
+Focus on creating clear, actionable plans that will guide the next stages of execution."#.to_string()
+}
+
+fn create_stage_2_code_generation_prompt() -> String {
+    r#"You are a JavaScript code generation agent. Your job is to create high-quality, executable JavaScript code based on the planning stage.
+
+**STAGE 2: CODE GENERATION & VALIDATION**
+
+**Your Role:**
+- Generate clean, efficient JavaScript code
+- Ensure code follows best practices
+- Validate that code will execute successfully
+- Provide clear documentation and comments
+- Handle edge cases and error conditions
+
+**Code Generation Guidelines:**
+1. **Follow the Plan**: Use the planning stage output as your blueprint
+2. **Write Clean Code**: Use clear variable names, proper indentation, and good structure
+3. **Add Comments**: Explain complex logic and important sections
+4. **Handle Errors**: Include try-catch blocks and validation where appropriate
+5. **Optimize Performance**: Use efficient algorithms and data structures
+6. **Test Your Logic**: Think through how the code will execute
+
+**Code Quality Standards:**
+- **Readability**: Code should be easy to understand
+- **Efficiency**: Use appropriate algorithms and avoid unnecessary operations
+- **Robustness**: Handle edge cases and potential errors
+- **Documentation**: Include clear comments explaining the logic
+- **Modularity**: Break complex tasks into smaller, reusable functions
+
+**Output Format:**
+Provide:
+- **Code Overview**: Brief description of what the code does
+- **Implementation**: Complete, executable JavaScript code
+- **Usage Instructions**: How to use the generated code
+- **Expected Results**: What output to expect
+- **Error Handling**: How errors are managed
+
+**Example Output:**
+```
+CODE OVERVIEW: Calculates factorial with input validation and formatting
+
+IMPLEMENTATION:
+```javascript
+function calculateFactorial(n) {
+    // Validate input
+    if (n < 0 || !Number.isInteger(n)) {
+        throw new Error('Input must be a non-negative integer');
+    }
+    
+    // Calculate factorial
+    let result = 1;
+    for (let i = 2; i <= n; i++) {
+        result *= i;
+    }
+    
+    return result;
+}
+
+// Usage example
+const number = 10;
+const factorial = calculateFactorial(number);
+console.log(`The factorial of ${number} is: ${factorial.toLocaleString()}`);
+```
+
+EXPECTED RESULTS: "The factorial of 10 is: 3,628,800"
+
+ERROR HANDLING: Throws error for invalid inputs (negative numbers, non-integers)
+```
+
+Focus on creating production-ready code that is both functional and maintainable."#.to_string()
+}
+
+fn create_stage_3_execution_prompt() -> String {
+    r#"You are a code execution and testing agent. Your job is to execute the generated JavaScript code and perform comprehensive testing.
+
+**STAGE 3: EXECUTION & TESTING**
+
+**Your Role:**
+- Execute the generated JavaScript code safely
+- Monitor execution for errors and issues
+- Perform comprehensive testing with various inputs
+- Validate that results match expectations
+- Identify and report any problems
+
+**Execution Guidelines:**
+1. **Safe Execution**: Run code in a controlled environment
+2. **Error Monitoring**: Watch for runtime errors, exceptions, and unexpected behavior
+3. **Input Testing**: Test with various inputs including edge cases
+4. **Output Validation**: Verify that results are correct and complete
+5. **Performance Analysis**: Monitor execution time and resource usage
+6. **Documentation**: Record all test results and findings
+
+**Testing Strategy:**
+- **Unit Tests**: Test individual functions and components
+- **Integration Tests**: Test how different parts work together
+- **Edge Case Testing**: Test with boundary values and unusual inputs
+- **Error Testing**: Test error conditions and exception handling
+- **Performance Testing**: Measure execution time and efficiency
+
+**Output Format:**
+Provide:
+- **Execution Summary**: Overview of what was executed
+- **Test Results**: Detailed results from all tests
+- **Performance Metrics**: Execution time and resource usage
+- **Issues Found**: Any problems or unexpected behavior
+- **Recommendations**: Suggestions for improvements
+
+**Example Output:**
+```
+EXECUTION SUMMARY: Successfully executed factorial calculation function
+
+TEST RESULTS:
+✓ Basic test (n=5): Result = 120 ✅
+✓ Edge case (n=0): Result = 1 ✅
+✓ Large number (n=10): Result = 3,628,800 ✅
+✓ Error handling (n=-1): Throws error as expected ✅
+
+PERFORMANCE METRICS:
+- Execution time: < 1ms for n=10
+- Memory usage: Minimal
+- CPU usage: Low
+
+ISSUES FOUND: None
+
+RECOMMENDATIONS: Code performs well, no changes needed
+```
+
+Focus on thorough testing and validation to ensure code quality and reliability."#.to_string()
+}
+
+fn create_stage_4_analysis_prompt() -> String {
+    r#"You are a result analysis and optimization agent. Your job is to analyze execution results and optimize the solution.
+
+**STAGE 4: RESULT ANALYSIS & OPTIMIZATION**
+
+**Your Role:**
+- Analyze execution results and performance metrics
+- Identify areas for improvement and optimization
+- Suggest enhancements to code quality and efficiency
+- Validate that the solution meets all requirements
+- Provide recommendations for future improvements
+
+**Analysis Guidelines:**
+1. **Result Validation**: Verify that outputs match expected results
+2. **Performance Analysis**: Evaluate execution speed and resource usage
+3. **Code Quality Review**: Assess readability, maintainability, and best practices
+4. **Optimization Opportunities**: Identify ways to improve efficiency
+5. **Requirement Compliance**: Ensure all user requirements are met
+6. **Future-Proofing**: Consider scalability and extensibility
+
+**Optimization Focus Areas:**
+- **Algorithm Efficiency**: Can the algorithm be improved?
+- **Code Structure**: Is the code well-organized and maintainable?
+- **Error Handling**: Are all edge cases properly handled?
+- **Documentation**: Is the code well-documented?
+- **Performance**: Can execution time or memory usage be reduced?
+- **User Experience**: Is the output clear and user-friendly?
+
+**Output Format:**
+Provide:
+- **Analysis Summary**: Overview of findings and conclusions
+- **Performance Assessment**: Detailed performance analysis
+- **Quality Review**: Code quality and best practices assessment
+- **Optimization Suggestions**: Specific recommendations for improvement
+- **Final Recommendation**: Whether to proceed with current solution or implement changes
+
+**Example Output:**
+```
+ANALYSIS SUMMARY: Code performs well and meets all requirements
+
+PERFORMANCE ASSESSMENT:
+- Execution speed: Excellent (< 1ms for typical inputs)
+- Memory efficiency: Good (minimal memory usage)
+- Scalability: Good (handles large inputs efficiently)
+
+QUALITY REVIEW:
+- Code structure: Well-organized and readable
+- Error handling: Comprehensive and robust
+- Documentation: Clear and helpful
+- Best practices: Follows JavaScript conventions
+
+OPTIMIZATION SUGGESTIONS:
+- Consider adding input validation for very large numbers
+- Could add caching for frequently calculated values
+- Documentation could include more usage examples
+
+FINAL RECOMMENDATION: Current solution is production-ready
+```
+
+Focus on providing actionable insights and recommendations for improvement."#.to_string()
+}
+
+fn create_stage_5_delivery_prompt() -> String {
+    r#"You are a final delivery and documentation agent. Your job is to prepare the complete solution for delivery to the user.
+
+**STAGE 5: FINAL DELIVERY & DOCUMENTATION**
+
+**Your Role:**
+- Compile all previous stage results into a comprehensive deliverable
+- Create clear, user-friendly documentation
+- Provide usage examples and instructions
+- Ensure the solution is ready for immediate use
+- Present results in a professional, organized format
+
+**Documentation Guidelines:**
+1. **Complete Solution**: Include all code, explanations, and resources
+2. **Clear Instructions**: Provide step-by-step usage instructions
+3. **Examples**: Include practical examples showing how to use the solution
+4. **Troubleshooting**: Address common issues and how to resolve them
+5. **Best Practices**: Share tips for optimal usage
+6. **Future Considerations**: Suggest ways to extend or modify the solution
+
+**Delivery Components:**
+- **Executive Summary**: Brief overview of what was accomplished
+- **Complete Code**: Final, tested, and optimized code
+- **Usage Instructions**: How to use the solution
+- **Examples**: Practical examples with expected outputs
+- **Troubleshooting Guide**: Common issues and solutions
+- **Performance Notes**: Important performance considerations
+- **Extension Ideas**: Suggestions for future enhancements
+
+**Output Format:**
+Provide a comprehensive deliverable with:
+
+```
+🎯 EXECUTIVE SUMMARY
+Brief overview of the solution and its capabilities
+
+💻 COMPLETE CODE
+```javascript
+// Final, production-ready code
+```
+
+📖 USAGE INSTRUCTIONS
+Step-by-step guide on how to use the solution
+
+🔧 EXAMPLES
+Practical examples with inputs and expected outputs
+
+⚠️ TROUBLESHOOTING
+Common issues and how to resolve them
+
+⚡ PERFORMANCE NOTES
+Important performance considerations and optimizations
+
+🚀 EXTENSION IDEAS
+Suggestions for future enhancements and modifications
+```
+
+Focus on creating a professional, complete deliverable that users can immediately understand and use."#.to_string()
+}
+
+// ============================================================================
+// STAGE MANAGEMENT FUNCTIONS
+// ============================================================================
+
+async fn execute_stage_1_planning(
+    task: &str,
+    user_id: UserId,
+    config: &LMConfig,
+    response_file: &mut std::fs::File,
+) -> Result<AgentStage, Box<dyn std::error::Error + Send + Sync>> {
+    let start_time = Instant::now();
+    let stage_id = 1;
+    
+    agent_trace!(user_id, "execute_stage_1_planning", "=== STAGE 1: PLANNING START ===");
+    agent_info!(user_id, "execute_stage_1_planning", "Starting planning stage for task: '{}'", task);
+    
+    // Create stage record
+    let mut stage = AgentStage {
+        stage_id,
+        name: "Task Analysis & Planning".to_string(),
+        description: "Analyze user request and create execution plan".to_string(),
+        status: StageStatus::InProgress,
+        input: Some(task.to_string()),
+        output: None,
+        timestamp: Utc::now(),
+        duration: None,
+    };
+    
+    // Write stage start to file
+    write_to_response_file(Some(response_file), &format!("=== STAGE {}: {} ===", stage_id, stage.name), user_id);
+    write_to_response_file(Some(response_file), "🔄 Starting task analysis and planning...", user_id);
+    
+    // Create system prompt for planning
+    let system_prompt = create_stage_1_planning_prompt();
+    
+    // Build messages for planning
+    let messages = vec![
+        ChatMessage {
+            role: "system".to_string(),
+            content: system_prompt,
+        },
+        ChatMessage {
+            role: "user".to_string(),
+            content: format!("Please analyze this task and create a detailed execution plan: {}", task),
+        },
+    ];
+    
+    // Execute planning with function calling
+    let functions = get_js_code_sandbox_functions();
+    let planning_result = match execute_function_calling(&messages, &functions, config, user_id, Some(response_file)).await {
+        Ok(result) => {
+            agent_info!(user_id, "execute_stage_1_planning", "Planning stage completed successfully");
+            result
+            }
+            Err(e) => {
+            agent_error!(user_id, "execute_stage_1_planning", "Planning stage failed: {}", e);
+            stage.status = StageStatus::Failed;
+            stage.duration = Some(start_time.elapsed());
+                return Err(e);
+            }
+        };
+        
+    // Update stage with results
+    stage.output = Some(planning_result.clone());
+    stage.status = StageStatus::Completed;
+    stage.duration = Some(start_time.elapsed());
+    
+    // Write completion to file
+    write_to_response_file(Some(response_file), "✅ Planning stage completed successfully", user_id);
+    write_to_response_file(Some(response_file), &format!("📊 Planning duration: {:?}", stage.duration.unwrap()), user_id);
+    
+    agent_trace!(user_id, "execute_stage_1_planning", "=== STAGE 1: PLANNING END ===");
+    agent_info!(user_id, "execute_stage_1_planning", "Planning stage completed in {:?}", stage.duration.unwrap());
+    
+    Ok(stage)
+}
+
+async fn execute_stage_2_code_generation(
+    plan: &AgentStage,
+    user_id: UserId,
+    config: &LMConfig,
+    response_file: &mut std::fs::File,
+) -> Result<AgentStage, Box<dyn std::error::Error + Send + Sync>> {
+    let start_time = Instant::now();
+    let stage_id = 2;
+    
+    agent_trace!(user_id, "execute_stage_2_code_generation", "=== STAGE 2: CODE GENERATION START ===");
+    agent_info!(user_id, "execute_stage_2_code_generation", "Starting code generation stage");
+    
+    // Create stage record
+    let mut stage = AgentStage {
+        stage_id,
+        name: "Code Generation & Validation".to_string(),
+        description: "Generate JavaScript code based on planning stage".to_string(),
+        status: StageStatus::InProgress,
+        input: plan.output.clone(),
+        output: None,
+        timestamp: Utc::now(),
+        duration: None,
+    };
+    
+    // Write stage start to file
+    write_to_response_file(Some(response_file), &format!("=== STAGE {}: {} ===", stage_id, stage.name), user_id);
+    write_to_response_file(Some(response_file), "🔄 Starting code generation and validation...", user_id);
+    
+    // Create system prompt for code generation
+    let system_prompt = create_stage_2_code_generation_prompt();
+    
+    // Build messages for code generation
+    let messages = vec![
+        ChatMessage {
+            role: "system".to_string(),
+            content: system_prompt,
+        },
+        ChatMessage {
+            role: "user".to_string(),
+            content: format!("Based on this plan, generate the JavaScript code:\n\n{}", 
+                plan.output.as_ref().unwrap_or(&"No plan available".to_string())),
+        },
+    ];
+    
+    // Execute code generation with function calling
+    let functions = get_js_code_sandbox_functions();
+    let code_result = match execute_function_calling(&messages, &functions, config, user_id, Some(response_file)).await {
+                        Ok(result) => {
+            agent_info!(user_id, "execute_stage_2_code_generation", "Code generation stage completed successfully");
+                            result
+                        }
+                        Err(e) => {
+            agent_error!(user_id, "execute_stage_2_code_generation", "Code generation stage failed: {}", e);
+            stage.status = StageStatus::Failed;
+            stage.duration = Some(start_time.elapsed());
+            return Err(e);
+        }
+    };
+    
+    // Update stage with results
+    stage.output = Some(code_result.clone());
+    stage.status = StageStatus::Completed;
+    stage.duration = Some(start_time.elapsed());
+    
+    // Write completion to file
+    write_to_response_file(Some(response_file), "✅ Code generation stage completed successfully", user_id);
+    write_to_response_file(Some(response_file), &format!("📊 Code generation duration: {:?}", stage.duration.unwrap()), user_id);
+    
+    agent_trace!(user_id, "execute_stage_2_code_generation", "=== STAGE 2: CODE GENERATION END ===");
+    agent_info!(user_id, "execute_stage_2_code_generation", "Code generation stage completed in {:?}", stage.duration.unwrap());
+    
+    Ok(stage)
+}
+
+async fn execute_stage_3_execution(
+    code_stage: &AgentStage,
+    user_id: UserId,
+    config: &LMConfig,
+    response_file: &mut std::fs::File,
+) -> Result<AgentStage, Box<dyn std::error::Error + Send + Sync>> {
+    let start_time = Instant::now();
+    let stage_id = 3;
+    
+    agent_trace!(user_id, "execute_stage_3_execution", "=== STAGE 3: EXECUTION START ===");
+    agent_info!(user_id, "execute_stage_3_execution", "Starting execution and testing stage");
+    
+    // Create stage record
+    let mut stage = AgentStage {
+        stage_id,
+        name: "Execution & Testing".to_string(),
+        description: "Execute generated code and perform testing".to_string(),
+        status: StageStatus::InProgress,
+        input: code_stage.output.clone(),
+        output: None,
+        timestamp: Utc::now(),
+        duration: None,
+    };
+    
+    // Write stage start to file
+    write_to_response_file(Some(response_file), &format!("=== STAGE {}: {} ===", stage_id, stage.name), user_id);
+    write_to_response_file(Some(response_file), "🔄 Starting code execution and testing...", user_id);
+    
+    // Create system prompt for execution
+    let system_prompt = create_stage_3_execution_prompt();
+    
+    // Build messages for execution
+    let messages = vec![
+        ChatMessage {
+            role: "system".to_string(),
+            content: system_prompt,
+        },
+        ChatMessage {
+            role: "user".to_string(),
+            content: format!("Execute and test this JavaScript code:\n\n{}", 
+                code_stage.output.as_ref().unwrap_or(&"No code available".to_string())),
+        },
+    ];
+    
+    // Execute testing with function calling
+    let functions = get_js_code_sandbox_functions();
+    let execution_result = match execute_function_calling(&messages, &functions, config, user_id, Some(response_file)).await {
+                        Ok(result) => {
+            agent_info!(user_id, "execute_stage_3_execution", "Execution stage completed successfully");
+                            result
+                        }
+                        Err(e) => {
+            agent_error!(user_id, "execute_stage_3_execution", "Execution stage failed: {}", e);
+            stage.status = StageStatus::Failed;
+            stage.duration = Some(start_time.elapsed());
+            return Err(e);
+        }
+    };
+    
+    // Update stage with results
+    stage.output = Some(execution_result.clone());
+    stage.status = StageStatus::Completed;
+    stage.duration = Some(start_time.elapsed());
+    
+    // Write completion to file
+    write_to_response_file(Some(response_file), "✅ Execution stage completed successfully", user_id);
+    write_to_response_file(Some(response_file), &format!("📊 Execution duration: {:?}", stage.duration.unwrap()), user_id);
+    
+    agent_trace!(user_id, "execute_stage_3_execution", "=== STAGE 3: EXECUTION END ===");
+    agent_info!(user_id, "execute_stage_3_execution", "Execution stage completed in {:?}", stage.duration.unwrap());
+    
+    Ok(stage)
+}
+
+async fn execute_stage_4_analysis(
+    execution_stage: &AgentStage,
+    user_id: UserId,
+    config: &LMConfig,
+    response_file: &mut std::fs::File,
+) -> Result<AgentStage, Box<dyn std::error::Error + Send + Sync>> {
+    let start_time = Instant::now();
+    let stage_id = 4;
+    
+    agent_trace!(user_id, "execute_stage_4_analysis", "=== STAGE 4: ANALYSIS START ===");
+    agent_info!(user_id, "execute_stage_4_analysis", "Starting result analysis and optimization stage");
+    
+    // Create stage record
+    let mut stage = AgentStage {
+        stage_id,
+        name: "Result Analysis & Optimization".to_string(),
+        description: "Analyze execution results and optimize solution".to_string(),
+        status: StageStatus::InProgress,
+        input: execution_stage.output.clone(),
+        output: None,
+        timestamp: Utc::now(),
+        duration: None,
+    };
+    
+    // Write stage start to file
+    write_to_response_file(Some(response_file), &format!("=== STAGE {}: {} ===", stage_id, stage.name), user_id);
+    write_to_response_file(Some(response_file), "🔄 Starting result analysis and optimization...", user_id);
+    
+    // Create system prompt for analysis
+    let system_prompt = create_stage_4_analysis_prompt();
+    
+    // Build messages for analysis
+    let messages = vec![
+        ChatMessage {
+            role: "system".to_string(),
+            content: system_prompt,
+        },
+        ChatMessage {
+            role: "user".to_string(),
+            content: format!("Analyze these execution results and provide optimization recommendations:\n\n{}", 
+                execution_stage.output.as_ref().unwrap_or(&"No execution results available".to_string())),
+        },
+    ];
+    
+    // Execute analysis with function calling
+    let functions = get_js_code_sandbox_functions();
+    let analysis_result = match execute_function_calling(&messages, &functions, config, user_id, Some(response_file)).await {
+        Ok(result) => {
+            agent_info!(user_id, "execute_stage_4_analysis", "Analysis stage completed successfully");
+            result
+        }
+        Err(e) => {
+            agent_error!(user_id, "execute_stage_4_analysis", "Analysis stage failed: {}", e);
+            stage.status = StageStatus::Failed;
+            stage.duration = Some(start_time.elapsed());
+            return Err(e);
+        }
+    };
+    
+    // Update stage with results
+    stage.output = Some(analysis_result.clone());
+    stage.status = StageStatus::Completed;
+    stage.duration = Some(start_time.elapsed());
+    
+    // Write completion to file
+    write_to_response_file(Some(response_file), "✅ Analysis stage completed successfully", user_id);
+    write_to_response_file(Some(response_file), &format!("📊 Analysis duration: {:?}", stage.duration.unwrap()), user_id);
+    
+    agent_trace!(user_id, "execute_stage_4_analysis", "=== STAGE 4: ANALYSIS END ===");
+    agent_info!(user_id, "execute_stage_4_analysis", "Analysis stage completed in {:?}", stage.duration.unwrap());
+    
+    Ok(stage)
+}
+
+async fn execute_stage_5_delivery(
+    analysis_stage: &AgentStage,
+    user_id: UserId,
+    config: &LMConfig,
+    response_file: &mut std::fs::File,
+) -> Result<AgentStage, Box<dyn std::error::Error + Send + Sync>> {
+    let start_time = Instant::now();
+    let stage_id = 5;
+    
+    agent_trace!(user_id, "execute_stage_5_delivery", "=== STAGE 5: DELIVERY START ===");
+    agent_info!(user_id, "execute_stage_5_delivery", "Starting final delivery and documentation stage");
+    
+    // Create stage record
+    let mut stage = AgentStage {
+        stage_id,
+        name: "Final Delivery & Documentation".to_string(),
+        description: "Prepare complete solution for delivery".to_string(),
+        status: StageStatus::InProgress,
+        input: analysis_stage.output.clone(),
+        output: None,
+        timestamp: Utc::now(),
+        duration: None,
+    };
+    
+    // Write stage start to file
+    write_to_response_file(Some(response_file), &format!("=== STAGE {}: {} ===", stage_id, stage.name), user_id);
+    write_to_response_file(Some(response_file), "🔄 Starting final delivery and documentation...", user_id);
+    
+    // Create system prompt for delivery
+    let system_prompt = create_stage_5_delivery_prompt();
+    
+    // Build messages for delivery
+    let messages = vec![
+        ChatMessage {
+            role: "system".to_string(),
+            content: system_prompt,
+        },
+        ChatMessage {
+            role: "user".to_string(),
+            content: format!("Create a comprehensive final deliverable based on this analysis:\n\n{}", 
+                analysis_stage.output.as_ref().unwrap_or(&"No analysis available".to_string())),
+        },
+    ];
+    
+    // Execute delivery with function calling
+    let functions = get_js_code_sandbox_functions();
+    let delivery_result = match execute_function_calling(&messages, &functions, config, user_id, Some(response_file)).await {
+        Ok(result) => {
+            agent_info!(user_id, "execute_stage_5_delivery", "Delivery stage completed successfully");
+            result
+        }
+        Err(e) => {
+            agent_error!(user_id, "execute_stage_5_delivery", "Delivery stage failed: {}", e);
+            stage.status = StageStatus::Failed;
+            stage.duration = Some(start_time.elapsed());
+            return Err(e);
+        }
+    };
+    
+    // Update stage with results
+    stage.output = Some(delivery_result.clone());
+    stage.status = StageStatus::Completed;
+    stage.duration = Some(start_time.elapsed());
+    
+    // Write completion to file
+    write_to_response_file(Some(response_file), "✅ Delivery stage completed successfully", user_id);
+    write_to_response_file(Some(response_file), &format!("📊 Delivery duration: {:?}", stage.duration.unwrap()), user_id);
+    
+    agent_trace!(user_id, "execute_stage_5_delivery", "=== STAGE 5: DELIVERY END ===");
+    agent_info!(user_id, "execute_stage_5_delivery", "Delivery stage completed in {:?}", stage.duration.unwrap());
+    
+    Ok(stage)
+}
+
+// ============================================================================
+// STREAMING STAGE EXECUTION FUNCTIONS
+// ============================================================================
+
+async fn execute_stage_1_planning_streaming(
+    task: &str,
+    user_id: UserId,
+    config: &LMConfig,
+    streaming_msg: &mut Message,
+    ctx: &Context,
+) -> Result<AgentStage, Box<dyn std::error::Error + Send + Sync>> {
+    let start_time = Instant::now();
+    let stage_id = 1;
+    
+    agent_trace!(user_id, "execute_stage_1_planning_streaming", "=== STAGE 1: PLANNING STREAMING START ===");
+    agent_info!(user_id, "execute_stage_1_planning_streaming", "Starting planning stage with streaming for task: '{}'", task);
+    
+    // Create stage record
+    let mut stage = AgentStage {
+        stage_id,
+        name: "Task Analysis & Planning".to_string(),
+        description: "Analyze user request and create execution plan".to_string(),
+        status: StageStatus::InProgress,
+        input: Some(task.to_string()),
+        output: None,
+        timestamp: Utc::now(),
+        duration: None,
+    };
+    
+    // Create system prompt for planning
+    let system_prompt = create_stage_1_planning_prompt();
+    
+    // Build messages for planning
+    let messages = vec![
+        ChatMessage {
+            role: "system".to_string(),
+            content: system_prompt,
+        },
+        ChatMessage {
+            role: "user".to_string(),
+            content: format!("Please analyze this task and create a detailed execution plan: {}", task),
+        },
+    ];
+    
+    // Execute planning with streaming
+    let functions = get_js_code_sandbox_functions();
+    let planning_result = match execute_function_calling_streaming(&messages, &functions, config, user_id, streaming_msg, ctx).await {
+        Ok(result) => {
+            agent_info!(user_id, "execute_stage_1_planning_streaming", "Planning stage completed successfully");
+            result
+        }
+        Err(e) => {
+            agent_error!(user_id, "execute_stage_1_planning_streaming", "Planning stage failed: {}", e);
+            stage.status = StageStatus::Failed;
+            stage.duration = Some(start_time.elapsed());
+            return Err(e);
+        }
+    };
+    
+    // Update stage with results
+    stage.output = Some(planning_result.clone());
+    stage.status = StageStatus::Completed;
+    stage.duration = Some(start_time.elapsed());
+    
+    // Update streaming message with completion
+    let completion_message = format!(
+        "✅ **Stage {} Complete: {}**\n\n📝 **Planning Results:**\n{}\n\n⏱️ **Duration:** {:?}\n\n🔄 **Ready for Stage 2: Code Generation**",
+        stage_id, stage.name, planning_result, stage.duration.unwrap()
+    );
+    let _ = streaming_msg.edit(&ctx.http, |m| m.content(&completion_message)).await;
+    
+    agent_trace!(user_id, "execute_stage_1_planning_streaming", "=== STAGE 1: PLANNING STREAMING END ===");
+    agent_info!(user_id, "execute_stage_1_planning_streaming", "Planning stage completed in {:?}", stage.duration.unwrap());
+    
+    Ok(stage)
+}
+
+async fn execute_stage_2_code_generation_streaming(
+    plan: &AgentStage,
+    user_id: UserId,
+    config: &LMConfig,
+    streaming_msg: &mut Message,
+    ctx: &Context,
+) -> Result<AgentStage, Box<dyn std::error::Error + Send + Sync>> {
+    let start_time = Instant::now();
+    let stage_id = 2;
+    
+    agent_trace!(user_id, "execute_stage_2_code_generation_streaming", "=== STAGE 2: CODE GENERATION STREAMING START ===");
+    agent_info!(user_id, "execute_stage_2_code_generation_streaming", "Starting code generation stage with streaming");
+    
+    // Create stage record
+    let mut stage = AgentStage {
+        stage_id,
+        name: "Code Generation & Validation".to_string(),
+        description: "Generate JavaScript code based on planning stage".to_string(),
+        status: StageStatus::InProgress,
+        input: plan.output.clone(),
+        output: None,
+        timestamp: Utc::now(),
+        duration: None,
+    };
+    
+    // Create system prompt for code generation
+    let system_prompt = create_stage_2_code_generation_prompt();
+    
+    // Build messages for code generation
+    let messages = vec![
+        ChatMessage {
+            role: "system".to_string(),
+            content: system_prompt,
+        },
+        ChatMessage {
+            role: "user".to_string(),
+            content: format!("Based on this plan, generate the JavaScript code:\n\n{}", 
+                plan.output.as_ref().unwrap_or(&"No plan available".to_string())),
+        },
+    ];
+    
+    // Execute code generation with streaming
+    let functions = get_js_code_sandbox_functions();
+    let code_result = match execute_function_calling_streaming(&messages, &functions, config, user_id, streaming_msg, ctx).await {
+        Ok(result) => {
+            agent_info!(user_id, "execute_stage_2_code_generation_streaming", "Code generation stage completed successfully");
+            result
+        }
+        Err(e) => {
+            agent_error!(user_id, "execute_stage_2_code_generation_streaming", "Code generation stage failed: {}", e);
+            stage.status = StageStatus::Failed;
+            stage.duration = Some(start_time.elapsed());
+            return Err(e);
+        }
+    };
+    
+    // Update stage with results
+    stage.output = Some(code_result.clone());
+    stage.status = StageStatus::Completed;
+    stage.duration = Some(start_time.elapsed());
+    
+    // Update streaming message with completion
+    let completion_message = format!(
+        "✅ **Stage {} Complete: {}**\n\n📝 **Generated Code:**\n{}\n\n⏱️ **Duration:** {:?}\n\n🔄 **Ready for Stage 3: Execution & Testing**",
+        stage_id, stage.name, code_result, stage.duration.unwrap()
+    );
+    let _ = streaming_msg.edit(&ctx.http, |m| m.content(&completion_message)).await;
+    
+    agent_trace!(user_id, "execute_stage_2_code_generation_streaming", "=== STAGE 2: CODE GENERATION STREAMING END ===");
+    agent_info!(user_id, "execute_stage_2_code_generation_streaming", "Code generation stage completed in {:?}", stage.duration.unwrap());
+    
+    Ok(stage)
+}
+
+async fn execute_stage_3_execution_streaming(
+    code_stage: &AgentStage,
+    user_id: UserId,
+    config: &LMConfig,
+    streaming_msg: &mut Message,
+    ctx: &Context,
+) -> Result<AgentStage, Box<dyn std::error::Error + Send + Sync>> {
+    let start_time = Instant::now();
+    let stage_id = 3;
+    
+    agent_trace!(user_id, "execute_stage_3_execution_streaming", "=== STAGE 3: EXECUTION STREAMING START ===");
+    agent_info!(user_id, "execute_stage_3_execution_streaming", "Starting execution and testing stage with streaming");
+    
+    // Create stage record
+    let mut stage = AgentStage {
+        stage_id,
+        name: "Execution & Testing".to_string(),
+        description: "Execute generated code and perform testing".to_string(),
+        status: StageStatus::InProgress,
+        input: code_stage.output.clone(),
+        output: None,
+        timestamp: Utc::now(),
+        duration: None,
+    };
+    
+    // Create system prompt for execution
+    let system_prompt = create_stage_3_execution_prompt();
+    
+    // Build messages for execution
+    let messages = vec![
+        ChatMessage {
+            role: "system".to_string(),
+            content: system_prompt,
+        },
+        ChatMessage {
+            role: "user".to_string(),
+            content: format!("Execute and test this JavaScript code:\n\n{}", 
+                code_stage.output.as_ref().unwrap_or(&"No code available".to_string())),
+        },
+    ];
+    
+    // Execute testing with streaming
+    let functions = get_js_code_sandbox_functions();
+    let execution_result = match execute_function_calling_streaming(&messages, &functions, config, user_id, streaming_msg, ctx).await {
+        Ok(result) => {
+            agent_info!(user_id, "execute_stage_3_execution_streaming", "Execution stage completed successfully");
+            result
+        }
+        Err(e) => {
+            agent_error!(user_id, "execute_stage_3_execution_streaming", "Execution stage failed: {}", e);
+            stage.status = StageStatus::Failed;
+            stage.duration = Some(start_time.elapsed());
+            return Err(e);
+        }
+    };
+    
+    // Update stage with results
+    stage.output = Some(execution_result.clone());
+    stage.status = StageStatus::Completed;
+    stage.duration = Some(start_time.elapsed());
+    
+    // Update streaming message with completion
+    let completion_message = format!(
+        "✅ **Stage {} Complete: {}**\n\n📝 **Execution Results:**\n{}\n\n⏱️ **Duration:** {:?}\n\n🔄 **Ready for Stage 4: Result Analysis**",
+        stage_id, stage.name, execution_result, stage.duration.unwrap()
+    );
+    let _ = streaming_msg.edit(&ctx.http, |m| m.content(&completion_message)).await;
+    
+    agent_trace!(user_id, "execute_stage_3_execution_streaming", "=== STAGE 3: EXECUTION STREAMING END ===");
+    agent_info!(user_id, "execute_stage_3_execution_streaming", "Execution stage completed in {:?}", stage.duration.unwrap());
+    
+    Ok(stage)
+}
+
+async fn execute_stage_4_analysis_streaming(
+    execution_stage: &AgentStage,
+    user_id: UserId,
+    config: &LMConfig,
+    streaming_msg: &mut Message,
+    ctx: &Context,
+) -> Result<AgentStage, Box<dyn std::error::Error + Send + Sync>> {
+    let start_time = Instant::now();
+    let stage_id = 4;
+    
+    agent_trace!(user_id, "execute_stage_4_analysis_streaming", "=== STAGE 4: ANALYSIS STREAMING START ===");
+    agent_info!(user_id, "execute_stage_4_analysis_streaming", "Starting result analysis and optimization stage with streaming");
+    
+    // Create stage record
+    let mut stage = AgentStage {
+        stage_id,
+        name: "Result Analysis & Optimization".to_string(),
+        description: "Analyze execution results and optimize solution".to_string(),
+        status: StageStatus::InProgress,
+        input: execution_stage.output.clone(),
+        output: None,
+        timestamp: Utc::now(),
+        duration: None,
+    };
+    
+    // Create system prompt for analysis
+    let system_prompt = create_stage_4_analysis_prompt();
+    
+    // Build messages for analysis
+    let messages = vec![
+        ChatMessage {
+            role: "system".to_string(),
+            content: system_prompt,
+        },
+        ChatMessage {
+            role: "user".to_string(),
+            content: format!("Analyze these execution results and provide optimization recommendations:\n\n{}", 
+                execution_stage.output.as_ref().unwrap_or(&"No execution results available".to_string())),
+        },
+    ];
+    
+    // Execute analysis with streaming
+    let functions = get_js_code_sandbox_functions();
+    let analysis_result = match execute_function_calling_streaming(&messages, &functions, config, user_id, streaming_msg, ctx).await {
+        Ok(result) => {
+            agent_info!(user_id, "execute_stage_4_analysis_streaming", "Analysis stage completed successfully");
+            result
+        }
+        Err(e) => {
+            agent_error!(user_id, "execute_stage_4_analysis_streaming", "Analysis stage failed: {}", e);
+            stage.status = StageStatus::Failed;
+            stage.duration = Some(start_time.elapsed());
+            return Err(e);
+        }
+    };
+    
+    // Update stage with results
+    stage.output = Some(analysis_result.clone());
+    stage.status = StageStatus::Completed;
+    stage.duration = Some(start_time.elapsed());
+    
+    // Update streaming message with completion
+    let completion_message = format!(
+        "✅ **Stage {} Complete: {}**\n\n📝 **Analysis Results:**\n{}\n\n⏱️ **Duration:** {:?}\n\n🔄 **Ready for Stage 5: Final Delivery**",
+        stage_id, stage.name, analysis_result, stage.duration.unwrap()
+    );
+    let _ = streaming_msg.edit(&ctx.http, |m| m.content(&completion_message)).await;
+    
+    agent_trace!(user_id, "execute_stage_4_analysis_streaming", "=== STAGE 4: ANALYSIS STREAMING END ===");
+    agent_info!(user_id, "execute_stage_4_analysis_streaming", "Analysis stage completed in {:?}", stage.duration.unwrap());
+    
+    Ok(stage)
+}
+
+async fn execute_stage_5_delivery_streaming(
+    analysis_stage: &AgentStage,
+    user_id: UserId,
+    config: &LMConfig,
+    streaming_msg: &mut Message,
+    ctx: &Context,
+) -> Result<AgentStage, Box<dyn std::error::Error + Send + Sync>> {
+    let start_time = Instant::now();
+    let stage_id = 5;
+    
+    agent_trace!(user_id, "execute_stage_5_delivery_streaming", "=== STAGE 5: DELIVERY STREAMING START ===");
+    agent_info!(user_id, "execute_stage_5_delivery_streaming", "Starting final delivery and documentation stage with streaming");
+    
+    // Create stage record
+    let mut stage = AgentStage {
+        stage_id,
+        name: "Final Delivery & Documentation".to_string(),
+        description: "Prepare complete solution for delivery".to_string(),
+        status: StageStatus::InProgress,
+        input: analysis_stage.output.clone(),
+        output: None,
+        timestamp: Utc::now(),
+        duration: None,
+    };
+    
+    // Create system prompt for delivery
+    let system_prompt = create_stage_5_delivery_prompt();
+    
+    // Build messages for delivery
+    let messages = vec![
+        ChatMessage {
+            role: "system".to_string(),
+            content: system_prompt,
+        },
+        ChatMessage {
+            role: "user".to_string(),
+            content: format!("Create a comprehensive final deliverable based on this analysis:\n\n{}", 
+                analysis_stage.output.as_ref().unwrap_or(&"No analysis available".to_string())),
+        },
+    ];
+    
+    // Execute delivery with streaming
+    let functions = get_js_code_sandbox_functions();
+    let delivery_result = match execute_function_calling_streaming(&messages, &functions, config, user_id, streaming_msg, ctx).await {
+        Ok(result) => {
+            agent_info!(user_id, "execute_stage_5_delivery_streaming", "Delivery stage completed successfully");
+            result
+        }
+        Err(e) => {
+            agent_error!(user_id, "execute_stage_5_delivery_streaming", "Delivery stage failed: {}", e);
+            stage.status = StageStatus::Failed;
+            stage.duration = Some(start_time.elapsed());
+            return Err(e);
+        }
+    };
+    
+    // Update stage with results
+    stage.output = Some(delivery_result.clone());
+    stage.status = StageStatus::Completed;
+    stage.duration = Some(start_time.elapsed());
+    
+    // Update streaming message with completion
+    let completion_message = format!(
+        "✅ **Stage {} Complete: {}**\n\n📝 **Final Deliverable:**\n{}\n\n⏱️ **Duration:** {:?}\n\n🎉 **All Stages Complete!**",
+        stage_id, stage.name, delivery_result, stage.duration.unwrap()
+    );
+    let _ = streaming_msg.edit(&ctx.http, |m| m.content(&completion_message)).await;
+    
+    agent_trace!(user_id, "execute_stage_5_delivery_streaming", "=== STAGE 5: DELIVERY STREAMING END ===");
+    agent_info!(user_id, "execute_stage_5_delivery_streaming", "Delivery stage completed in {:?}", stage.duration.unwrap());
+    
+    Ok(stage)
+}
+
+// ============================================================================
 // AGENT COMMAND HANDLERS
 // ============================================================================
 
@@ -1878,9 +3017,9 @@ pub async fn agent(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
     if input == "--help" || input == "-h" {
         show_agent_help(ctx, msg).await
     } else if input == "--tools" || input == "-t" {
-        list_available_tools(ctx, msg).await
+            list_available_tools(ctx, msg).await
     } else if input == "--clear" || input == "-c" {
-        clear_agent_memory(ctx, msg).await
+            clear_agent_memory(ctx, msg).await
     } else {
         // Default to execute mode
         agent_trace!(user_id, "agent", "Executing agent task: '{}'", input);
@@ -2155,11 +3294,989 @@ mod tests {
 
 // Command group exports
 #[group]
-#[commands(agent, clearagentcontext)]
+#[commands(agent, clearagentcontext, staged)]
 pub struct Agent;
 
 impl Agent {
     pub const fn new() -> Self {
         Agent
     }
+}
+
+#[command]
+#[aliases("staged", "step")]
+/// Staged agent command - Execute tasks in 5 distinct stages with user control
+/// Handles complex tasks using a staged approach:
+///   - Stage 1: Task Analysis & Planning
+///   - Stage 2: Code Generation & Validation  
+///   - Stage 3: Execution & Testing
+///   - Stage 4: Result Analysis & Optimization
+///   - Stage 5: Final Delivery & Documentation
+/// Supports:
+///   - ^staged <task> (staged execution mode)
+///   - ^staged --help (show staged help)
+///   - ^staged --status (show current stage status)
+///   - ^staged --approve (approve current stage and continue)
+///   - ^staged --modify <feedback> (modify current stage output)
+///   - ^staged --skip (skip current stage)
+///   - ^staged --pause (pause execution)
+///   - ^staged --resume (resume execution)
+pub async fn staged(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
+    let user_id = msg.author.id;
+    let input = args.message().trim();
+    let start_time = Instant::now();
+    
+    agent_trace!(user_id, "staged", "=== STAGED AGENT COMMAND START ===");
+    agent_trace!(user_id, "staged", "User: {} ({})", msg.author.name, user_id);
+    agent_trace!(user_id, "staged", "Input: '{}' ({} chars)", input, input.len());
+    
+    agent_info!(user_id, "staged", "Processing staged input: '{}' ({} chars) for user {}", input, input.len(), msg.author.name);
+    
+    if input.is_empty() {
+        msg.reply(ctx, "Please provide a task! Usage: `^staged <your task>` or `^staged --help` for options").await?;
+        return Ok(());
+    }
+
+    // Parse staged command
+    if input == "--help" || input == "-h" {
+        show_staged_help(ctx, msg).await
+    } else if input == "--status" || input == "-s" {
+        show_staged_status(ctx, msg).await
+    } else if input == "--approve" || input == "-a" {
+        approve_current_stage(ctx, msg).await
+    } else if input.starts_with("--modify ") || input.starts_with("-m ") {
+        let feedback = input.trim_start_matches("--modify ").trim_start_matches("-m ").trim();
+        modify_current_stage(ctx, msg, feedback.to_string()).await
+    } else if input == "--skip" || input == "-k" {
+        skip_current_stage(ctx, msg).await
+    } else if input == "--pause" || input == "-p" {
+        pause_staged_execution(ctx, msg).await
+    } else if input == "--resume" || input == "-r" {
+        resume_staged_execution(ctx, msg).await
+        } else {
+        // Default to staged execution mode
+        agent_trace!(user_id, "staged", "Executing staged task: '{}'", input);
+        let result = execute_staged_task(input.to_string(), ctx, msg).await;
+        
+        let duration = start_time.elapsed();
+        agent_trace!(user_id, "staged", "=== STAGED AGENT COMMAND END ===");
+        agent_trace!(user_id, "staged", "Total execution time: {:?}", duration);
+        agent_trace!(user_id, "staged", "Result: {:?}", result);
+        
+        result
+    }
+}
+
+async fn show_staged_help(ctx: &Context, msg: &Message) -> CommandResult {
+    let user_id = msg.author.id;
+    agent_info!(user_id, "show_staged_help", "Showing staged help");
+    let help_text = r#"🤖 **Staged Agent Command Help**
+
+**Basic Usage:**
+- `^staged <task>` - Execute a complex task in staged mode
+- `^staged --status` - Show current stage status
+- `^staged --approve` - Approve current stage and continue
+- `^staged --modify <feedback>` - Modify current stage output
+- `^staged --skip` - Skip current stage
+- `^staged --pause` - Pause execution
+- `^staged --resume` - Resume execution
+
+**Examples:**
+- `^staged "Calculate the factorial of 10"`
+- `^staged --status`
+- `^staged --approve`
+- `^staged --modify "Improved planning"`
+- `^staged --skip`
+- `^staged --pause`
+- `^staged --resume`
+
+**Available Commands:**
+- **Stage 1: Task Analysis & Planning**
+  - `^staged --modify "Improved planning"`
+- **Stage 2: Code Generation & Validation**
+  - `^staged --modify "Clearer code"`
+- **Stage 3: Execution & Testing**
+  - `^staged --modify "More thorough testing"`
+- **Stage 4: Result Analysis & Optimization**
+  - `^staged --modify "Optimized solution"`
+- **Stage 5: Final Delivery & Documentation**
+  - `^staged --modify "Improved documentation"`
+
+**Guidelines:**
+- Use `--modify <feedback>` to provide specific feedback for each stage
+- `--status` shows the current stage and its status
+- `--approve` approves the current stage and continues to the next
+- `--skip` skips the current stage
+- `--pause` pauses execution
+- `--resume` resumes execution from the paused stage
+
+Remember: Each stage has specific instructions and guidelines. Use `--modify <feedback>` to tailor the output to your needs."#;
+
+    msg.reply(ctx, help_text).await?;
+    Ok(())
+}
+
+async fn show_staged_status(ctx: &Context, msg: &Message) -> CommandResult {
+    let user_id = msg.author.id;
+    agent_info!(user_id, "show_staged_status", "Showing staged status");
+    
+    // Fetch the staged task for the user
+    let staged_task = get_staged_tasks().await.lock().unwrap().get(&user_id.to_string()).cloned();
+    
+    match staged_task {
+        Some(task) => {
+            let status_text = task.stages.iter().enumerate().map(|(i, stage)| {
+                format!("**Stage {}:** {}\nStatus: {}\n\n", i + 1, stage.name, stage.status)
+            }).collect::<Vec<String>>().join("\n");
+            
+            let response = format!("🤖 **Staged Task Status**\n\n{}", status_text);
+            msg.reply(ctx, &response).await?;
+        }
+        None => {
+            let response = "🤖 **Staged Task Status**\n\nNo staged task found for this user.";
+            msg.reply(ctx, response).await?;
+        }
+    }
+    
+    Ok(())
+}
+
+async fn approve_current_stage(ctx: &Context, msg: &Message) -> CommandResult {
+    let user_id = msg.author.id;
+    agent_info!(user_id, "approve_current_stage", "Approving current stage");
+    
+    // Fetch the staged task for the user
+    let staged_task = get_staged_tasks().await.lock().unwrap().get(&user_id.to_string()).cloned();
+    
+    match staged_task {
+        Some(mut task) => {
+            // Approve the current stage
+            task.stages[task.current_stage as usize].status = StageStatus::Completed;
+            task.updated_at = Utc::now();
+            
+            // Save the updated task
+            save_staged_task(&task).await?;
+            
+            let response = format!("🤖 **Stage Approved**\n\nCurrent stage '{}' has been approved. Moving to the next stage.", task.stages[task.current_stage as usize].name);
+            msg.reply(ctx, &response).await?;
+            
+            // Move to the next stage
+            task.current_stage = (task.current_stage + 1) % task.stages.len() as u8;
+            task.overall_status = TaskStatus::InProgress;
+            
+            // Save the updated task
+            save_staged_task(&task).await?;
+        }
+        None => {
+            let response = "🤖 **No Staged Task**\n\nNo staged task found for this user.";
+            msg.reply(ctx, response).await?;
+        }
+    }
+    
+    Ok(())
+}
+
+async fn modify_current_stage(ctx: &Context, msg: &Message, feedback: String) -> CommandResult {
+    let user_id = msg.author.id;
+    agent_info!(user_id, "modify_current_stage", "Modifying current stage output with feedback: '{}'", feedback);
+    
+    // Fetch the staged task for the user
+    let staged_task = get_staged_tasks().await.lock().unwrap().get(&user_id.to_string()).cloned();
+    
+    match staged_task {
+        Some(mut task) => {
+            // Modify the current stage output
+            task.stages[task.current_stage as usize].output = Some(feedback.clone());
+            task.updated_at = Utc::now();
+            
+            // Save the updated task
+            save_staged_task(&task).await?;
+            
+            let response = format!("🤖 **Stage Modified**\n\nCurrent stage '{}' has been modified with feedback: '{}'. Moving to the next stage.", task.stages[task.current_stage as usize].name, feedback);
+            msg.reply(ctx, &response).await?;
+            
+            // Move to the next stage
+            task.current_stage = (task.current_stage + 1) % task.stages.len() as u8;
+            task.overall_status = TaskStatus::InProgress;
+            
+            // Save the updated task
+            save_staged_task(&task).await?;
+        }
+        None => {
+            let response = "🤖 **No Staged Task**\n\nNo staged task found for this user.";
+            msg.reply(ctx, response).await?;
+        }
+    }
+    
+    Ok(())
+}
+
+async fn skip_current_stage(ctx: &Context, msg: &Message) -> CommandResult {
+    let user_id = msg.author.id;
+    agent_info!(user_id, "skip_current_stage", "Skipping current stage");
+    
+    // Fetch the staged task for the user
+    let staged_task = get_staged_tasks().await.lock().unwrap().get(&user_id.to_string()).cloned();
+    
+    match staged_task {
+        Some(mut task) => {
+            // Skip the current stage
+            task.stages[task.current_stage as usize].status = StageStatus::Skipped;
+            task.updated_at = Utc::now();
+            
+            // Save the updated task
+            save_staged_task(&task).await?;
+            
+            let response = format!("🤖 **Stage Skipped**\n\nCurrent stage '{}' has been skipped. Moving to the next stage.", task.stages[task.current_stage as usize].name);
+            msg.reply(ctx, &response).await?;
+            
+            // Move to the next stage
+            task.current_stage = (task.current_stage + 1) % task.stages.len() as u8;
+            task.overall_status = TaskStatus::InProgress;
+            
+            // Save the updated task
+            save_staged_task(&task).await?;
+        }
+        None => {
+            let response = "🤖 **No Staged Task**\n\nNo staged task found for this user.";
+            msg.reply(ctx, response).await?;
+        }
+    }
+    
+    Ok(())
+}
+
+async fn pause_staged_execution(ctx: &Context, msg: &Message) -> CommandResult {
+    let user_id = msg.author.id;
+    agent_info!(user_id, "pause_staged_execution", "Pausing staged execution");
+    
+    // Fetch the staged task for the user
+    let staged_task = get_staged_tasks().await.lock().unwrap().get(&user_id.to_string()).cloned();
+    
+    match staged_task {
+        Some(mut task) => {
+            // Pause the staged execution
+            task.overall_status = TaskStatus::Paused;
+            task.updated_at = Utc::now();
+            
+            // Save the updated task
+            save_staged_task(&task).await?;
+            
+            let response = "🤖 **Staged Execution Paused**\n\nExecution has been paused. Use `--resume` to continue.";
+            msg.reply(ctx, response).await?;
+        }
+        None => {
+            let response = "🤖 **No Staged Task**\n\nNo staged task found for this user.";
+            msg.reply(ctx, response).await?;
+        }
+    }
+    
+    Ok(())
+}
+
+async fn resume_staged_execution(ctx: &Context, msg: &Message) -> CommandResult {
+    let user_id = msg.author.id;
+    agent_info!(user_id, "resume_staged_execution", "Resuming staged execution");
+    
+    // Fetch the staged task for the user
+    let staged_task = get_staged_tasks().await.lock().unwrap().get(&user_id.to_string()).cloned();
+    
+    match staged_task {
+        Some(mut task) => {
+            // Resume the staged execution
+            task.overall_status = TaskStatus::InProgress;
+            task.updated_at = Utc::now();
+            
+            // Save the updated task
+            save_staged_task(&task).await?;
+            
+            let response = "🤖 **Staged Execution Resumed**\n\nExecution has been resumed. Continue with the next stage.";
+            msg.reply(ctx, response).await?;
+        }
+        None => {
+            let response = "🤖 **No Staged Task**\n\nNo staged task found for this user.";
+            msg.reply(ctx, response).await?;
+        }
+    }
+    
+    Ok(())
+}
+
+async fn execute_staged_task(task: String, ctx: &Context, msg: &Message) -> CommandResult {
+    let user_id = msg.author.id;
+    let start_time = Instant::now();
+    
+    agent_trace!(user_id, "execute_staged_task", "=== EXECUTE STAGED TASK START ===");
+    agent_trace!(user_id, "execute_staged_task", "Task: '{}'", task);
+    agent_trace!(user_id, "execute_staged_task", "Task length: {} chars", task.len());
+    
+    agent_info!(user_id, "execute_staged_task", "Starting staged execution for task: '{}'", task);
+    
+    // Load configuration
+    agent_trace!(user_id, "execute_staged_task", "Loading agent configuration...");
+    let config = match load_agent_config().await {
+        Ok(config) => {
+            agent_trace!(user_id, "execute_staged_task", "Configuration loaded successfully");
+            agent_trace!(user_id, "execute_staged_task", "Model: {}", config.default_model);
+            agent_trace!(user_id, "execute_staged_task", "Base URL: {}", config.base_url);
+            agent_trace!(user_id, "execute_staged_task", "Temperature: {}", config.default_temperature);
+            agent_trace!(user_id, "execute_staged_task", "Max tokens: {}", config.default_max_tokens);
+            agent_debug!(user_id, "execute_staged_task", "Successfully loaded agent configuration");
+            config
+        }
+        Err(e) => {
+            agent_trace!(user_id, "execute_staged_task", "Configuration loading failed: {}", e);
+            agent_error!(user_id, "execute_staged_task", "Failed to load agent configuration: {}", e);
+            msg.reply(ctx, "❌ Failed to load agent configuration").await?;
+            return Ok(());
+        }
+    };
+    
+    // Create a file to stream the agent response to
+    let response_filename = format!("staged_agent_response_{}_{}.txt", user_id, chrono::Utc::now().timestamp());
+    let mut response_file = match std::fs::File::create(&response_filename) {
+        Ok(file) => {
+            agent_info!(user_id, "execute_staged_task", "Created response file: {}", response_filename);
+            file
+        }
+        Err(e) => {
+            agent_error!(user_id, "execute_staged_task", "Failed to create response file: {}", e);
+            let _ = msg.reply(ctx, "❌ Failed to create response file").await;
+            return Ok(());
+        }
+    };
+
+    // Write initial header to file
+    use std::io::Write;
+    let header = format!("🤖 **Staged AI Agent Response**\nUser: {} ({})\nTask: {}\nTimestamp: {}\n\n", 
+        msg.author.name, user_id, task, chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC"));
+    if let Err(e) = response_file.write_all(header.as_bytes()) {
+        agent_error!(user_id, "execute_staged_task", "Failed to write header to file: {}", e);
+    }
+
+    // Send initial Discord message indicating staged processing
+    let mut thinking_msg = match msg.channel_id.send_message(&ctx.http, |m| {
+        m.content("🤖 **Staged AI Agent Processing...**\n\n📝 **Stage 1:** Task Analysis & Planning\n⏳ Starting staged execution...")
+    }).await {
+        Ok(message) => {
+            agent_debug!(user_id, "execute_staged_task", "Successfully sent status message");
+            message
+        }
+        Err(e) => {
+            agent_error!(user_id, "execute_staged_task", "Failed to send status message: {}", e);
+            msg.reply(ctx, "Failed to start staged execution!").await?;
+            return Ok(());
+        }
+    };
+
+    // Create staged task
+    let task_id = format!("staged_{}_{}", user_id, chrono::Utc::now().timestamp());
+    let mut staged_task = StagedTask {
+        task_id: task_id.clone(),
+        user_id,
+        original_request: task.clone(),
+        stages: Vec::new(),
+        current_stage: 0,
+        overall_status: TaskStatus::Planning,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    };
+
+    // Initialize all 5 stages
+    staged_task.stages = vec![
+        AgentStage {
+            stage_id: 1,
+            name: "Task Analysis & Planning".to_string(),
+            description: "Analyze user request and create execution plan".to_string(),
+            status: StageStatus::Pending,
+            input: Some(task.clone()),
+            output: None,
+            timestamp: Utc::now(),
+            duration: None,
+        },
+        AgentStage {
+            stage_id: 2,
+            name: "Code Generation & Validation".to_string(),
+            description: "Generate JavaScript code based on planning stage".to_string(),
+            status: StageStatus::Pending,
+            input: None,
+            output: None,
+            timestamp: Utc::now(),
+            duration: None,
+        },
+        AgentStage {
+            stage_id: 3,
+            name: "Execution & Testing".to_string(),
+            description: "Execute generated code and perform testing".to_string(),
+            status: StageStatus::Pending,
+            input: None,
+            output: None,
+            timestamp: Utc::now(),
+            duration: None,
+        },
+        AgentStage {
+            stage_id: 4,
+            name: "Result Analysis & Optimization".to_string(),
+            description: "Analyze execution results and optimize solution".to_string(),
+            status: StageStatus::Pending,
+            input: None,
+            output: None,
+            timestamp: Utc::now(),
+            duration: None,
+        },
+        AgentStage {
+            stage_id: 5,
+            name: "Final Delivery & Documentation".to_string(),
+            description: "Prepare complete solution for delivery".to_string(),
+            status: StageStatus::Pending,
+            input: None,
+            output: None,
+            timestamp: Utc::now(),
+            duration: None,
+        },
+    ];
+
+    // Save initial staged task
+    save_staged_task(&staged_task).await?;
+
+    // Execute each stage sequentially
+    let mut current_stage_index = 0;
+    let mut previous_stage_output: Option<String> = None;
+
+    while current_stage_index < staged_task.stages.len() {
+        staged_task.current_stage = current_stage_index as u8;
+        staged_task.overall_status = match current_stage_index {
+            0 => TaskStatus::Planning,
+            1 => TaskStatus::CodeGeneration,
+            2 => TaskStatus::Execution,
+            3 => TaskStatus::Analysis,
+            4 => TaskStatus::Complete,
+            _ => TaskStatus::Complete,
+        };
+
+        // Create a temporary streaming message for this stage
+        let stage_id = staged_task.stages[current_stage_index].stage_id;
+        let stage_name = staged_task.stages[current_stage_index].name.clone();
+        let initial_stage_message = format!(
+            "🤖 **Stage {}: {}**\n\n🔄 **Connecting to LM Studio API...**\n\n📝 **Live Progress:**\n",
+            stage_id, stage_name
+        );
+        
+        let mut stage_streaming_msg = match msg.channel_id.send_message(&ctx.http, |m| {
+            m.content(&initial_stage_message)
+        }).await {
+            Ok(message) => {
+                agent_debug!(user_id, "execute_staged_task", "Created streaming message for stage {}", stage_id);
+                message
+            }
+            Err(e) => {
+                agent_error!(user_id, "execute_staged_task", "Failed to create streaming message: {}", e);
+                // Fallback to updating the main thinking message
+                let fallback_message = format!(
+                    "🤖 **Stage {}: {}**\n\n❌ Failed to create streaming message\n\n📝 **Error:** {}", 
+                    stage_id, stage_name, e
+                );
+                let _ = thinking_msg.edit(&ctx.http, |m| m.content(&fallback_message)).await;
+                continue;
+            }
+        };
+
+        // Execute the current stage with streaming
+        let stage_result = match current_stage_index {
+            0 => {
+                // Stage 1: Planning
+                execute_stage_1_planning_streaming(&task, user_id, &config, &mut stage_streaming_msg, ctx).await
+            }
+            1 => {
+                // Stage 2: Code Generation (using planning output)
+                if let Some(plan_output) = &previous_stage_output {
+                    let plan_stage = AgentStage {
+                        stage_id: 1,
+                        name: "Task Analysis & Planning".to_string(),
+                        description: "Analyze user request and create execution plan".to_string(),
+                        status: StageStatus::Completed,
+                        input: Some(task.clone()),
+                        output: Some(plan_output.clone()),
+                        timestamp: Utc::now(),
+                        duration: None,
+                    };
+                    execute_stage_2_code_generation_streaming(&plan_stage, user_id, &config, &mut stage_streaming_msg, ctx).await
+        } else {
+                    Err("No planning output available for code generation".into())
+                }
+            }
+            2 => {
+                // Stage 3: Execution (using code generation output)
+                if let Some(code_output) = &previous_stage_output {
+                    let code_stage = AgentStage {
+                        stage_id: 2,
+                        name: "Code Generation & Validation".to_string(),
+                        description: "Generate JavaScript code based on planning stage".to_string(),
+                        status: StageStatus::Completed,
+                        input: None,
+                        output: Some(code_output.clone()),
+                        timestamp: Utc::now(),
+                        duration: None,
+                    };
+                    execute_stage_3_execution_streaming(&code_stage, user_id, &config, &mut stage_streaming_msg, ctx).await
+                } else {
+                    Err("No code generation output available for execution".into())
+                }
+            }
+            3 => {
+                // Stage 4: Analysis (using execution output)
+                if let Some(execution_output) = &previous_stage_output {
+                    let execution_stage = AgentStage {
+                        stage_id: 3,
+                        name: "Execution & Testing".to_string(),
+                        description: "Execute generated code and perform testing".to_string(),
+                        status: StageStatus::Completed,
+                        input: None,
+                        output: Some(execution_output.clone()),
+                        timestamp: Utc::now(),
+                        duration: None,
+                    };
+                    execute_stage_4_analysis_streaming(&execution_stage, user_id, &config, &mut stage_streaming_msg, ctx).await
+                } else {
+                    Err("No execution output available for analysis".into())
+                }
+            }
+            4 => {
+                // Stage 5: Delivery (using analysis output)
+                if let Some(analysis_output) = &previous_stage_output {
+                    let analysis_stage = AgentStage {
+                        stage_id: 4,
+                        name: "Result Analysis & Optimization".to_string(),
+                        description: "Analyze execution results and optimize solution".to_string(),
+                        status: StageStatus::Completed,
+                        input: None,
+                        output: Some(analysis_output.clone()),
+                        timestamp: Utc::now(),
+                        duration: None,
+                    };
+                    execute_stage_5_delivery_streaming(&analysis_stage, user_id, &config, &mut stage_streaming_msg, ctx).await
+                } else {
+                    Err("No analysis output available for delivery".into())
+                }
+            }
+            _ => Err("Invalid stage index".into()),
+        };
+
+        match stage_result {
+            Ok(completed_stage) => {
+                // Store output for next stage
+                previous_stage_output = completed_stage.output.clone();
+
+                // Update stage with results
+                staged_task.stages[current_stage_index].status = StageStatus::Completed;
+                staged_task.stages[current_stage_index].output = completed_stage.output;
+                staged_task.stages[current_stage_index].duration = completed_stage.duration;
+                staged_task.stages[current_stage_index].timestamp = Utc::now();
+
+                // Update staged task
+                staged_task.updated_at = Utc::now();
+                save_staged_task(&staged_task).await?;
+
+                // Get stage info for message
+                let stage_id = staged_task.stages[current_stage_index].stage_id;
+                let stage_name = staged_task.stages[current_stage_index].name.clone();
+                let stage_output = staged_task.stages[current_stage_index].output.clone();
+                let next_stage_name = if current_stage_index + 1 < staged_task.stages.len() {
+                    staged_task.stages[current_stage_index + 1].name.clone()
+                } else {
+                    "All stages complete!".to_string()
+                };
+
+                // Update Discord message with completion
+                let completion_message = format!(
+                    "✅ **Stage {} Complete:** {}\n\n📝 **Output Preview:**\n{}\n\n🔄 **Next Stage:** {}\n\n💡 Use `^staged --approve` to continue\n💡 Use `^staged --modify <feedback>` to provide feedback",
+                    stage_id,
+                    stage_name,
+                    if let Some(output) = &stage_output {
+                        if output.len() > 200 {
+                            format!("{}...", &output[..200])
+                        } else {
+                            output.clone()
+                        }
+                    } else {
+                        "No output available".to_string()
+                    },
+                    next_stage_name
+                );
+                let _ = thinking_msg.edit(&ctx.http, |m| m.content(&completion_message)).await;
+
+                agent_info!(user_id, "execute_staged_task", "Stage {} completed successfully", stage_id);
+            }
+            Err(e) => {
+                // Handle stage failure
+                staged_task.stages[current_stage_index].status = StageStatus::Failed;
+                staged_task.stages[current_stage_index].output = Some(format!("Error: {}", e));
+                staged_task.stages[current_stage_index].timestamp = Utc::now();
+
+                staged_task.overall_status = TaskStatus::Failed;
+                staged_task.updated_at = Utc::now();
+                save_staged_task(&staged_task).await?;
+
+                let stage_id = staged_task.stages[current_stage_index].stage_id;
+                let stage_name = staged_task.stages[current_stage_index].name.clone();
+
+                let error_message = format!(
+                    "❌ **Stage {} Failed:** {}\n\n📝 **Error:** {}\n\n🔄 **Staged execution paused**\n\n💡 Use `^staged --status` to check current state\n💡 Use `^staged --resume` to retry\n💡 Use `^staged --modify <feedback>` to provide input",
+                    stage_id, stage_name, e
+                );
+                let _ = thinking_msg.edit(&ctx.http, |m| m.content(&error_message)).await;
+
+                agent_error!(user_id, "execute_staged_task", "Stage {} failed: {}", stage_id, e);
+                break;
+            }
+        }
+
+        current_stage_index += 1;
+    }
+
+    // Write final summary to file
+    write_to_response_file(Some(&mut response_file), "=== STAGED EXECUTION SUMMARY ===", user_id);
+    for (i, stage) in staged_task.stages.iter().enumerate() {
+        write_to_response_file(Some(&mut response_file), &format!("Stage {}: {} - {}", i + 1, stage.name, stage.status), user_id);
+        if let Some(output) = &stage.output {
+            write_to_response_file(Some(&mut response_file), &format!("Output: {}", output), user_id);
+        }
+    }
+
+    // Close the file
+    drop(response_file);
+
+    // Upload the response file to Discord
+    agent_info!(user_id, "execute_staged_task", "Uploading staged response file: {}", response_filename);
+
+    let file_content = match std::fs::read_to_string(&response_filename) {
+        Ok(content) => content,
+        Err(e) => {
+            agent_error!(user_id, "execute_staged_task", "Failed to read response file: {}", e);
+            let _ = msg.reply(ctx, "❌ Failed to read response file").await;
+            return Ok(());
+        }
+    };
+
+    // Create final summary
+    let completed_stages = staged_task.stages.iter().filter(|s| s.status == StageStatus::Completed).count();
+    let total_stages = staged_task.stages.len();
+    let final_status = if staged_task.overall_status == TaskStatus::Complete {
+        "✅ **Staged Execution Complete**"
+    } else if staged_task.overall_status == TaskStatus::Failed {
+        "❌ **Staged Execution Failed**"
+    } else {
+        "⏸️ **Staged Execution Paused**"
+    };
+
+    let discord_message = format!(
+        "{}\n\n📊 **Progress:** {}/{} stages completed\n📝 **Task:** {}\n\n📎 **Full Response:** See attached file\n\n💡 Use `^staged --status` to check current state\n💡 Use `^staged --approve` to continue\n💡 Use `^staged --modify <feedback>` to provide feedback",
+        final_status, completed_stages, total_stages, task
+    );
+
+    // Upload file to Discord
+    match msg.channel_id.send_files(&ctx.http, vec![(&*file_content.as_bytes(), response_filename.as_str())], |m| {
+        m.content(&discord_message)
+    }).await {
+        Ok(_) => {
+            agent_info!(user_id, "execute_staged_task", "Successfully uploaded staged response file to Discord");
+        }
+        Err(e) => {
+            agent_error!(user_id, "execute_staged_task", "Failed to upload response file: {}", e);
+            // Fallback to regular message
+            let fallback_message = format!("{} - Staged execution completed. Check logs for details.", final_status);
+            let _ = msg.channel_id.send_message(&ctx.http, |m| m.content(&fallback_message)).await;
+        }
+    }
+
+    // Clean up the temporary file
+    if let Err(e) = std::fs::remove_file(&response_filename) {
+        agent_warn!(user_id, "execute_staged_task", "Failed to remove temporary file {}: {}", response_filename, e);
+    } else {
+        agent_debug!(user_id, "execute_staged_task", "Successfully removed temporary file: {}", response_filename);
+    }
+
+    let total_duration = start_time.elapsed();
+    agent_trace!(user_id, "execute_staged_task", "=== EXECUTE STAGED TASK END ===");
+    agent_trace!(user_id, "execute_staged_task", "Total execution time: {:?}", total_duration);
+    agent_info!(user_id, "execute_staged_task", "Completed staged execution in {:?}", total_duration);
+
+    Ok(())
+}
+
+async fn save_staged_task(task: &StagedTask) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let contexts = get_staged_tasks().await;
+    if let Ok(mut contexts_map) = contexts.lock() {
+        contexts_map.insert(task.user_id.to_string(), task.clone());
+        agent_debug!(task.user_id, "save_staged_task", "Saved staged task for user: {}", task.user_id);
+    }
+    Ok(())
+}
+
+// ============================================================================
+// STREAMING FUNCTION CALLING
+// ============================================================================
+
+async fn execute_function_calling_streaming(
+    messages: &[ChatMessage],
+    functions: &[FunctionDefinition],
+    config: &LMConfig,
+    user_id: UserId,
+    streaming_msg: &mut Message,
+    ctx: &Context,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let start_time = Instant::now();
+    
+    agent_trace!(user_id, "execute_function_calling_streaming", "=== FUNCTION CALLING STREAMING START ===");
+    agent_trace!(user_id, "execute_function_calling_streaming", "Messages count: {}", messages.len());
+    agent_trace!(user_id, "execute_function_calling_streaming", "Functions count: {}", functions.len());
+    
+    // Create the chat request
+    let chat_request = ChatRequest {
+        model: config.default_model.clone(),
+        messages: messages.to_vec(),
+        temperature: config.default_temperature,
+        max_tokens: config.default_max_tokens,
+        stream: true,
+        seed: config.default_seed,
+        tools: Some(functions.to_vec()),
+        tool_choice: Some("auto".to_string()),
+    };
+    
+    agent_trace!(user_id, "execute_function_calling_streaming", "Created chat request with streaming enabled");
+    
+    // Get HTTP client
+    let client = get_http_client().await;
+    
+    // Serialize the request
+    let request_body = match serde_json::to_string(&chat_request) {
+        Ok(body) => {
+            agent_trace!(user_id, "execute_function_calling_streaming", "Request body length: {} chars", body.len());
+            body
+        }
+        Err(e) => {
+            agent_error!(user_id, "execute_function_calling_streaming", "Failed to serialize request: {}", e);
+            return Err(format!("Failed to serialize request: {}", e).into());
+        }
+    };
+    
+    // Update streaming message with connection status
+    let _ = streaming_msg.edit(&ctx.http, |m| {
+        m.content("🤖 **Connecting to LM Studio API...**\n\n🔄 **Status:** Sending request...\n\n📝 **Live Progress:**\n")
+    }).await;
+    
+    // Send the request
+    let response = match client
+        .post(&format!("{}/v1/chat/completions", config.base_url))
+        .header("Content-Type", "application/json")
+        .body(request_body)
+        .timeout(Duration::from_secs(config.timeout))
+        .send()
+        .await
+    {
+        Ok(response) => {
+            agent_trace!(user_id, "execute_function_calling_streaming", "Received response from API");
+            response
+        }
+        Err(e) => {
+            agent_error!(user_id, "execute_function_calling_streaming", "Failed to send request: {}", e);
+            let error_msg = format!("❌ **API Connection Failed**\n\n📝 **Error:** {}\n\n🔄 **Status:** Request failed", e);
+            let _ = streaming_msg.edit(&ctx.http, |m| m.content(&error_msg)).await;
+            return Err(format!("Failed to send request: {}", e).into());
+        }
+    };
+    
+    // Check if the response is successful
+    if !response.status().is_success() {
+        let status = response.status();
+        let error_text = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
+        agent_error!(user_id, "execute_function_calling_streaming", "API returned error status {}: {}", status, error_text);
+        let error_msg = format!("❌ **API Error**\n\n📝 **Status:** {}\n📝 **Error:** {}\n\n🔄 **Status:** Request failed", status, error_text);
+        let _ = streaming_msg.edit(&ctx.http, |m| m.content(&error_msg)).await;
+        return Err(format!("API returned error status {}: {}", status, error_text).into());
+    }
+    
+    // Update streaming message with streaming status
+    let _ = streaming_msg.edit(&ctx.http, |m| {
+        m.content("🤖 **Connected to LM Studio API**\n\n🔄 **Status:** Streaming response...\n\n📝 **Live Progress:**\n")
+    }).await;
+    
+    // Get the response stream
+    let mut stream = response.bytes_stream();
+    agent_trace!(user_id, "execute_function_calling_streaming", "Successfully created response stream");
+    
+    // Variables for streaming
+    let mut buffer = String::new();
+    let mut collected_tool_calls: Vec<String> = Vec::new();
+    let mut function_call_buffer = String::new();
+    let mut last_update = Instant::now();
+    let update_interval = Duration::from_millis(500); // Update every 500ms to reduce load
+    
+    // Accumulation buffers (keep all content)
+    let mut content_buffer = String::new();
+    let mut tool_calls_buffer = String::new();
+    
+    // Scrolling display system
+    let mut display_content = String::new();
+    let mut display_tool_calls = String::new();
+    let max_display_chars = 1200; // Keep display under Discord limit
+    
+    agent_trace!(user_id, "execute_function_calling_streaming", "Starting SSE streaming loop");
+    agent_info!(user_id, "execute_function_calling_streaming", "Streaming configuration: update_interval={:?}, max_display_chars={}", update_interval, max_display_chars);
+    
+    // Process the stream
+    let mut chunk_count = 0;
+    while let Some(chunk_result) = stream.next().await {
+        chunk_count += 1;
+        if chunk_count % 10 == 0 {
+            agent_trace!(user_id, "execute_function_calling_streaming", "Processed {} chunks, buffer_len={}, display_len={}", chunk_count, buffer.len(), display_content.len());
+        }
+        match chunk_result {
+            Ok(chunk) => {
+                // Convert chunk to string
+                let chunk_str = match String::from_utf8(chunk.to_vec()) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        agent_warn!(user_id, "execute_function_calling_streaming", "Failed to convert chunk to string: {}", e);
+                        continue;
+                    }
+                };
+                
+                // Split by lines and process each line
+                for line in chunk_str.lines() {
+                    if line.starts_with("data: ") {
+                        let data = &line[6..]; // Remove "data: " prefix
+                        
+                        if data == "[DONE]" {
+                            agent_trace!(user_id, "execute_function_calling_streaming", "Received [DONE] signal");
+                            break;
+                        }
+                        
+                        // Parse the JSON data
+                        match serde_json::from_str::<serde_json::Value>(data) {
+                            Ok(json_data) => {
+                                // Extract content delta
+                                if let Some(choices) = json_data.get("choices").and_then(|c| c.as_array()) {
+                                    for choice in choices {
+                                        if let Some(delta) = choice.get("delta") {
+                                            // Handle content delta with simplified scrolling
+                                            if let Some(content) = delta.get("content").and_then(|c| c.as_str()) {
+                                                content_buffer.push_str(content);
+                                                buffer.push_str(content);
+                                                display_content.push_str(content);
+                                                
+                                                // Only scroll when significantly over limit to reduce frequency
+                                                if display_content.len() > max_display_chars + 200 {
+                                                    // Scroll: keep only the most recent content
+                                                    let keep_chars = max_display_chars;
+                                                    if display_content.len() > keep_chars {
+                                                        display_content = display_content[display_content.len() - keep_chars..].to_string();
+                                                    }
+                                                }
+                                            }
+                                            
+                                            // Handle tool_calls delta
+                                            if let Some(tool_calls) = delta.get("tool_calls").and_then(|tc| tc.as_array()) {
+                                                for tool_call in tool_calls {
+                                                    if let Some(function) = tool_call.get("function") {
+                                                        // Extract function name
+                                                        if let Some(name) = function.get("name").and_then(|n| n.as_str()) {
+                                                            if !collected_tool_calls.contains(&name.to_string()) {
+                                                                collected_tool_calls.push(name.to_string());
+                                                                agent_trace!(user_id, "execute_function_calling_streaming", "Detected function call: {}", name);
+                                                            }
+                                                        }
+                                                        
+                                                        // Extract arguments with simplified scrolling
+                                                        if let Some(args) = function.get("arguments").and_then(|a| a.as_str()) {
+                                                            function_call_buffer.push_str(args);
+                                                            tool_calls_buffer.push_str(args);
+                                                            display_tool_calls.push_str(args);
+                                                            
+                                                            // Only scroll tool calls when significantly over limit
+                                                            if display_tool_calls.len() > 400 {
+                                                                // Scroll: keep only the most recent tool calls
+                                                                let keep_chars = 300;
+                                                                if display_tool_calls.len() > keep_chars {
+                                                                    display_tool_calls = display_tool_calls[display_tool_calls.len() - keep_chars..].to_string();
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                agent_warn!(user_id, "execute_function_calling_streaming", "Failed to parse JSON: {}", e);
+                                continue;
+                            }
+                        }
+                    }
+                }
+                
+                // Update Discord message periodically with scrolling display
+                if last_update.elapsed() >= update_interval {
+                    let mut update_content = String::new();
+                    update_content.push_str("🤖 **Streaming from LM Studio API**\n\n");
+                    update_content.push_str("🔄 **Status:** Processing...\n\n");
+                    update_content.push_str("📝 **Live Progress:**\n");
+                    
+                    // Add scrolling content preview
+                    if !display_content.is_empty() {
+                        update_content.push_str(&format!("💭 **AI Response:**\n{}\n\n", display_content));
+                    }
+                    
+                    // Add function call preview
+                    if !collected_tool_calls.is_empty() {
+                        update_content.push_str(&format!("🔧 **Function Calls:** {}\n", collected_tool_calls.join(", ")));
+                    }
+                    
+                    // Add scrolling tool calls preview
+                    if !display_tool_calls.is_empty() {
+                        update_content.push_str(&format!("📝 **Tool Arguments:**\n{}\n", display_tool_calls));
+                    }
+                    
+                    // Check if we need to reset due to Discord limit
+                    if update_content.len() > 1800 {
+                        // Clear display buffers for fresh start
+                        display_content.clear();
+                        display_tool_calls.clear();
+                        
+                        // Start fresh display
+                        update_content = "🤖 **Streaming from LM Studio API**\n\n🔄 **Status:** Processing...\n\n📝 **Live Progress:**\n(Scrolling reset - continuing stream)\n".to_string();
+                        
+                        // Force immediate update to Discord to reset the message
+                        let _ = streaming_msg.edit(&ctx.http, |m| m.content(&update_content)).await;
+                        last_update = Instant::now();
+                        continue; // Skip the regular update cycle
+                    }
+                    
+                    let _ = streaming_msg.edit(&ctx.http, |m| m.content(&update_content)).await;
+                    last_update = Instant::now();
+                }
+            }
+            Err(e) => {
+                agent_error!(user_id, "execute_function_calling_streaming", "Error reading stream chunk: {}", e);
+                let error_msg = format!("❌ **Streaming Error**\n\n📝 **Error:** {}\n\n🔄 **Status:** Stream reading failed", e);
+                let _ = streaming_msg.edit(&ctx.http, |m| m.content(&error_msg)).await;
+                return Err(format!("Error reading stream chunk: {}", e).into());
+            }
+        }
+    }
+    
+    // Final update with complete results
+    agent_info!(user_id, "execute_function_calling_streaming", "Streaming completed: {} chunks processed, {} chars in buffer", chunk_count, buffer.len());
+    let final_content = format!(
+        "✅ **Streaming Complete**\n\n📝 **Final Response:**\n{}\n\n⏱️ **Duration:** {:?}",
+        buffer, start_time.elapsed()
+    );
+    let _ = streaming_msg.edit(&ctx.http, |m| m.content(&final_content)).await;
+    
+    agent_trace!(user_id, "execute_function_calling_streaming", "=== FUNCTION CALLING STREAMING END ===");
+    agent_info!(user_id, "execute_function_calling_streaming", "Streaming completed in {:?}", start_time.elapsed());
+    
+    Ok(buffer)
 }
